@@ -1,0 +1,5 @@
+{
+  "type": "command",
+  "msg_id": "req-201",
+  "action": "resync_mailbox"
+}

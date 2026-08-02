@@ -11,15 +11,16 @@ Current Cargo workspace members:
 - **`aa-registers`** — register IDs, CAN2 wire codec, and register bank (scaffold)
 - **`aa-link`** — async byte I/O seam (`Link`), `MockLink` for hardware-free tests, `AoaLink` for raw `/dev/usb_accessory` (config on open, chunked writes; aaservice must not hold the accessory while open), and `TtyLink` for Linux USB-serial / USB-RS485 (57600 8N1 raw, full-frame writes; default `/dev/ttyUSB0`)
 - **`aa-engine`** — CB session state machine (negotiate / dump / steady poll) over a `Link`
+- **`aa-mailbox`** — northbound mailbox JSON message types and `RegisterBank` ↔ JSON converters (no WS bind)
 
-More crates (`aa-mailbox`, `cb-daemon`, …) will join the workspace in later issues.
+More crates (`cb-daemon`, …) will join the workspace in later issues.
 
 ## Development
 
 ```bash
 ./scripts/run_codequality.sh   # fmt check + clippy (-D warnings)
 ./scripts/run_tests.sh         # cargo test --workspace
-cargo test -p aa-crc -p aa-frame -p aa-registers -p aa-link -p aa-engine
+cargo test -p aa-crc -p aa-frame -p aa-registers -p aa-link -p aa-engine -p aa-mailbox
 ```
 
 ## Cross builds
