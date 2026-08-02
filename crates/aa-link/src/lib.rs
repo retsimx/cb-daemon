@@ -1,14 +1,17 @@
 //! Async byte I/O seam for Android Auto link backends.
 //!
 //! Provides [`Link`] for engine-facing read/write/close, [`MockLink`] for
-//! scripted unit tests without hardware, and [`AoaLink`] for the raw
-//! `/dev/usb_accessory` USB Accessory backend.
+//! scripted unit tests without hardware, [`AoaLink`] for the raw
+//! `/dev/usb_accessory` USB Accessory backend, and [`TtyLink`] for Linux
+//! USB-serial / USB-RS485 (57600 8N1 raw).
 
 #![allow(async_fn_in_trait)] // D3: native async `Link`; consumers use `L: Link`, not `dyn Link`.
 
 mod aoa;
+mod tty;
 
 pub use aoa::{AOA_CONFIG_PACKET, AOA_DEFAULT_PATH, AOA_INTER_CHUNK_DELAY, AOA_MAX_CHUNK, AoaLink};
+pub use tty::{TTY_BAUD, TTY_DEFAULT_PATH, TtyLink};
 
 use std::collections::VecDeque;
 use std::io;
