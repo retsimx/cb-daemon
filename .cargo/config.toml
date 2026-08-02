@@ -1,0 +1,10 @@
+# Cross-compilation linker hints for local builds.
+# Builds succeed on host without these linkers; set them when cross-building.
+
+# Pi Zero W / musl armhf — typically provided by `cross` or a system musl toolchain.
+# [target.arm-unknown-linux-musleabihf]
+# linker = "arm-linux-musleabihf-gcc"
+
+# Android ARMv7 — typically provided by Android NDK / cargo-ndk (local only; not CI).
+# [target.armv7-linux-androideabi]
+# linker = "armv7a-linux-androideabi21-clang"

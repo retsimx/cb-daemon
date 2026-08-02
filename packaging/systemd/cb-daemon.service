@@ -1,0 +1,12 @@
+# Placeholder systemd unit — non-functional until the binary is packaged.
+[Unit]
+Description=cb-daemon Android Auto serial bridge
+After=network.target
+
+[Service]
+Type=simple
+# Placeholder path; replace when packaging installs the binary.
+ExecStart=/usr/local/bin/cb-daemon
+
+[Install]
+WantedBy=multi-user.target
