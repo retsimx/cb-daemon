@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -18,9 +19,9 @@ pub const TTY_BAUD: u32 = speed::B57600;
 
 /// Async byte transport over a serial device (or a test double).
 pub(super) trait SerialTransport: Send {
-    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
-    async fn write_all(&mut self, data: &[u8]) -> io::Result<()>;
-    async fn close(&mut self) -> io::Result<()>;
+    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
+    fn write_all(&mut self, data: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+    fn close(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 /// Apply 57600 8N1 raw settings to an existing [`Termios`] value.
