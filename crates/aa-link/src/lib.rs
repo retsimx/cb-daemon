@@ -10,8 +10,11 @@
 mod aoa;
 mod tty;
 
-pub use aoa::{AOA_CONFIG_PACKET, AOA_DEFAULT_PATH, AOA_INTER_CHUNK_DELAY, AOA_MAX_CHUNK, AoaLink};
-pub use tty::{TTY_BAUD, TTY_DEFAULT_PATH, TtyLink};
+pub use aoa::{
+    AOA_CONFIG_PACKET, AOA_DEFAULT_PATH, AOA_INTER_CHUNK_DELAY, AOA_INTER_CHUNK_DELAY_MS,
+    AOA_MAX_CHUNK, AoaLink, AoaOpenOptions,
+};
+pub use tty::{TTY_BAUD, TTY_DEFAULT_PATH, TtyLink, TtyOpenOptions};
 
 use std::collections::VecDeque;
 use std::future::Future;

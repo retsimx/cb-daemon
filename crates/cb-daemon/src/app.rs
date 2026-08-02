@@ -3,9 +3,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use aa_engine::{CbEngine, EngineCmd, EngineEvent};
-use aa_link::{AoaLink, Link, TtyLink};
+use aa_link::{
+    AOA_DEFAULT_PATH, AoaLink, AoaOpenOptions, Link, TTY_DEFAULT_PATH, TtyLink, TtyOpenOptions,
+};
 use aa_registers::RegisterBank;
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -127,6 +130,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 ///
 /// Propagates link open or serve failures.
 pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow::Result<()> {
+    if let Some(hint) = config.unit_id_hint {
+        info!(%hint, "unit_id_hint set");
+    }
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     // Keep sender alive until signals fire.
     let signal_shutdown = shutdown_tx;
@@ -137,33 +144,40 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
     match config.backend {
         Backend::Mock => run_mock_with_listener(listener, shutdown_rx, None, true).await,
         Backend::Aoa => {
-            let link = open_aoa(config.device.as_ref()).await?;
+            let link = open_aoa(&config).await?;
             run_with_link(listener, link, shutdown_rx, None).await
         }
         Backend::Tty => {
-            let link = open_tty(config.device.as_ref()).await?;
+            let link = open_tty(&config).await?;
             run_with_link(listener, link, shutdown_rx, None).await
         }
     }
 }
 
-async fn open_aoa(device: Option<&std::path::PathBuf>) -> anyhow::Result<AoaLink> {
-    match device {
-        Some(path) => AoaLink::open(path)
+async fn open_aoa(config: &Config) -> anyhow::Result<AoaLink> {
+    let opts = AoaOpenOptions {
+        max_chunk: config.aoa_chunk_size,
+        inter_chunk_delay: Duration::from_millis(config.aoa_chunk_delay_ms),
+    };
+    match config.device.as_ref() {
+        Some(path) => AoaLink::open_with(path, opts)
             .await
             .with_context(|| format!("open AoaLink {}", path.display())),
-        None => AoaLink::open_default()
+        None => AoaLink::open_with(AOA_DEFAULT_PATH, opts)
             .await
             .context("open AoaLink default path"),
     }
 }
 
-async fn open_tty(device: Option<&std::path::PathBuf>) -> anyhow::Result<TtyLink> {
-    match device {
-        Some(path) => TtyLink::open(path)
+async fn open_tty(config: &Config) -> anyhow::Result<TtyLink> {
+    let opts = TtyOpenOptions {
+        baud: config.tty_baud,
+    };
+    match config.device.as_ref() {
+        Some(path) => TtyLink::open_with(path, opts)
             .await
             .with_context(|| format!("open TtyLink {}", path.display())),
-        None => TtyLink::open_default()
+        None => TtyLink::open_with(TTY_DEFAULT_PATH, opts)
             .await
             .context("open TtyLink default path"),
     }

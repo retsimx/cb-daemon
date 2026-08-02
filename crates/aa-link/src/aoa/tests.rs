@@ -1,9 +1,11 @@
 use super::link::{
-    AOA_CONFIG_PACKET, AOA_MAX_CHUNK, AccessoryTransport, AoaLinkInner, InterChunkDelay,
+    AOA_CONFIG_PACKET, AOA_INTER_CHUNK_DELAY, AOA_MAX_CHUNK, AccessoryTransport, AoaLinkInner,
+    AoaOpenOptions, InterChunkDelay,
 };
 use crate::Link;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 struct FakeTransport {
@@ -113,7 +115,15 @@ async fn open_fake(
     transport: FakeTransport,
     delay: RecordingDelay,
 ) -> AoaLinkInner<FakeTransport, RecordingDelay> {
-    AoaLinkInner::from_transport(transport, delay)
+    open_fake_with(transport, delay, AoaOpenOptions::default()).await
+}
+
+async fn open_fake_with(
+    transport: FakeTransport,
+    delay: RecordingDelay,
+    opts: AoaOpenOptions,
+) -> AoaLinkInner<FakeTransport, RecordingDelay> {
+    AoaLinkInner::from_transport(transport, delay, opts.max_chunk)
         .await
         .expect("from_transport")
 }
@@ -145,7 +155,7 @@ async fn config_write_failure_returns_err_no_usable_link() {
     // fail_write_after(0): first write (config packet) fails → from_transport Err
     let transport = FakeTransport::new().fail_write_after(0);
     let delay = RecordingDelay::new();
-    let err = AoaLinkInner::from_transport(transport.clone(), delay)
+    let err = AoaLinkInner::from_transport(transport.clone(), delay, AOA_MAX_CHUNK)
         .await
         .expect_err("config write must fail");
     assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -307,4 +317,62 @@ async fn write_error_on_first_payload_chunk_no_sleep() {
     assert_eq!(err.kind(), io::ErrorKind::Other);
     assert_eq!(transport.written_chunks().len(), 1); // config only
     assert_eq!(delay_handle.sleep_count(), 0);
+}
+
+#[tokio::test]
+async fn custom_max_chunk_splits_and_sleeps() {
+    let opts = AoaOpenOptions {
+        max_chunk: 10,
+        inter_chunk_delay: Duration::from_millis(5),
+    };
+    let transport = FakeTransport::new();
+    let delay = RecordingDelay::new();
+    let delay_handle = RecordingDelay {
+        count: Arc::clone(&delay.count),
+    };
+    let mut link = open_fake_with(transport.clone(), delay, opts).await;
+
+    let payload = vec![0xABu8; 25];
+    link.write_all(&payload).await.expect("write");
+
+    let chunks = transport.written_chunks();
+    assert_eq!(chunks.len(), 4); // config + [10] + [10] + [5]
+    assert_eq!(chunks[1].len(), 10);
+    assert_eq!(chunks[2].len(), 10);
+    assert_eq!(chunks[3].len(), 5);
+    assert_eq!(&chunks[1][..], &payload[..10]);
+    assert_eq!(&chunks[2][..], &payload[10..20]);
+    assert_eq!(&chunks[3][..], &payload[20..]);
+    assert_eq!(delay_handle.sleep_count(), 2);
+    assert_eq!(opts.inter_chunk_delay, Duration::from_millis(5));
+    assert_ne!(opts.inter_chunk_delay, AOA_INTER_CHUNK_DELAY);
+}
+
+#[tokio::test]
+async fn custom_max_chunk_exact_boundary_no_sleep() {
+    let opts = AoaOpenOptions {
+        max_chunk: 16,
+        inter_chunk_delay: Duration::from_millis(0),
+    };
+    let transport = FakeTransport::new();
+    let delay = RecordingDelay::new();
+    let delay_handle = RecordingDelay {
+        count: Arc::clone(&delay.count),
+    };
+    let mut link = open_fake_with(transport.clone(), delay, opts).await;
+
+    let payload = vec![0xCDu8; 16];
+    link.write_all(&payload).await.expect("write");
+
+    let chunks = transport.written_chunks();
+    assert_eq!(chunks.len(), 2); // config + one chunk
+    assert_eq!(chunks[1], payload);
+    assert_eq!(delay_handle.sleep_count(), 0);
+}
+
+#[test]
+fn aoa_open_options_default_matches_constants() {
+    let opts = AoaOpenOptions::default();
+    assert_eq!(opts.max_chunk, AOA_MAX_CHUNK);
+    assert_eq!(opts.inter_chunk_delay, AOA_INTER_CHUNK_DELAY);
 }

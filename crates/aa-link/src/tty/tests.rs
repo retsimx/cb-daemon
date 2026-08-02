@@ -1,7 +1,9 @@
-use super::link::{SerialTransport, TTY_BAUD, TtyLinkInner, apply_tty_settings};
+use super::link::{
+    SerialTransport, TTY_BAUD, TtyLinkInner, TtyOpenOptions, apply_tty_settings, map_baud_to_speed,
+};
 use crate::Link;
 use rustix::fs::{Mode, OFlags, open};
-use rustix::termios::{ControlModes, InputModes, tcgetattr};
+use rustix::termios::{ControlModes, InputModes, speed, tcgetattr};
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -148,7 +150,7 @@ fn apply_tty_settings_57600_8n1_raw_on_ptmx() {
         return; // optional helper test; skip if no ptmx
     };
     let mut termios = tcgetattr(&fd).expect("tcgetattr");
-    apply_tty_settings(&mut termios).expect("apply");
+    apply_tty_settings(&mut termios, TTY_BAUD).expect("apply");
 
     assert_eq!(termios.input_speed(), TTY_BAUD);
     assert_eq!(termios.output_speed(), TTY_BAUD);
@@ -159,4 +161,61 @@ fn apply_tty_settings_57600_8n1_raw_on_ptmx() {
     assert!(!termios.control_modes.contains(ControlModes::CSTOPB));
     assert!(!termios.input_modes.contains(InputModes::IXON));
     assert!(!termios.input_modes.contains(InputModes::IXOFF));
+}
+
+#[test]
+fn map_baud_57600_to_rustix_speed() {
+    assert_eq!(map_baud_to_speed(57600).expect("57600"), speed::B57600);
+    assert_eq!(
+        map_baud_to_speed(TTY_BAUD).expect("TTY_BAUD"),
+        speed::B57600
+    );
+}
+
+#[test]
+fn map_baud_rejects_unsupported_with_clear_error() {
+    let err = map_baud_to_speed(12345).expect_err("unsupported");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsupported baud") && msg.contains("12345"),
+        "clear message, got: {msg}"
+    );
+}
+
+#[test]
+fn apply_tty_settings_rejects_unsupported_baud() {
+    let Ok(fd) = open(
+        "/dev/ptmx",
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let mut termios = tcgetattr(&fd).expect("tcgetattr");
+    let err = apply_tty_settings(&mut termios, 999).expect_err("bad baud");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("unsupported baud"));
+}
+
+#[test]
+fn apply_tty_settings_115200_on_ptmx() {
+    let Ok(fd) = open(
+        "/dev/ptmx",
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let mut termios = tcgetattr(&fd).expect("tcgetattr");
+    apply_tty_settings(&mut termios, 115_200).expect("apply 115200");
+    assert_eq!(termios.input_speed(), speed::B115200);
+    assert_eq!(termios.output_speed(), speed::B115200);
+}
+
+#[test]
+fn tty_open_options_default_is_57600() {
+    let opts = TtyOpenOptions::default();
+    assert_eq!(opts.baud, 57600);
+    assert_eq!(opts.baud, TTY_BAUD);
 }

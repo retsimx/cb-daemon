@@ -1,0 +1,28 @@
+# Example cb-daemon configuration.
+# Copy to /etc/cb-daemon/config.toml or ./config.toml, or pass --config <path>.
+# Precedence: defaults → this file → env (CB_DAEMON_*) → CLI (CLI wins).
+
+# Link backend: "mock" | "aoa" | "tty"
+backend = "aoa"
+
+# Device path (required absolute path for aoa/tty when set; defaults to
+# /dev/usb_accessory or /dev/ttyUSB0 when omitted).
+device = "/dev/usb_accessory"
+
+# HTTP / WebSocket listen address
+bind = "127.0.0.1:2026"
+
+# Optional 5-hex unit id hint (logged at startup; not consumed by negotiate in D9)
+unit_id_hint = "181f3"
+
+# Tracing level when RUST_LOG is unset: error | warn | info | debug | trace
+log_level = "info"
+
+# AOA payload max chunk size (≥ 1)
+aoa_chunk_size = 63
+
+# AOA inter-chunk delay in milliseconds
+aoa_chunk_delay_ms = 1
+
+# TTY baud rate (e.g. 9600, 19200, 38400, 57600, 115200, 230400)
+tty_baud = 57600
