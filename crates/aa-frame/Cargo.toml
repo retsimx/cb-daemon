@@ -1,0 +1,10 @@
+[package]
+name = "aa-frame"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aa-crc = { workspace = true }
+
+[lints]
+workspace = true
