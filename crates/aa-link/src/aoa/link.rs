@@ -17,8 +17,29 @@ pub const AOA_CONFIG_PACKET: [u8; 8] = [0x00, 0xE1, 0x00, 0x00, 0x08, 0x01, 0x00
 /// Maximum payload bytes per underlying write after open.
 pub const AOA_MAX_CHUNK: usize = 63;
 
+/// Inter-chunk delay in milliseconds (source for [`AOA_INTER_CHUNK_DELAY`]).
+pub const AOA_INTER_CHUNK_DELAY_MS: u64 = 1;
+
 /// Delay inserted between successive payload chunks (not after the last).
-pub const AOA_INTER_CHUNK_DELAY: Duration = Duration::from_millis(1);
+pub const AOA_INTER_CHUNK_DELAY: Duration = Duration::from_millis(AOA_INTER_CHUNK_DELAY_MS);
+
+/// Options for [`AoaLink::open_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AoaOpenOptions {
+    /// Maximum payload bytes per underlying write after open.
+    pub max_chunk: usize,
+    /// Delay inserted between successive payload chunks (not after the last).
+    pub inter_chunk_delay: Duration,
+}
+
+impl Default for AoaOpenOptions {
+    fn default() -> Self {
+        Self {
+            max_chunk: AOA_MAX_CHUNK,
+            inter_chunk_delay: AOA_INTER_CHUNK_DELAY,
+        }
+    }
+}
 
 /// Async byte transport over the accessory device (or a test double).
 pub(super) trait AccessoryTransport: Send {
@@ -32,13 +53,21 @@ pub(super) trait InterChunkDelay: Send {
     fn sleep(&mut self) -> impl Future<Output = ()> + Send;
 }
 
-/// Production delay: [`tokio::time::sleep`] for [`AOA_INTER_CHUNK_DELAY`].
-#[derive(Debug, Default, Clone, Copy)]
-struct TokioDelay;
+/// Production delay: [`tokio::time::sleep`] for a configurable duration.
+#[derive(Debug, Clone, Copy)]
+struct TokioDelay {
+    duration: Duration,
+}
+
+impl TokioDelay {
+    const fn new(duration: Duration) -> Self {
+        Self { duration }
+    }
+}
 
 impl InterChunkDelay for TokioDelay {
     async fn sleep(&mut self) {
-        tokio::time::sleep(AOA_INTER_CHUNK_DELAY).await;
+        tokio::time::sleep(self.duration).await;
     }
 }
 
@@ -91,6 +120,7 @@ impl AccessoryTransport for FileTransport {
 pub(super) struct AoaLinkInner<T, D> {
     transport: Option<T>,
     delay: D,
+    max_chunk: usize,
 }
 
 impl<T, D> AoaLinkInner<T, D>
@@ -100,11 +130,17 @@ where
 {
     /// Build from an already-open transport that has **not** yet had the config
     /// packet written. Writes [`AOA_CONFIG_PACKET`] once unchunked.
-    pub(super) async fn from_transport(mut transport: T, delay: D) -> io::Result<Self> {
+    pub(super) async fn from_transport(
+        mut transport: T,
+        delay: D,
+        max_chunk: usize,
+    ) -> io::Result<Self> {
         write_config_packet(&mut transport).await?;
         Ok(Self {
             transport: Some(transport),
             delay,
+            // Avoid a zero-sized chunk hang in write_all if callers pass 0.
+            max_chunk: max_chunk.max(1),
         })
     }
 }
@@ -132,9 +168,10 @@ where
         if data.is_empty() {
             return Ok(());
         }
+        let max_chunk = self.max_chunk;
         let mut offset = 0;
         while offset < data.len() {
-            let end = (offset + AOA_MAX_CHUNK).min(data.len());
+            let end = (offset + max_chunk).min(data.len());
             transport.write_all(&data[offset..end]).await?;
             offset = end;
             if offset < data.len() {
@@ -154,15 +191,15 @@ where
 
 /// USB Accessory [`Link`] over `/dev/usb_accessory` (or a custom path).
 ///
-/// Open with [`AoaLink::open`] / [`AoaLink::open_default`]. Config packet is
-/// written once on open; subsequent `write_all` calls are chunked.
+/// Open with [`AoaLink::open`] / [`AoaLink::open_with`] / [`AoaLink::open_default`].
+/// Config packet is written once on open; subsequent `write_all` calls are chunked.
 #[derive(Debug)]
 pub struct AoaLink {
     inner: AoaLinkInner<FileTransport, TokioDelay>,
 }
 
 impl AoaLink {
-    /// Open `path` read/write (no create), write [`AOA_CONFIG_PACKET`] once
+    /// Open `path` with [`AoaOpenOptions`], write [`AOA_CONFIG_PACKET`] once
     /// unchunked, and return a ready link. On config write failure the FD is
     /// dropped and an error is returned — never a half-open link.
     ///
@@ -170,13 +207,23 @@ impl AoaLink {
     ///
     /// Returns an error if the path cannot be opened read/write or if the
     /// config packet write fails.
-    pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub async fn open_with(path: impl AsRef<Path>, opts: AoaOpenOptions) -> io::Result<Self> {
         let transport = FileTransport::open(path).await?;
-        let inner = AoaLinkInner::from_transport(transport, TokioDelay).await?;
+        let delay = TokioDelay::new(opts.inter_chunk_delay);
+        let inner = AoaLinkInner::from_transport(transport, delay, opts.max_chunk).await?;
         Ok(Self { inner })
     }
 
-    /// Open [`AOA_DEFAULT_PATH`].
+    /// Open `path` with [`AoaOpenOptions::default`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`AoaLink::open_with`].
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with(path, AoaOpenOptions::default()).await
+    }
+
+    /// Open [`AOA_DEFAULT_PATH`] with default options.
     ///
     /// # Errors
     ///
