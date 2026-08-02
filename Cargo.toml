@@ -5,6 +5,7 @@ members = [
     "crates/aa-registers",
     "crates/aa-link",
     "crates/aa-engine",
+    "crates/aa-mailbox",
 ]
 resolver = "3"
 

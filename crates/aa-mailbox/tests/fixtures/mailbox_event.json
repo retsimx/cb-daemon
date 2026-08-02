@@ -1,0 +1,10 @@
+{
+  "type": "mailbox_event",
+  "register": "zone_state",
+  "payload": {
+    "zone_id": "1",
+    "open": true,
+    "damper_pct": 80,
+    "measured_temp_c": 23.4
+  }
+}
