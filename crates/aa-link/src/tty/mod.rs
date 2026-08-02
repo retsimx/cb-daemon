@@ -21,7 +21,7 @@
 
 mod link;
 
-pub use link::{TTY_BAUD, TTY_DEFAULT_PATH, TtyLink};
+pub use link::{TTY_BAUD, TTY_DEFAULT_PATH, TtyLink, TtyOpenOptions};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
