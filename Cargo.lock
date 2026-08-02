@@ -7,6 +7,17 @@ name = "aa-crc"
 version = "0.1.0"
 
 [[package]]
+name = "aa-engine"
+version = "0.1.0"
+dependencies = [
+ "aa-crc",
+ "aa-frame",
+ "aa-link",
+ "aa-registers",
+ "tokio",
+]
+
+[[package]]
 name = "aa-frame"
 version = "0.1.0"
 dependencies = [

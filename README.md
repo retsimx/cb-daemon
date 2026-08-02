@@ -1,6 +1,6 @@
 # cb-daemon
 
-Foundation for a Control Box (CB) mailbox sync daemon that talks to Advantage Air air-conditioning systems. This repository holds the pure protocol crates and engineering scaffold; link backends, the sync engine, and full packaging come later.
+Foundation for a Control Box (CB) mailbox sync daemon that talks to Advantage Air air-conditioning systems. This repository holds the pure protocol crates (CRC, framing, registers, link backends, session engine) and engineering scaffold; the mailbox layer and full packaging come later.
 
 ## Workspace
 
@@ -10,15 +10,16 @@ Current Cargo workspace members:
 - **`aa-frame`** — `<U>…</U=xx>` frame encode/decode and burst scanning
 - **`aa-registers`** — register IDs, CAN2 wire codec, and register bank (scaffold)
 - **`aa-link`** — async byte I/O seam (`Link`), `MockLink` for hardware-free tests, `AoaLink` for raw `/dev/usb_accessory` (config on open, chunked writes; aaservice must not hold the accessory while open), and `TtyLink` for Linux USB-serial / USB-RS485 (57600 8N1 raw, full-frame writes; default `/dev/ttyUSB0`)
+- **`aa-engine`** — CB session state machine (negotiate / dump / steady poll) over a `Link`
 
-More crates (`aa-engine`, `aa-mailbox`, `cb-daemon`, …) will join the workspace in later issues.
+More crates (`aa-mailbox`, `cb-daemon`, …) will join the workspace in later issues.
 
 ## Development
 
 ```bash
 ./scripts/run_codequality.sh   # fmt check + clippy (-D warnings)
 ./scripts/run_tests.sh         # cargo test --workspace
-cargo test -p aa-crc -p aa-frame -p aa-registers -p aa-link
+cargo test -p aa-crc -p aa-frame -p aa-registers -p aa-link -p aa-engine
 ```
 
 ## Cross builds
