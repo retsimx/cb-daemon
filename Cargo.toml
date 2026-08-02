@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/aa-crc", "crates/aa-frame", "crates/aa-registers"]
+members = [
+    "crates/aa-crc",
+    "crates/aa-frame",
+    "crates/aa-registers",
+    "crates/aa-link",
+]
 resolver = "3"
 
 [workspace.package]

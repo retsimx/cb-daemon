@@ -9,15 +9,16 @@ Current Cargo workspace members:
 - **`aa-crc`** — CRC-8 used on CB frames
 - **`aa-frame`** — `<U>…</U=xx>` frame encode/decode and burst scanning
 - **`aa-registers`** — register IDs, CAN2 wire codec, and register bank (scaffold)
+- **`aa-link`** — async byte I/O seam (`Link`) and `MockLink` for hardware-free tests
 
-More crates (`aa-link`, `aa-engine`, `aa-mailbox`, `cb-daemon`, …) will join the workspace in later issues.
+More crates (`aa-engine`, `aa-mailbox`, `cb-daemon`, …) will join the workspace in later issues.
 
 ## Development
 
 ```bash
 ./scripts/run_codequality.sh   # fmt check + clippy (-D warnings)
 ./scripts/run_tests.sh         # cargo test --workspace
-cargo test -p aa-crc -p aa-frame -p aa-registers
+cargo test -p aa-crc -p aa-frame -p aa-registers -p aa-link
 ```
 
 ## Cross builds
