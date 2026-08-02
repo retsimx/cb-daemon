@@ -1,0 +1,10 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Editor / OS junk
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

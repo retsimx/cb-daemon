@@ -1,0 +1,10 @@
+# Example cb-daemon config for Magisk installs (placeholder keys only).
+
+# Link backend to use (e.g. serial, stub). Not wired yet.
+# link_backend = "serial"
+
+# Device path for the serial/link backend.
+# device_path = "/dev/ttyUSB0"
+
+# WebSocket bind address for the control/UI surface.
+# ws_bind = "127.0.0.1:8080"

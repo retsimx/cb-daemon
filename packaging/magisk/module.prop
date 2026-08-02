@@ -1,0 +1,7 @@
+# Magisk module metadata stub — non-functional placeholder for later packaging.
+id=cb-daemon
+name=cb-daemon
+version=0.1.0
+versionCode=1
+author=retsimx
+description=Android Auto serial bridge daemon (stub Magisk module; not installable yet)
