@@ -64,14 +64,34 @@ cargo test -p aa-crc -p aa-frame -p aa-registers -p aa-link -p aa-engine -p aa-m
 
 ```bash
 ./scripts/build-pi-zero.sh         # arm-unknown-linux-musleabihf via cross
-./scripts/build-android-armv7.sh   # NDK / cargo-ndk (local only)
+./scripts/build-android-armv7.sh   # NDK / cargo-ndk (local only) → dist/android-armv7/cb-daemon
+./scripts/pack-magisk.sh           # Magisk zip from packaging/magisk + that binary
 ```
 
-CI builds the Pi musl target only; Android/NDK is local scaffolding for later Magisk work.
+CI builds the Pi musl target only. Android/NDK is **local only** (not wired into CI).
 
-## Packaging stubs
+### Android ARMv7 (local)
 
-`packaging/magisk/` and `packaging/systemd/` are placeholders — not installable Magisk modules or production unit files yet. Ship `packaging/cb-daemon.example.toml` as the config template.
+Tested baseline (informative — no hard version gate in the script):
+
+- Android NDK **r26+** or **r27**
+- API **21** (`cargo-ndk --platform 21`)
+- Target `armv7-linux-androideabi`
+- `cargo-ndk` on `PATH`
+- `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` set
+
+```bash
+./scripts/build-android-armv7.sh   # stripped binary → dist/android-armv7/cb-daemon
+./scripts/pack-magisk.sh           # → dist/android-armv7/cb-daemon-magisk.zip
+```
+
+Override binary path for packing with `CB_DAEMON_BIN=/path/to/cb-daemon`.
+
+## Packaging
+
+- **Magisk** (`packaging/magisk/`): installable module (flash the zip from `pack-magisk.sh`). Runtime binary/config live under `/data/adb/cb-daemon/`. Ops notes and a device start/stop checklist: [`packaging/magisk/README.md`](packaging/magisk/README.md).
+- **systemd** (`packaging/systemd/`): placeholder unit — not production-ready yet.
+- Canonical host config example: [`packaging/cb-daemon.example.toml`](packaging/cb-daemon.example.toml).
 
 ## Tracking
 
