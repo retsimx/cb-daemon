@@ -1,12 +1,13 @@
-# Magisk packaging placeholder — units/service wiring is a non-goal for D9.
-# Canonical keyed example: packaging/cb-daemon.example.toml
-# Copy keys from there into /etc/cb-daemon/config.toml on device.
+# Magisk device defaults for cb-daemon.
+# Installed to /data/adb/cb-daemon/config.toml on first install only
+# (existing config is preserved on module upgrade).
+# Precedence on the daemon: defaults → this file → env (CB_DAEMON_*) → CLI.
 
-# backend = "aoa"
-# device = "/dev/usb_accessory"
-# bind = "127.0.0.1:2026"
-# unit_id_hint = "11111"
-# log_level = "info"
-# aoa_chunk_size = 63
-# aoa_chunk_delay_ms = 1
-# tty_baud = 57600
+backend = "aoa"
+device = "/dev/usb_accessory"
+bind = "127.0.0.1:2026"
+unit_id_hint = "11111"
+log_level = "info"
+aoa_chunk_size = 63
+aoa_chunk_delay_ms = 1
+tty_baud = 57600
