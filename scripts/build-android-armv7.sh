@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 TARGET="armv7-linux-androideabi"
-CRATES=(aa-crc aa-frame aa-registers)
+CRATES=(aa-crc aa-frame aa-registers aa-link)
 
 if ! command -v cargo-ndk >/dev/null 2>&1; then
   cat >&2 <<'MSG'

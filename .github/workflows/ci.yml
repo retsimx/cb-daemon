@@ -73,5 +73,5 @@ jobs:
           tool: cross
       - name: Cross-build Pi musl armhf
         run: >
-          cross build -p aa-crc -p aa-frame -p aa-registers
+          cross build -p aa-crc -p aa-frame -p aa-registers -p aa-link
           --target arm-unknown-linux-musleabihf --release
