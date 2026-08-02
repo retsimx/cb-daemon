@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 TARGET="arm-unknown-linux-musleabihf"
-CRATES=(aa-crc aa-frame)
+CRATES=(aa-crc aa-frame aa-registers)
 
 if ! command -v cross >/dev/null 2>&1; then
   cat >&2 <<'MSG'
