@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -21,14 +22,14 @@ pub const AOA_INTER_CHUNK_DELAY: Duration = Duration::from_millis(1);
 
 /// Async byte transport over the accessory device (or a test double).
 pub(super) trait AccessoryTransport: Send {
-    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
-    async fn write_all(&mut self, data: &[u8]) -> io::Result<()>;
-    async fn close(&mut self) -> io::Result<()>;
+    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
+    fn write_all(&mut self, data: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+    fn close(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 /// Injectable delay between payload chunks.
 pub(super) trait InterChunkDelay: Send {
-    async fn sleep(&mut self);
+    fn sleep(&mut self) -> impl Future<Output = ()> + Send;
 }
 
 /// Production delay: [`tokio::time::sleep`] for [`AOA_INTER_CHUNK_DELAY`].
