@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["fs", "io-util", "time", "macros", "rt"] }
+rustix = { version = "1", features = ["fs", "termios"] }
+tokio = { version = "1", features = ["fs", "io-util", "time", "macros", "rt", "net"] }
 
 [lints]
 workspace = true
