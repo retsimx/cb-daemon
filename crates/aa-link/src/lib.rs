@@ -1,9 +1,14 @@
 //! Async byte I/O seam for Android Auto link backends.
 //!
-//! Provides [`Link`] for engine-facing read/write/close, and [`MockLink`] for
-//! scripted unit tests without hardware.
+//! Provides [`Link`] for engine-facing read/write/close, [`MockLink`] for
+//! scripted unit tests without hardware, and [`AoaLink`] for the raw
+//! `/dev/usb_accessory` USB Accessory backend.
 
 #![allow(async_fn_in_trait)] // D3: native async `Link`; consumers use `L: Link`, not `dyn Link`.
+
+mod aoa;
+
+pub use aoa::{AOA_CONFIG_PACKET, AOA_DEFAULT_PATH, AOA_INTER_CHUNK_DELAY, AOA_MAX_CHUNK, AoaLink};
 
 use std::collections::VecDeque;
 use std::io;
@@ -27,7 +32,7 @@ pub trait Link: Send {
     async fn close(&mut self) -> io::Result<()>;
 }
 
-fn closed_error() -> io::Error {
+pub(crate) fn closed_error() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "link closed")
 }
 
