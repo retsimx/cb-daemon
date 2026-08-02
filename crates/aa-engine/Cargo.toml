@@ -1,0 +1,16 @@
+[package]
+name = "aa-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aa-frame = { path = "../aa-frame" }
+aa-registers = { path = "../aa-registers" }
+aa-link = { path = "../aa-link" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "io-util"] }
+
+[dev-dependencies]
+aa-crc = { workspace = true }
+
+[lints]
+workspace = true

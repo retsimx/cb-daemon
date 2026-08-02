@@ -4,6 +4,7 @@ members = [
     "crates/aa-frame",
     "crates/aa-registers",
     "crates/aa-link",
+    "crates/aa-engine",
 ]
 resolver = "3"
 
