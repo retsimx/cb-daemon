@@ -1,5 +1,6 @@
 # Rust / Cargo
 /target/
+/dist/
 **/*.rs.bk
 
 # Editor / OS junk
