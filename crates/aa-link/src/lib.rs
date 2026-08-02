@@ -14,11 +14,14 @@ pub use aoa::{AOA_CONFIG_PACKET, AOA_DEFAULT_PATH, AOA_INTER_CHUNK_DELAY, AOA_MA
 pub use tty::{TTY_BAUD, TTY_DEFAULT_PATH, TtyLink};
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 
 /// Async byte transport used by the protocol engine.
 ///
-/// Implementors must be [`Send`]. Native Rust 2024 `async fn` methods are not
+/// Implementors must be [`Send`]. Futures returned by I/O methods are also
+/// [`Send`] so callers can drive the link on multi-thread runtimes
+/// (`tokio::spawn`). Native Rust 2024 `async fn` / `impl Future` methods are not
 /// dyn-compatible; consumers should use generics (`L: Link`).
 pub trait Link: Send {
     /// Read up to `buf.len()` bytes into `buf`.
@@ -26,13 +29,13 @@ pub trait Link: Send {
     /// Returns the number of bytes read. `Ok(0)` indicates end-of-stream / no
     /// more data available (for example an empty inbound script on
     /// [`MockLink`]).
-    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
 
     /// Write all of `data` to the link.
-    async fn write_all(&mut self, data: &[u8]) -> io::Result<()>;
+    fn write_all(&mut self, data: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
 
     /// Close the link. Subsequent I/O should fail. Idempotent.
-    async fn close(&mut self) -> io::Result<()>;
+    fn close(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 pub(crate) fn closed_error() -> io::Error {
