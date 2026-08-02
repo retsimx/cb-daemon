@@ -1,0 +1,6 @@
+{
+  "type": "ack",
+  "msg_id": "req-101",
+  "status": "error",
+  "reason": "register write rejected"
+}
