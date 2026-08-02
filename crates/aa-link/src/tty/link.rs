@@ -17,6 +17,19 @@ pub const TTY_DEFAULT_PATH: &str = "/dev/ttyUSB0";
 /// Baud rate: 57600 (8N1 raw).
 pub const TTY_BAUD: u32 = speed::B57600;
 
+/// Options for [`TtyLink::open_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtyOpenOptions {
+    /// Baud rate in bits per second (e.g. 57600).
+    pub baud: u32,
+}
+
+impl Default for TtyOpenOptions {
+    fn default() -> Self {
+        Self { baud: TTY_BAUD }
+    }
+}
+
 /// Async byte transport over a serial device (or a test double).
 pub(super) trait SerialTransport: Send {
     fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
@@ -24,12 +37,35 @@ pub(super) trait SerialTransport: Send {
     fn close(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
-/// Apply 57600 8N1 raw settings to an existing [`Termios`] value.
+/// Map a numeric baud rate to a rustix [`speed`] constant.
+///
+/// Supported rates include the common Linux termios speeds; at minimum 57600.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] for unsupported baud rates.
+pub(super) fn map_baud_to_speed(baud: u32) -> io::Result<u32> {
+    match baud {
+        speed::B9600 => Ok(speed::B9600),
+        speed::B19200 => Ok(speed::B19200),
+        speed::B38400 => Ok(speed::B38400),
+        speed::B57600 => Ok(speed::B57600),
+        speed::B115200 => Ok(speed::B115200),
+        speed::B230400 => Ok(speed::B230400),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported baud rate: {other}"),
+        )),
+    }
+}
+
+/// Apply 8N1 raw settings at `baud` to an existing [`Termios`] value.
 ///
 /// Does not touch the FD; callers apply with [`tcsetattr`].
-pub(super) fn apply_tty_settings(termios: &mut Termios) -> io::Result<()> {
+pub(super) fn apply_tty_settings(termios: &mut Termios, baud: u32) -> io::Result<()> {
+    let speed_val = map_baud_to_speed(baud)?;
     termios.make_raw();
-    termios.set_speed(TTY_BAUD)?;
+    termios.set_speed(speed_val)?;
 
     // 8N1 + enable receiver; ignore modem control lines; no hardware RTS/CTS.
     let mut control = termios.control_modes;
@@ -47,9 +83,9 @@ pub(super) fn apply_tty_settings(termios: &mut Termios) -> io::Result<()> {
     Ok(())
 }
 
-fn configure_fd(fd: &OwnedFd) -> io::Result<()> {
+fn configure_fd(fd: &OwnedFd, baud: u32) -> io::Result<()> {
     let mut termios = tcgetattr(fd).map_err(io::Error::from)?;
-    apply_tty_settings(&mut termios)?;
+    apply_tty_settings(&mut termios, baud)?;
     tcsetattr(fd, OptionalActions::Now, &termios).map_err(io::Error::from)
 }
 
@@ -60,7 +96,7 @@ struct FileTransport {
 }
 
 impl FileTransport {
-    fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    fn open(path: impl AsRef<Path>, baud: u32) -> io::Result<Self> {
         let fd = open(
             path.as_ref(),
             OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
@@ -69,7 +105,7 @@ impl FileTransport {
         .map_err(io::Error::from)?;
 
         // Termios failure must not leave a usable half-open link: drop `fd`.
-        if let Err(err) = configure_fd(&fd) {
+        if let Err(err) = configure_fd(&fd, baud) {
             drop(fd);
             return Err(err);
         }
@@ -167,32 +203,42 @@ impl<T: SerialTransport> Link for TtyLinkInner<T> {
 
 /// USB-serial [`Link`] over a TTY path (default [`TTY_DEFAULT_PATH`]).
 ///
-/// Open with [`TtyLink::open`] / [`TtyLink::open_default`]. Configures
-/// 57600 8N1 raw mode on open; subsequent `write_all` calls write the full
-/// buffer without chunking.
+/// Open with [`TtyLink::open`] / [`TtyLink::open_with`] / [`TtyLink::open_default`].
+/// Configures 8N1 raw mode at the requested baud on open; subsequent
+/// `write_all` calls write the full buffer without chunking.
 #[derive(Debug)]
 pub struct TtyLink {
     inner: TtyLinkInner<FileTransport>,
 }
 
 impl TtyLink {
-    /// Open `path` read/write (no create), apply 57600 8N1 raw termios, and
-    /// return a ready link. On termios failure the FD is dropped and an error
-    /// is returned — never a half-open link.
+    /// Open `path` with [`TtyOpenOptions`], apply 8N1 raw termios at `opts.baud`,
+    /// and return a ready link. On termios failure the FD is dropped and an
+    /// error is returned — never a half-open link.
     ///
     /// # Errors
     ///
-    /// Returns an error if the path cannot be opened read/write, termios
-    /// configuration fails, or the FD cannot be registered with the reactor.
+    /// Returns an error if the path cannot be opened read/write, the baud rate
+    /// is unsupported, termios configuration fails, or the FD cannot be
+    /// registered with the reactor.
     #[allow(clippy::unused_async)] // async API parity with AoaLink::open
-    pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let transport = FileTransport::open(path)?;
+    pub async fn open_with(path: impl AsRef<Path>, opts: TtyOpenOptions) -> io::Result<Self> {
+        let transport = FileTransport::open(path, opts.baud)?;
         Ok(Self {
             inner: TtyLinkInner::from_transport(transport),
         })
     }
 
-    /// Open [`TTY_DEFAULT_PATH`].
+    /// Open `path` with [`TtyOpenOptions::default`] (57600 8N1 raw).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`TtyLink::open_with`].
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with(path, TtyOpenOptions::default()).await
+    }
+
+    /// Open [`TTY_DEFAULT_PATH`] with default options.
     ///
     /// # Errors
     ///

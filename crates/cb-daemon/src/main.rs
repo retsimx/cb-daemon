@@ -1,17 +1,12 @@
 //! Binary entry for `cb-daemon`.
 
 use anyhow::Context;
-use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
-use cb_daemon::{Config, run};
+use cb_daemon::{init_tracing, load_config, run};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
-        .init();
-
-    let config = Config::parse();
+    let config = load_config().context("load configuration")?;
+    init_tracing(&config.log_level).context("init tracing")?;
     run(config).await.context("cb-daemon failed")
 }
