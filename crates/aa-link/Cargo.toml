@@ -3,8 +3,8 @@ name = "aa-link"
 version.workspace = true
 edition.workspace = true
 
-[dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+[dependencies]
+tokio = { version = "1", features = ["fs", "io-util", "time", "macros", "rt"] }
 
 [lints]
 workspace = true
