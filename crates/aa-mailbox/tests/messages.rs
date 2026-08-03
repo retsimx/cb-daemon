@@ -130,6 +130,7 @@ fn golden_command_round_trip() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn acceptance_snapshot_bank_round_trip() {
     let mut bank = RegisterBank::new();
     let status = SystemStatus {
@@ -218,10 +219,7 @@ fn acceptance_snapshot_bank_round_trip() {
         s.clone()
     });
     assert_eq!(body.zone_config, {
-        let ServerMessage::MailboxSnapshot {
-            zone_config: c, ..
-        } = &snap2
-        else {
+        let ServerMessage::MailboxSnapshot { zone_config: c, .. } = &snap2 else {
             panic!("expected snapshot");
         };
         c.clone()
@@ -239,10 +237,7 @@ fn acceptance_snapshot_bank_round_trip() {
     else {
         panic!("expected can_records on resnapshot");
     };
-    assert_eq!(
-        body.can_records.as_ref().map(Vec::len),
-        Some(recs2.len())
-    );
+    assert_eq!(body.can_records.as_ref().map(Vec::len), Some(recs2.len()));
 }
 
 #[test]

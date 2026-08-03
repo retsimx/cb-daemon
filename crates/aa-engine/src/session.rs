@@ -24,6 +24,7 @@ pub(crate) enum State {
 
 /// Pure sync session: Ping/frame handlers, register bank, write queue.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // protocol flags are independent, not a bitfield
 pub(crate) struct Session {
     state: State,
     bank: RegisterBank,
@@ -319,7 +320,7 @@ impl Session {
     /// Seed reg 05 from zone setpoints when the dump omitted it.
     ///
     /// Without this, mailbox snapshots have zones but no `system_status`, so aaservice
-    /// never emits `getSystemData` and MyAir5 `:2025` keeps `aircons: {}`.
+    /// never emits `getSystemData` and `MyAir5` `:2025` keeps `aircons: {}`.
     fn maybe_synthesize_system_status_from_zones(&mut self) {
         let unit = self.primary_unit_id();
         if unit == UnitId::ZERO {
@@ -409,6 +410,7 @@ fn parse_system_data_xml_status(payload: &[u8]) -> Option<SystemStatus> {
         _ => return None,
     };
     let set_temp_c: f32 = xml_tag(text, "setTemp")?.parse().ok()?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let set_temp_x2 = (set_temp_c * 2.0).round().clamp(0.0, 255.0) as u8;
     let myzone_id: u8 = xml_tag(text, "myZone")
         .and_then(|s| s.parse().ok())
@@ -443,9 +445,9 @@ mod tests {
     use aa_registers::{Dest, RegId, UnitId, UnitType};
 
     /// Minimal stock-shaped getSystemData XML (tags the parser requires).
-    const SAMPLE_SYSTEM_XML: &[u8] = br#"<request>getSystemData</request>
+    const SAMPLE_SYSTEM_XML: &[u8] = b"<request>getSystemData</request>
 <aircon><info><state>on</state><mode>cool</mode><fan>high</fan>
-<setTemp>24.0</setTemp><myZone>1</myZone><freshAir>none</freshAir></info></aircon>"#;
+<setTemp>24.0</setTemp><myZone>1</myZone><freshAir>none</freshAir></info></aircon>";
 
     fn sample_record() -> CanRecord {
         CanRecord {
@@ -529,7 +531,8 @@ mod tests {
         assert_eq!(s.state, State::Steady);
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         assert_eq!(
-            s.bank.get(dump_rec.unit_type, dump_rec.unit_id, dump_rec.reg),
+            s.bank
+                .get(dump_rec.unit_type, dump_rec.unit_id, dump_rec.reg),
             Some(dump_rec.data)
         );
     }
@@ -561,7 +564,9 @@ mod tests {
         let Some(EngineEvent::Snapshot {
             bank,
             can_records: Some(recs),
-        }) = ev.into_iter().find(|e| matches!(e, EngineEvent::Snapshot { .. }))
+        }) = ev
+            .into_iter()
+            .find(|e| matches!(e, EngineEvent::Snapshot { .. }))
         else {
             panic!("expected Snapshot with can_records");
         };
@@ -640,10 +645,11 @@ mod tests {
         let _ = s.on_frame(&get_can_payload(std::slice::from_ref(&live)));
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
-        assert!(s
-            .bank
-            .get(UnitType::AIRCON, live.unit_id, RegId::new(0x05))
-            .is_some());
+        assert!(
+            s.bank
+                .get(UnitType::AIRCON, live.unit_id, RegId::new(0x05))
+                .is_some()
+        );
     }
 
     #[test]
@@ -720,7 +726,10 @@ mod tests {
 
         let _ = s.on_frame(b"CAN2 in use");
         assert!(s.can_in_use);
-        assert!(s.on_ping().is_none(), "must not send empty setCAN while can_in_use");
+        assert!(
+            s.on_ping().is_none(),
+            "must not send empty setCAN while can_in_use"
+        );
     }
 
     #[test]
@@ -735,7 +744,10 @@ mod tests {
 
         let live = live_unit_reg06();
         let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&live)));
-        assert!(ev.iter().any(|e| matches!(e, EngineEvent::RegistersChanged { .. })));
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, EngineEvent::RegistersChanged { .. }))
+        );
         assert!(ev.iter().any(|e| matches!(e, EngineEvent::Snapshot { .. })));
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
 

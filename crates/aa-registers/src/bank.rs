@@ -158,10 +158,10 @@ impl RegisterBank {
     /// not filtered through the mock feeder id (`abcde`).
     #[must_use]
     pub fn preferred_unit_id(&self, unit_type: UnitType, hint: Option<UnitId>) -> UnitId {
-        if let Some(hint) = hint {
-            if self.has_unit(unit_type, hint) {
-                return hint;
-            }
+        if let Some(hint) = hint
+            && self.has_unit(unit_type, hint)
+        {
+            return hint;
         }
         let mut best: Option<UnitId> = None;
         for key in self.slots.keys() {

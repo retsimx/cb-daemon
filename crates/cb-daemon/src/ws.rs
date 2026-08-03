@@ -31,7 +31,7 @@ pub(crate) const SINGLE_CLIENT_CLOSE_REASON: &str = "Single client limit enforce
 #[derive(Debug, Clone)]
 pub(crate) struct HeldSnapshot {
     pub bank: RegisterBank,
-    /// CB dump `can_records` for MyAir5 rawCan (excludes synthesized regs).
+    /// CB dump `can_records` for `MyAir5` `rawCan` (excludes synthesized regs).
     pub can_records: Option<Vec<String>>,
 }
 
@@ -219,10 +219,7 @@ async fn forward_engine_event(
             }
             Ok(true)
         }
-        Ok(EngineEvent::Snapshot {
-            bank,
-            can_records,
-        }) => {
+        Ok(EngineEvent::Snapshot { bank, can_records }) => {
             let unit_id = resolve_unit_id(&bank, state.unit_id_hint);
             let snap =
                 snapshot_from_bank_with_can_records(&bank, UnitType::AIRCON, unit_id, can_records);
@@ -253,12 +250,10 @@ async fn handle_client_text(
             register,
             payload,
         }) => {
-            let unit_id = state
-                .snapshot
-                .borrow()
-                .as_ref()
-                .map(|held| resolve_unit_id(&held.bank, state.unit_id_hint))
-                .unwrap_or_else(|| state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID));
+            let unit_id = state.snapshot.borrow().as_ref().map_or_else(
+                || state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID),
+                |held| resolve_unit_id(&held.bank, state.unit_id_hint),
+            );
             match records_from_update(UnitType::AIRCON, unit_id, &register, &payload) {
                 Ok(records) => {
                     let cmd = EngineCmd::WriteRegisters(records);

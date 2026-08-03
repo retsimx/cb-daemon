@@ -266,10 +266,7 @@ async fn fanout_events(
 ) {
     while let Some(ev) = ev_rx.recv().await {
         match &ev {
-            EngineEvent::Snapshot {
-                bank,
-                can_records,
-            } => {
+            EngineEvent::Snapshot { bank, can_records } => {
                 let _ = snapshot_tx.send(Some(ws::HeldSnapshot {
                     bank: bank.clone(),
                     can_records: can_records.clone(),

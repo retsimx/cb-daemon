@@ -131,23 +131,16 @@ impl<L: Link> CbEngine<L> {
 
         if is_ping(&frame.payload) {
             if let Some(payload) = session.on_ping() {
-                eprintln!("cb-engine: ping reply tx={}", String::from_utf8_lossy(&payload));
                 let encoded = Frame { payload }.encode();
                 if let Err(err) = self.link.write_all(&encoded).await {
                     let _ = ev_tx.send(EngineEvent::LinkError(err.to_string())).await;
                     let _ = self.link.close().await;
                     return true;
                 }
-            } else {
-                eprintln!("cb-engine: ping (no tx)");
             }
             return false;
         }
 
-        eprintln!(
-            "cb-engine: frame rx={}",
-            String::from_utf8_lossy(&frame.payload)
-        );
         for event in session.on_frame(&frame.payload) {
             if ev_tx.send(event).await.is_err() {
                 let _ = self.link.close().await;
@@ -462,7 +455,7 @@ mod tests {
         match ev {
             EngineEvent::LinkError(msg) => {
                 assert!(
-                    msg.contains("EOF") || msg.contains("0"),
+                    msg.contains("EOF") || msg.contains('0'),
                     "expected EOF wording, got {msg}"
                 );
             }
