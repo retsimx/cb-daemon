@@ -19,6 +19,22 @@ const ZONE_SCAN: std::ops::RangeInclusive<u8> = 1..=10;
 /// Default zone-config header when synthesizing CB→tablet bytes from a DTO.
 const ZONE_CONFIG_HEADER_CB_TO_TABLET: u8 = 0x20;
 
+/// Build a `mailbox_snapshot` from one unit in `bank`, optionally overriding
+/// `can_records` (CB dump hex for MyAir5 rawCan; excludes synthesized regs).
+#[must_use]
+pub fn snapshot_from_bank_with_can_records(
+    bank: &RegisterBank,
+    unit_type: UnitType,
+    unit_id: UnitId,
+    can_records: Option<Vec<String>>,
+) -> ServerMessage {
+    let mut body = snapshot_body_from_bank(bank, unit_type, unit_id);
+    if let Some(recs) = can_records {
+        body.can_records = if recs.is_empty() { None } else { Some(recs) };
+    }
+    ServerMessage::from_snapshot_body(body)
+}
+
 /// Build a `mailbox_snapshot` [`ServerMessage`] from one unit in `bank`.
 ///
 /// Absent registers become omitted optional fields. An empty zones map is
@@ -29,7 +45,7 @@ pub fn snapshot_from_bank(
     unit_type: UnitType,
     unit_id: UnitId,
 ) -> ServerMessage {
-    ServerMessage::from_snapshot_body(snapshot_body_from_bank(bank, unit_type, unit_id))
+    snapshot_from_bank_with_can_records(bank, unit_type, unit_id, None)
 }
 
 /// Snapshot body fields for one unit (without the message `type` tag).
@@ -63,11 +79,23 @@ pub fn snapshot_body_from_bank(
     }
     let zones = if zones.is_empty() { None } else { Some(zones) };
 
+    let can_records: Vec<String> = bank
+        .records_for_unit(unit_type, unit_id)
+        .into_iter()
+        .map(|r| r.to_wire())
+        .collect();
+    let can_records = if can_records.is_empty() {
+        None
+    } else {
+        Some(can_records)
+    };
+
     SnapshotBody {
         unit_id: unit_id.to_string(),
         system_status,
         zone_config,
         zones,
+        can_records,
     }
 }
 
@@ -466,7 +494,9 @@ fn sensor_from_str(s: &str) -> Result<SensorType, EncodeError> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use aa_registers::{Fan, FreshAir, Mode, Power, SensorType, UnitId, UnitType};
+    use aa_registers::{
+        CanRecord, Dest, Fan, FreshAir, Mode, Power, RegId, SensorType, UnitId, UnitType,
+    };
     use serde_json::json;
 
     fn unit_id() -> UnitId {
@@ -533,6 +563,7 @@ mod tests {
             system_status,
             zone_config,
             zones,
+            can_records,
         } = msg
         else {
             panic!("expected snapshot");
@@ -557,6 +588,28 @@ mod tests {
         assert_eq!(z1.sensor_type, "wired");
         assert!((z1.target_temp_c - 22.5).abs() < f64::EPSILON);
         assert!((z1.measured_temp_c - 23.1).abs() < f64::EPSILON);
+        let can_records = can_records.expect("can_records");
+        assert_eq!(can_records.len(), 3);
+        assert!(can_records.iter().any(|r| r[9..11] == *"05"));
+        assert!(can_records.iter().any(|r| r[9..11] == *"01"));
+        assert!(can_records.iter().any(|r| r[9..11] == *"03"));
+    }
+
+    #[test]
+    fn snapshot_includes_opaque_regs_in_can_records() {
+        // Regression: MyAir5 rawCan needs the full dump (02/04/08/0a), not only DTOs.
+        let mut bank = seed_bank();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: unit_id(),
+            reg: RegId::new(0x0a),
+            data: [0; 7],
+        });
+        let body = snapshot_body_from_bank(&bank, UnitType::AIRCON, unit_id());
+        let records = body.can_records.expect("can_records");
+        assert!(records.iter().any(|r| &r[9..11] == "0a"));
+        assert_eq!(records.len(), 4);
     }
 
     #[test]

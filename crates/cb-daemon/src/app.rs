@@ -9,7 +9,6 @@ use aa_engine::{CbEngine, EngineCmd, EngineEvent};
 use aa_link::{
     AOA_DEFAULT_PATH, AoaLink, AoaOpenOptions, Link, TTY_DEFAULT_PATH, TtyLink, TtyOpenOptions,
 };
-use aa_registers::RegisterBank;
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
@@ -144,12 +143,14 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
     match config.backend {
         Backend::Mock => run_mock_with_listener(listener, shutdown_rx, None, true).await,
         Backend::Aoa => {
+            let hint = config.unit_id_hint;
             let link = open_aoa(&config).await?;
-            run_with_link(listener, link, shutdown_rx, None).await
+            run_with_link(listener, link, shutdown_rx, None, hint).await
         }
         Backend::Tty => {
+            let hint = config.unit_id_hint;
             let link = open_tty(&config).await?;
-            run_with_link(listener, link, shutdown_rx, None).await
+            run_with_link(listener, link, shutdown_rx, None, hint).await
         }
     }
 }
@@ -193,7 +194,7 @@ async fn run_mock_with_listener(
     let (link, mock, notify) = SharedMockLink::new();
     let feeder =
         with_feeder.then(|| tokio::spawn(mock_feeder::run_negotiate_dump_feeder(mock, notify)));
-    let result = run_with_link(listener, link, shutdown_rx, cmd_spy).await;
+    let result = run_with_link(listener, link, shutdown_rx, cmd_spy, None).await;
     if let Some(feeder) = feeder {
         feeder.abort();
         let _ = feeder.await;
@@ -206,10 +207,11 @@ async fn run_with_link<L: Link + 'static>(
     link: L,
     shutdown_rx: oneshot::Receiver<()>,
     cmd_spy: Option<Arc<Mutex<Vec<EngineCmd>>>>,
+    unit_id_hint: Option<aa_registers::UnitId>,
 ) -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(CHANNEL_BOUND);
     let (ev_tx, ev_rx) = mpsc::channel::<EngineEvent>(CHANNEL_BOUND);
-    let (snapshot_tx, snapshot_rx) = watch::channel::<Option<RegisterBank>>(None);
+    let (snapshot_tx, snapshot_rx) = watch::channel::<Option<ws::HeldSnapshot>>(None);
     let (broadcast_tx, _) = broadcast::channel::<EngineEvent>(CHANNEL_BOUND);
 
     let engine = CbEngine::new(link);
@@ -228,6 +230,7 @@ async fn run_with_link<L: Link + 'static>(
         events: broadcast_tx,
         session_held: Arc::new(AtomicBool::new(false)),
         cmd_spy,
+        unit_id_hint,
     };
     let router = ws::router(state);
 
@@ -258,13 +261,19 @@ async fn run_with_link<L: Link + 'static>(
 
 async fn fanout_events(
     mut ev_rx: mpsc::Receiver<EngineEvent>,
-    snapshot_tx: watch::Sender<Option<RegisterBank>>,
+    snapshot_tx: watch::Sender<Option<ws::HeldSnapshot>>,
     broadcast_tx: broadcast::Sender<EngineEvent>,
 ) {
     while let Some(ev) = ev_rx.recv().await {
         match &ev {
-            EngineEvent::Snapshot(bank) => {
-                let _ = snapshot_tx.send(Some(bank.clone()));
+            EngineEvent::Snapshot {
+                bank,
+                can_records,
+            } => {
+                let _ = snapshot_tx.send(Some(ws::HeldSnapshot {
+                    bank: bank.clone(),
+                    can_records: can_records.clone(),
+                }));
                 let _ = broadcast_tx.send(ev);
             }
             EngineEvent::Negotiated { detail } => {

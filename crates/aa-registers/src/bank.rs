@@ -143,6 +143,40 @@ impl RegisterBank {
         self.slots.get(key).copied()
     }
 
+    /// Whether any slot exists for `(unit_type, unit_id)` (any register / zone).
+    #[must_use]
+    pub fn has_unit(&self, unit_type: UnitType, unit_id: UnitId) -> bool {
+        self.slots
+            .keys()
+            .any(|k| k.unit_type == unit_type && k.unit_id == unit_id)
+    }
+
+    /// Prefer `hint` when present in the bank; else the smallest `unit_id` seen for
+    /// `unit_type`; else `hint` (even if empty); else [`UnitId::ZERO`].
+    ///
+    /// Used by the WebSocket snapshot path so live AOA dumps (real unit ids) are
+    /// not filtered through the mock feeder id (`abcde`).
+    #[must_use]
+    pub fn preferred_unit_id(&self, unit_type: UnitType, hint: Option<UnitId>) -> UnitId {
+        if let Some(hint) = hint {
+            if self.has_unit(unit_type, hint) {
+                return hint;
+            }
+        }
+        let mut best: Option<UnitId> = None;
+        for key in self.slots.keys() {
+            if key.unit_type != unit_type {
+                continue;
+            }
+            best = Some(match best {
+                None => key.unit_id,
+                Some(cur) if key.unit_id.get() < cur.get() => key.unit_id,
+                Some(cur) => cur,
+            });
+        }
+        best.or(hint).unwrap_or(UnitId::ZERO)
+    }
+
     /// Look up a non-zone slot and decode via `(reg, data)` only (no dest).
     #[must_use]
     pub fn get_decoded(
@@ -166,6 +200,32 @@ impl RegisterBank {
     ) -> Option<DecodedRegister> {
         self.get_zone(unit_type, unit_id, reg, zone)
             .map(|data| DecodedRegister::from_reg_data(reg, data))
+    }
+
+    /// All slots for `(unit_type, unit_id)` as tablet-bound [`CanRecord`]s (stable order).
+    ///
+    /// Dest is always [`crate::wire::Dest::Tablet`] — mailbox identity ignores dest.
+    #[must_use]
+    pub fn records_for_unit(&self, unit_type: UnitType, unit_id: UnitId) -> Vec<CanRecord> {
+        use crate::wire::Dest;
+        let mut keys: Vec<&BankKey> = self
+            .slots
+            .keys()
+            .filter(|k| k.unit_type == unit_type && k.unit_id == unit_id)
+            .collect();
+        keys.sort_by_key(|k| (k.reg.get(), k.zone.unwrap_or(0)));
+        keys.into_iter()
+            .filter_map(|k| {
+                let data = self.slots.get(k).copied()?;
+                Some(CanRecord {
+                    unit_type: k.unit_type,
+                    dest: Dest::Tablet,
+                    unit_id: k.unit_id,
+                    reg: k.reg,
+                    data,
+                })
+            })
+            .collect()
     }
 }
 
@@ -265,5 +325,67 @@ mod tests {
         assert_eq!(BankKey::from_record(&a).zone, None);
         assert_eq!(BankKey::from_record(&b).zone, None);
         assert_eq!(BankKey::from_record(&a), BankKey::from_record(&b));
+    }
+
+    #[test]
+    fn preferred_unit_id_prefers_hint_when_present() {
+        // Regression: WS snapshots must not stick to mock feeder id `abcde`
+        // when the live dump uses another unit (e.g. `11111`).
+        let mut bank = RegisterBank::new();
+        let live = UnitId::try_new(0x0_11111).unwrap();
+        let mock = UnitId::try_new(0x0_ABCDE).unwrap();
+        let hint = live;
+
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: live,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: mock,
+            reg: RegId::new(0x06),
+            data: [1; 7],
+        });
+
+        assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, Some(hint)), live);
+        assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, Some(mock)), mock);
+    }
+
+    #[test]
+    fn preferred_unit_id_falls_back_to_smallest_seen() {
+        let mut bank = RegisterBank::new();
+        let a = UnitId::try_new(0x0_11111).unwrap();
+        let b = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: b,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: a,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        // Missing hint → smallest numeric id among AIRCON units.
+        assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, None), a);
+        // Hint absent from bank → still smallest seen (not the missing hint).
+        let missing = UnitId::try_new(0x0_FFFFF).unwrap();
+        assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, Some(missing)), a);
+    }
+
+    #[test]
+    fn preferred_unit_id_empty_bank_uses_hint_or_zero() {
+        let bank = RegisterBank::new();
+        let hint = UnitId::try_new(0x0_11111).unwrap();
+        assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, Some(hint)), hint);
+        assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, None), UnitId::ZERO);
     }
 }
