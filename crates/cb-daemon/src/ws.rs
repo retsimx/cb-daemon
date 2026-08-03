@@ -152,17 +152,68 @@ async fn wait_for_snapshot(
     }
 }
 
+/// Per-session `mailbox_update` ack state: acks are deferred until the engine
+/// confirms the write was transmitted ([`EngineEvent::WriteFlushed`]), so a
+/// success ack never lies when the bus is dead. FIFO: aaservice serializes
+/// outbound actions, so at most one write is in flight at a time.
+struct PendingAcks {
+    queue: std::collections::VecDeque<(String, tokio::time::Instant)>,
+    timeout: std::time::Duration,
+}
+
+impl PendingAcks {
+    const fn new() -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            timeout: std::time::Duration::from_secs(10),
+        }
+    }
+
+    fn push(&mut self, msg_id: String) {
+        self.queue
+            .push_back((msg_id, tokio::time::Instant::now() + self.timeout));
+    }
+
+    /// Pop the oldest pending ack as a success (write was flushed).
+    fn pop_front(&mut self) -> Option<String> {
+        self.queue.pop_front().map(|(msg_id, _)| msg_id)
+    }
+
+    /// Pop the oldest pending ack only when its deadline has passed.
+    fn pop_expired(&mut self) -> Option<String> {
+        let expired = self
+            .queue
+            .front()
+            .is_some_and(|(_, deadline)| tokio::time::Instant::now() >= *deadline);
+        if expired {
+            return self.queue.pop_front().map(|(msg_id, _)| msg_id);
+        }
+        None
+    }
+}
+
 async fn bridge_until_disconnect(socket: &mut WebSocket, state: &WsState) -> anyhow::Result<()> {
     let mut ev_rx = state.events.subscribe();
+    let mut pending = PendingAcks::new();
     loop {
+        // Expire stale write acks so a dead bus surfaces as an error ack.
+        if let Some(msg_id) = pending.pop_expired() {
+            send_ack(
+                socket,
+                &msg_id,
+                AckStatus::Error,
+                Some("write timeout".into()),
+            )
+            .await?;
+        }
         tokio::select! {
             msg = socket.next() => {
-                if !handle_ws_message(socket, state, msg).await? {
+                if !handle_ws_message(socket, state, msg, &mut pending).await? {
                     break;
                 }
             }
             ev = ev_rx.recv() => {
-                if !forward_engine_event(socket, state, ev).await? {
+                if !forward_engine_event(socket, state, ev, &mut pending).await? {
                     break;
                 }
             }
@@ -176,10 +227,11 @@ async fn handle_ws_message(
     socket: &mut WebSocket,
     state: &WsState,
     msg: Option<Result<Message, axum::Error>>,
+    pending: &mut PendingAcks,
 ) -> anyhow::Result<bool> {
     match msg {
         Some(Ok(Message::Text(text))) => {
-            handle_client_text(socket, state, &text).await?;
+            handle_client_text(socket, state, &text, pending).await?;
             Ok(true)
         }
         Some(Ok(Message::Ping(payload))) => {
@@ -211,9 +263,20 @@ async fn forward_engine_event(
     socket: &mut WebSocket,
     state: &WsState,
     ev: Result<EngineEvent, broadcast::error::RecvError>,
+    pending: &mut PendingAcks,
 ) -> anyhow::Result<bool> {
     match ev {
         Ok(EngineEvent::RegistersChanged { records }) => {
+            // USB parity: forward non-empty steady getCANs as a rawCan frame
+            // (MyAir5 secure rawCan), plus the typed DTO events for the mapper.
+            if !records.is_empty() {
+                let mut payload = String::from("getCAN 1");
+                for record in &records {
+                    payload.push(' ');
+                    payload.push_str(&record.to_wire());
+                }
+                send_json(socket, &ServerMessage::RawCan { payload }).await?;
+            }
             for msg in mailbox_events_from_records(&records) {
                 send_json(socket, &msg).await?;
             }
@@ -224,6 +287,17 @@ async fn forward_engine_event(
             let snap =
                 snapshot_from_bank_with_can_records(&bank, UnitType::AIRCON, unit_id, can_records);
             send_json(socket, &snap).await?;
+            Ok(true)
+        }
+        Ok(EngineEvent::WriteFlushed) => {
+            if let Some(msg_id) = pending.pop_front() {
+                send_ack(socket, &msg_id, AckStatus::Success, None).await?;
+            }
+            Ok(true)
+        }
+        Ok(EngineEvent::DirectReply { payload }) => {
+            let text = String::from_utf8_lossy(&payload).into_owned();
+            send_json(socket, &ServerMessage::DirectReply { payload: text }).await?;
             Ok(true)
         }
         Ok(other) => {
@@ -242,6 +316,7 @@ async fn handle_client_text(
     socket: &mut WebSocket,
     state: &WsState,
     text: &str,
+    pending: &mut PendingAcks,
 ) -> anyhow::Result<()> {
     let parsed: Result<ClientMessage, _> = serde_json::from_str(text);
     match parsed {
@@ -250,36 +325,13 @@ async fn handle_client_text(
             register,
             payload,
         }) => {
-            let unit_id = state.snapshot.borrow().as_ref().map_or_else(
-                || state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID),
-                |held| resolve_unit_id(&held.bank, state.unit_id_hint),
-            );
-            let held_bank = state
-                .snapshot
-                .borrow()
-                .as_ref()
-                .map(|held| held.bank.clone())
-                .unwrap_or_default();
-            match records_from_update_with_bank(
-                &held_bank,
-                UnitType::AIRCON,
-                unit_id,
-                &register,
-                &payload,
-            ) {
-                Ok(records) => {
-                    let cmd = EngineCmd::WriteRegisters(records);
-                    record_spy(state, &cmd).await;
-                    if let Err(err) = state.cmd_tx.send(cmd).await {
-                        send_ack(socket, &msg_id, AckStatus::Error, Some(err.to_string())).await?;
-                    } else {
-                        send_ack(socket, &msg_id, AckStatus::Success, None).await?;
-                    }
-                }
-                Err(err) => {
-                    send_ack(socket, &msg_id, AckStatus::Error, Some(err.to_string())).await?;
-                }
-            }
+            handle_mailbox_update(socket, state, pending, &msg_id, &register, &payload).await?;
+        }
+        Ok(ClientMessage::WriteCan { msg_id, tokens }) => {
+            handle_write_can(socket, state, pending, &msg_id, &tokens).await?;
+        }
+        Ok(ClientMessage::Direct { msg_id, payload }) => {
+            handle_direct(socket, state, pending, &msg_id, &payload).await?;
         }
         Ok(ClientMessage::Command { msg_id, action }) => {
             if action == "resync_mailbox" {
@@ -307,6 +359,109 @@ async fn handle_client_text(
             };
             send_json(socket, &msg).await?;
         }
+    }
+    Ok(())
+}
+
+/// `mailbox_update`: sparse register write merged over the held bank.
+/// Ack is deferred until the engine confirms the frame was transmitted.
+async fn handle_mailbox_update(
+    socket: &mut WebSocket,
+    state: &WsState,
+    pending: &mut PendingAcks,
+    msg_id: &str,
+    register: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let unit_id = state.snapshot.borrow().as_ref().map_or_else(
+        || state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID),
+        |held| resolve_unit_id(&held.bank, state.unit_id_hint),
+    );
+    let held_bank = state
+        .snapshot
+        .borrow()
+        .as_ref()
+        .map(|held| held.bank.clone())
+        .unwrap_or_default();
+    match records_from_update_with_bank(&held_bank, UnitType::AIRCON, unit_id, register, payload) {
+        Ok(records) => {
+            let cmd = EngineCmd::WriteRegisters(records);
+            record_spy(state, &cmd).await;
+            if let Err(err) = state.cmd_tx.send(cmd).await {
+                send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
+            } else {
+                pending.push(msg_id.to_owned());
+            }
+        }
+        Err(err) => {
+            send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `write_can`: raw 25-char CAN2 tokens forwarded as register writes
+/// (`MyAir5` `CAN_TO_CB` / `BROADCAST_CAN_TO_CB` parity).
+async fn handle_write_can(
+    socket: &mut WebSocket,
+    state: &WsState,
+    pending: &mut PendingAcks,
+    msg_id: &str,
+    tokens: &[String],
+) -> anyhow::Result<()> {
+    let mut records = Vec::with_capacity(tokens.len());
+    let mut first_err: Option<aa_registers::WireError> = None;
+    for token in tokens {
+        match aa_registers::CanRecord::parse_one(token) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+    if let Some(err) = first_err {
+        send_ack(
+            socket,
+            msg_id,
+            AckStatus::Error,
+            Some(format!("invalid CAN token: {err:?}")),
+        )
+        .await?;
+    } else if records.is_empty() {
+        send_ack(
+            socket,
+            msg_id,
+            AckStatus::Error,
+            Some("no CAN tokens".into()),
+        )
+        .await?;
+    } else {
+        let cmd = EngineCmd::WriteRegisters(records);
+        record_spy(state, &cmd).await;
+        if let Err(err) = state.cmd_tx.send(cmd).await {
+            send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
+        } else {
+            pending.push(msg_id.to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// `direct`: one-shot raw request (poll tag / `setAllZoneSensorData?`); the CB
+/// reply is delivered as [`ServerMessage::DirectReply`].
+async fn handle_direct(
+    socket: &mut WebSocket,
+    state: &WsState,
+    pending: &mut PendingAcks,
+    msg_id: &str,
+    payload: &str,
+) -> anyhow::Result<()> {
+    let cmd = EngineCmd::WriteDirect(payload.as_bytes().to_vec());
+    record_spy(state, &cmd).await;
+    if let Err(err) = state.cmd_tx.send(cmd).await {
+        send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
+    } else {
+        pending.push(msg_id.to_owned());
     }
     Ok(())
 }

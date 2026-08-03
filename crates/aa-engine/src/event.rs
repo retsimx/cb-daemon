@@ -7,6 +7,9 @@ use aa_registers::{CanRecord, RegisterBank};
 pub enum EngineCmd {
     /// Enqueue register writes for the next steady-state `setCAN` window.
     WriteRegisters(Vec<CanRecord>),
+    /// Enqueue a raw direct-message write (one-shot poll / command string) for
+    /// the next steady-state ping (aaservice direct-queue parity).
+    WriteDirect(Vec<u8>),
     /// Re-enter the dump path; emits a fresh [`EngineEvent::Snapshot`] when done.
     ResyncMailbox,
     /// Stop the runner and close the link.
@@ -29,6 +32,11 @@ pub enum EngineEvent {
     },
     /// Incremental register updates from a steady-state `getCAN`.
     RegistersChanged { records: Vec<CanRecord> },
+    /// Queued register writes were transmitted in a `setCAN` frame.
+    /// Lets the WS bridge defer mailbox acks until the bus actually sent them.
+    WriteFlushed,
+    /// Reply to a [`EngineCmd::WriteDirect`] request (non-getCAN CB frame).
+    DirectReply { payload: Vec<u8> },
     /// Link I/O failure; runner is exiting.
     LinkError(String),
     /// Non-fatal protocol anomaly (e.g. negotiate mismatch); session stays alive.

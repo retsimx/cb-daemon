@@ -122,11 +122,45 @@ fn golden_command_round_trip() {
             assert_eq!(msg_id, "req-201");
             assert_eq!(action, "resync_mailbox");
         }
-        ClientMessage::MailboxUpdate { .. } => panic!("expected command"),
+        ClientMessage::MailboxUpdate { .. }
+        | ClientMessage::WriteCan { .. }
+        | ClientMessage::Direct { .. } => panic!("expected command"),
     }
     let encoded: Value = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
     let expected: Value = serde_json::from_str(raw).unwrap();
     assert_eq!(encoded, expected);
+}
+
+#[test]
+fn golden_write_can_round_trip() {
+    let raw = r#"{"type":"write_can","msg_id":"req-301","tokens":["0703111110120090000000001"]}"#;
+    let msg: ClientMessage = serde_json::from_str(raw).expect("deserialize write_can");
+    match &msg {
+        ClientMessage::WriteCan { msg_id, tokens } => {
+            assert_eq!(msg_id, "req-301");
+            assert_eq!(tokens, &vec!["0703111110120090000000001".to_owned()]);
+        }
+        other => panic!("expected write_can, got {other:?}"),
+    }
+    let encoded = serde_json::to_string(&msg).unwrap();
+    let parsed: Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(parsed["type"], "write_can");
+    assert_eq!(parsed["tokens"][0], "0703111110120090000000001");
+}
+
+#[test]
+fn golden_direct_round_trip() {
+    let raw = r#"{"type":"direct","msg_id":"req-401","payload":"setAllZoneSensorData?"}"#;
+    let msg: ClientMessage = serde_json::from_str(raw).expect("deserialize direct");
+    match &msg {
+        ClientMessage::Direct { msg_id, payload } => {
+            assert_eq!(msg_id, "req-401");
+            assert_eq!(payload, "setAllZoneSensorData?");
+        }
+        other => panic!("expected direct, got {other:?}"),
+    }
+    let encoded: Value = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+    assert_eq!(encoded["type"], "direct");
 }
 
 #[test]

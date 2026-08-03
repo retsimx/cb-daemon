@@ -33,6 +33,18 @@ pub enum ServerMessage {
         /// Event payload (typed or sparse).
         payload: Value,
     },
+    /// Raw steady-state `getCAN` frame forwarded verbatim (USB `rawCan` parity):
+    /// `getCAN 1 <25-char records…>`. `MyAir5` receives these as secure rawCan.
+    RawCan {
+        /// Full getCAN payload.
+        payload: String,
+    },
+    /// Reply to a client `direct` request (one-shot poll / raw command).
+    /// The CB's reply payload (typically XML with a `<request>` tag).
+    DirectReply {
+        /// Raw CB reply payload.
+        payload: String,
+    },
     /// Response to a client `mailbox_update` / `command`.
     Ack {
         /// Client correlation id.
@@ -87,5 +99,23 @@ pub enum ClientMessage {
         msg_id: String,
         /// Action name.
         action: String,
+    },
+    /// Forward raw CAN2 tokens (25-char hex records) from `MyAir5` `CAN_TO_CB` /
+    /// `BROADCAST_CAN_TO_CB` intents (sensor pairing, unit flushes, …).
+    WriteCan {
+        /// Client correlation id.
+        msg_id: String,
+        /// Wire token strings (25-char hex records).
+        tokens: Vec<String>,
+    },
+    /// One-shot raw request to the CB (direct-message queue, USB parity):
+    /// payload is the raw command string (e.g. `setAllZoneSensorData?` or a
+    /// poll tag such as `getZoneTimer`). The CB reply is delivered as
+    /// [`ServerMessage::DirectReply`].
+    Direct {
+        /// Client correlation id.
+        msg_id: String,
+        /// Raw command string to write on the next ping.
+        payload: String,
     },
 }

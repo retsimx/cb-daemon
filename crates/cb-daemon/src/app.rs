@@ -308,6 +308,9 @@ async fn fanout_events(
                 }
                 let _ = broadcast_tx.send(ev);
             }
+            EngineEvent::WriteFlushed | EngineEvent::DirectReply { .. } => {
+                let _ = broadcast_tx.send(ev);
+            }
         }
     }
 }
