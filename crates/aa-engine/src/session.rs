@@ -7,8 +7,8 @@ use aa_registers::{
 
 use crate::event::{EngineCmd, EngineEvent};
 use crate::wire::{
-    ACK_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA, build_set_can, is_can2_in_use,
-    is_get_can, is_get_can_nack, parse_get_can,
+    ACK_CAN, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA, build_set_can,
+    is_can2_in_use, is_get_can, is_get_can_nack, parse_get_can,
 };
 
 /// Protocol phase for the tablet-side CB session.
@@ -33,6 +33,16 @@ pub(crate) struct Session {
     dump_sent: bool,
     /// After a dump `getCAN` NACK, resend dump once the ack has been flushed.
     dump_needs_resend: bool,
+    /// Reg-06 zero-uid flush (`DIRTY_RESET_SET_CAN`) sent this dump cycle; resets
+    /// the CB dirty flag so the following flush returns the full register set.
+    dirty_reset_sent: bool,
+    /// NACKs on the dirty-reset setCAN; bounded so an uncooperative CB cannot
+    /// livelock the dump (mirrors aaservice's ≤3 CAN retries).
+    reset_nacks: u8,
+    /// True once the bus delivered a real reg 05 (system status) in a getCAN.
+    /// The snapshot rawCan includes reg 05 only then; a bank slot synthesized
+    /// from zones/XML must stay out of `MyAir5` rawCan (USB parity).
+    system_status_real: bool,
     /// System status parsed from getSystemData XML before the dump reveals unit id.
     pending_system: Option<SystemStatus>,
     /// Mirrors stock `canInUse`: after `CAN2 in use`, skip empty `setCAN`.
@@ -53,6 +63,9 @@ impl Session {
             ack_armed: false,
             dump_sent: false,
             dump_needs_resend: false,
+            dirty_reset_sent: false,
+            reset_nacks: 0,
+            system_status_real: false,
             pending_system: None,
             can_in_use: false,
             system_xml_ticks: 0,
@@ -76,6 +89,8 @@ impl Session {
                 self.state = State::RequestDump;
                 self.dump_sent = false;
                 self.dump_needs_resend = false;
+                self.dirty_reset_sent = false;
+                self.reset_nacks = 0;
                 self.ack_armed = false;
             }
             EngineCmd::Shutdown => {
@@ -102,11 +117,24 @@ impl Session {
                 Some(GET_SYSTEM_DATA.to_vec())
             }
             State::RequestDump => {
-                // Ack after a dump getCAN NACK / success must beat re-sending the dump.
+                // Ack after a dump getCAN NACK / success / reset response must beat
+                // re-sending the dump.
                 if self.ack_armed {
                     return Some(self.steady_tx());
                 }
-                // Send dump once, then stay silent until getCAN (or NACK→resend).
+                // Phase 1: reg-06 zero-uid flush resets the CB dirty flag so the CB
+                // re-sends the full register set (aa_interop spec). Without it the
+                // following flush only returns unsent/changed registers and MyAir5
+                // rawCan stays incomplete on resync.
+                if !self.dirty_reset_sent {
+                    self.dirty_reset_sent = true;
+                    return Some(DIRTY_RESET_SET_CAN.to_vec());
+                }
+                // Phase 2: send dump once, then stay silent until getCAN (or NACK→resend).
+                // The reset is best-effort (some CBs return nothing for it); the
+                // flush is what actually pulls the register set. Never gate the
+                // flush on the reset getCAN — a silent/empty reset response must
+                // not livelock the dump (live CB showed exactly this hang).
                 // Re-sending on every Ping while AOA chunk-writes the first dump
                 // overlaps TX/RX and produces Malformed storms that destroy the
                 // large getCAN payload MyAir5 needs for :2025.
@@ -195,9 +223,13 @@ impl Session {
         }
         // Stock: getCAN byte[7]=='0' → ack then resend last setCAN (stay in dump).
         if is_get_can_nack(payload) {
+            self.ack_armed = true;
             if self.dump_sent {
-                self.ack_armed = true;
                 self.dump_needs_resend = true;
+            } else if self.reset_nacks < 2 {
+                // Phase-1 (dirty reset) NACK: resend the reset, bounded.
+                self.reset_nacks += 1;
+                self.dirty_reset_sent = false;
             }
             return Vec::new();
         }
@@ -205,9 +237,14 @@ impl Session {
             Ok(records) => {
                 for record in &records {
                     self.bank.apply(record);
+                    if record.reg == RegId::new(0x05) {
+                        self.system_status_real = true;
+                    }
                 }
-                // Early getCAN before dump TX: keep RequestDump until dump is sent.
+                // Early getCAN before dump TX (dirty-reset response): ack it and
+                // keep RequestDump until the 08 flush dump is sent.
                 if !self.dump_sent {
+                    self.ack_armed = true;
                     return Vec::new();
                 }
                 let mut events = Vec::new();
@@ -224,10 +261,19 @@ impl Session {
                 // Skipping the ack leaves the CB in canInUse so later polls misbehave.
                 self.ack_armed = true;
                 self.can_in_use = false;
-                // Capture CB dump hex *before* synthesizing reg 05 into the bank.
-                // MyAir5 rawCan matches USB (no reg 05 on this CB); typed system_status
-                // still comes from the synthesized bank slot via mailbox DTOs.
-                let can_records: Vec<String> = records.iter().map(CanRecord::to_wire).collect();
+                // Capture CB dump hex *before* synthesizing reg 05 into the bank:
+                // full bank for the primary unit (dirty-reset + 08-flush dumps and
+                // any steady-state deltas), excluding a synthesized reg 05 that
+                // never came from the bus. MyAir5 rawCan must match USB; typed
+                // system_status still comes from the bank slot via mailbox DTOs.
+                let unit = self.primary_unit_id();
+                let mut bank_records: Vec<CanRecord> =
+                    self.bank.records_for_unit(UnitType::AIRCON, unit);
+                if !self.system_status_real {
+                    bank_records.retain(|r| r.reg != RegId::new(0x05));
+                }
+                let can_records: Vec<String> =
+                    bank_records.iter().map(CanRecord::to_wire).collect();
                 self.maybe_synthesize_system_status_from_zones();
                 self.maybe_queue_unit_flush_for_missing_system_status();
                 events.push(EngineEvent::Snapshot {
@@ -271,6 +317,9 @@ impl Session {
             Ok(records) => {
                 for record in &records {
                     self.bank.apply(record);
+                    if record.reg == RegId::new(0x05) {
+                        self.system_status_real = true;
+                    }
                 }
                 self.ack_armed = true;
                 vec![EngineEvent::RegistersChanged { records }]
@@ -478,13 +527,20 @@ mod tests {
         s.into_bytes()
     }
 
-    /// Stock order: getSystemData → CAN2 → dump (flush seeded like aaservice open).
+    /// Stock order: getSystemData → CAN2 → dirty reset → reset getCAN → ack →
+    /// dump (flush seeded like aaservice open: reg-06 reset first, then 08 flush).
     fn advance_to_dump(s: &mut Session) {
         assert_eq!(s.on_ping().expect("negotiate"), GET_SYSTEM_DATA);
         let ev = s.on_frame(b"CAN2 in use");
         assert!(matches!(ev.as_slice(), [EngineEvent::Negotiated { .. }]));
         assert_eq!(s.state, State::RequestDump);
         assert!(s.can_in_use);
+        // Two-phase dump: reg-06 dirty reset → its getCAN → ack → 08 flush.
+        assert_eq!(s.on_ping().expect("dirty reset"), DIRTY_RESET_SET_CAN);
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&live_unit_reg06())));
+        assert!(ev.is_empty(), "reset response must not emit events");
+        assert_eq!(s.on_ping().expect("ack reset"), ACK_CAN);
+        assert!(!s.dump_sent);
     }
 
     fn advance_to_steady(s: &mut Session, dump_records: &[CanRecord]) {
@@ -514,6 +570,7 @@ mod tests {
         let ev = s.on_frame(b"CAN2 in use");
         assert!(matches!(ev.as_slice(), [EngineEvent::Negotiated { .. }]));
         assert_eq!(s.state, State::RequestDump);
+        assert_eq!(s.on_ping().unwrap(), DIRTY_RESET_SET_CAN);
         assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
         assert!(s.on_ping().is_none(), "must not dump twice before getCAN");
     }
@@ -740,6 +797,9 @@ mod tests {
         let _ = s.on_frame(SAMPLE_SYSTEM_XML);
         assert!(s.pending_system.is_some());
         assert_eq!(s.state, State::RequestDump);
+        assert_eq!(s.on_ping().unwrap(), DIRTY_RESET_SET_CAN);
+        let _ = s.on_frame(&get_can_payload(std::slice::from_ref(&live_unit_reg06())));
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
 
         let live = live_unit_reg06();
@@ -783,7 +843,7 @@ mod tests {
         let ev = s.on_frame(b"status: CAN2 in use ok");
         assert!(matches!(ev.as_slice(), [EngineEvent::Negotiated { .. }]));
         assert_eq!(s.state, State::RequestDump);
-        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
+        assert_eq!(s.on_ping().unwrap(), DIRTY_RESET_SET_CAN);
     }
 
     #[test]
@@ -838,7 +898,11 @@ mod tests {
 
         s.apply_cmd(EngineCmd::ResyncMailbox);
         assert_eq!(s.state, State::RequestDump);
+        assert!(!s.dirty_reset_sent);
 
+        assert_eq!(s.on_ping().unwrap(), DIRTY_RESET_SET_CAN);
+        let _ = s.on_frame(&get_can_payload(std::slice::from_ref(&live_unit_reg06())));
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
         let rec = sample_record();
         let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
@@ -848,7 +912,8 @@ mod tests {
 
     #[test]
     fn early_get_can_before_dump_tx_applies_but_stays() {
-        // CAN2 leaves RequestDump with dump_sent=false until the dump ping.
+        // A getCAN before the 08-flush dump TX (reset response or unsolicited) is
+        // applied to the bank, acked, and RequestDump persists until the dump.
         let mut s = Session::new();
         advance_to_dump(&mut s);
         assert!(!s.dump_sent);
@@ -862,6 +927,7 @@ mod tests {
             Some(rec.data)
         );
 
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
         let ev = s.on_frame(b"getCAN 1");
         assert!(matches!(ev.as_slice(), [EngineEvent::Snapshot { .. }]));

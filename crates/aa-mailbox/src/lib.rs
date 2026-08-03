@@ -32,9 +32,9 @@ pub mod message;
 
 pub use convert::{
     apply_records_to_bank, apply_snapshot_body_to_bank, records_from_update,
-    snapshot_body_from_bank, snapshot_from_bank, snapshot_from_bank_with_can_records,
-    system_status_from_dto, system_status_to_dto, zone_config_from_dto, zone_config_to_dto,
-    zone_dto_from_state, zone_state_from_dto,
+    records_from_update_with_bank, snapshot_body_from_bank, snapshot_from_bank,
+    snapshot_from_bank_with_can_records, system_status_from_dto, system_status_to_dto,
+    zone_config_from_dto, zone_config_to_dto, zone_dto_from_state, zone_state_from_dto,
 };
 pub use dto::{AckStatus, SnapshotBody, SystemStatusDto, ZoneConfigDto, ZoneDto};
 pub use error::EncodeError;

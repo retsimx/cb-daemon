@@ -15,6 +15,7 @@ dependencies = [
  "aa-link",
  "aa-registers",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

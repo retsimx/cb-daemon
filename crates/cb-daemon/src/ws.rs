@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
-    AckStatus, ClientMessage, ServerMessage, records_from_update,
+    AckStatus, ClientMessage, ServerMessage, records_from_update_with_bank,
     snapshot_from_bank_with_can_records, system_status_to_dto, zone_config_to_dto,
     zone_dto_from_state,
 };
@@ -254,7 +254,19 @@ async fn handle_client_text(
                 || state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID),
                 |held| resolve_unit_id(&held.bank, state.unit_id_hint),
             );
-            match records_from_update(UnitType::AIRCON, unit_id, &register, &payload) {
+            let held_bank = state
+                .snapshot
+                .borrow()
+                .as_ref()
+                .map(|held| held.bank.clone())
+                .unwrap_or_default();
+            match records_from_update_with_bank(
+                &held_bank,
+                UnitType::AIRCON,
+                unit_id,
+                &register,
+                &payload,
+            ) {
                 Ok(records) => {
                     let cmd = EngineCmd::WriteRegisters(records);
                     record_spy(state, &cmd).await;
