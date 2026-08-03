@@ -78,6 +78,11 @@ impl<L: Link> CbEngine<L> {
     ) -> bool {
         let n = match result {
             Ok(0) => {
+                let _ = ev_tx
+                    .send(EngineEvent::LinkError(
+                        "link EOF (read returned 0); accessory closed or detached".into(),
+                    ))
+                    .await;
                 let _ = self.link.close().await;
                 return true;
             }
@@ -126,16 +131,23 @@ impl<L: Link> CbEngine<L> {
 
         if is_ping(&frame.payload) {
             if let Some(payload) = session.on_ping() {
+                eprintln!("cb-engine: ping reply tx={}", String::from_utf8_lossy(&payload));
                 let encoded = Frame { payload }.encode();
                 if let Err(err) = self.link.write_all(&encoded).await {
                     let _ = ev_tx.send(EngineEvent::LinkError(err.to_string())).await;
                     let _ = self.link.close().await;
                     return true;
                 }
+            } else {
+                eprintln!("cb-engine: ping (no tx)");
             }
             return false;
         }
 
+        eprintln!(
+            "cb-engine: frame rx={}",
+            String::from_utf8_lossy(&frame.payload)
+        );
         for event in session.on_frame(&frame.payload) {
             if ev_tx.send(event).await.is_err() {
                 let _ = self.link.close().await;
@@ -276,6 +288,12 @@ mod tests {
         .encode()
     }
 
+    async fn negotiate_through_can2(mock: &Arc<Mutex<MockLink>>, notify: &Notify) {
+        push_frame(mock, notify, b"Ping").await;
+        wait_written_contains(mock, &encoded(GET_SYSTEM_DATA)).await;
+        push_frame(mock, notify, b"CAN2 in use").await;
+    }
+
     // Single end-to-end acceptance scenario (negotiate→dump→poll→write→ack);
     // kept as one test despite length >50 for readability of the path.
     #[tokio::test]
@@ -289,12 +307,13 @@ mod tests {
             engine.run(cmd_rx, ev_tx).await;
         });
 
-        push_frame(&mock, &notify, b"Ping").await;
-        wait_written_contains(&mock, &encoded(GET_SYSTEM_DATA)).await;
-
-        push_frame(&mock, &notify, b"CAN2 in use").await;
+        negotiate_through_can2(&mock, &notify).await;
         let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Negotiated { .. })).await;
 
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
         push_frame(&mock, &notify, b"Ping").await;
         wait_written_contains(&mock, &encoded(DUMP_SET_CAN)).await;
 
@@ -304,7 +323,14 @@ mod tests {
             body.extend_from_slice(rec.to_wire().as_bytes());
             push_frame(&mock, &notify, &body).await;
         }
-        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot(_))).await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
+
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &encoded(ACK_CAN)).await;
 
         {
             let mut g = mock.lock().await;
@@ -370,13 +396,15 @@ mod tests {
             engine.run(cmd_rx, ev_tx).await;
         });
 
-        push_frame(&mock, &notify, b"Ping").await;
-        wait_written_contains(&mock, &encoded(GET_SYSTEM_DATA)).await;
-        push_frame(&mock, &notify, b"CAN2 in use").await;
+        negotiate_through_can2(&mock, &notify).await;
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
         push_frame(&mock, &notify, b"Ping").await;
         wait_written_contains(&mock, &encoded(DUMP_SET_CAN)).await;
         push_frame(&mock, &notify, b"getCAN 1").await;
-        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot(_))).await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
 
         cmd_tx.send(EngineCmd::ResyncMailbox).await.unwrap();
         {
@@ -386,7 +414,7 @@ mod tests {
         push_frame(&mock, &notify, b"Ping").await;
         wait_written_contains(&mock, &encoded(DUMP_SET_CAN)).await;
         push_frame(&mock, &notify, b"getCAN 1 0703abcde0501010330000100").await;
-        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot(_))).await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
 
         cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
         timeout(Duration::from_secs(2), join)
@@ -410,6 +438,36 @@ mod tests {
 
         let ev = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::LinkError(_))).await;
         assert!(matches!(ev, EngineEvent::LinkError(_)));
+
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("join")
+            .expect("task");
+    }
+
+    #[tokio::test]
+    async fn link_eof_zero_read_emits_link_error_and_exits() {
+        // Regression: accessory detach returned Ok(0) and the engine exited silently.
+        let link = MockLink::new(); // empty inbound → read returns Ok(0)
+
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(1);
+        let (ev_tx, mut ev_rx) = mpsc::channel(4);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        let ev = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::LinkError(_))).await;
+        match ev {
+            EngineEvent::LinkError(msg) => {
+                assert!(
+                    msg.contains("EOF") || msg.contains("0"),
+                    "expected EOF wording, got {msg}"
+                );
+            }
+            other => panic!("expected LinkError, got {other:?}"),
+        }
 
         timeout(Duration::from_secs(2), join)
             .await

@@ -12,9 +12,15 @@ use tracing::{debug, warn};
 
 /// Wire payloads mirrored from `aa-engine` (crate-private there).
 const GET_SYSTEM_DATA: &[u8] = b"getSystemData";
-const DUMP_SET_CAN: &[u8] = b"setCAN 0701000000600000000000000 ";
+const DUMP_SET_CAN: &[u8] =
+    b"setCAN 0801000000600000000000000 0801000000236000000000000";
 const EMPTY_SET_CAN: &[u8] = b"setCAN ";
 const ACK_CAN: &[u8] = b"ackCAN 1";
+
+/// Stock-shaped getSystemData XML so negotiate can leave CAN2-in-use and dump.
+const SAMPLE_SYSTEM_XML: &[u8] = br#"<request>getSystemData</request>
+<aircon><info><state>on</state><mode>cool</mode><fan>high</fan>
+<setTemp>24.0</setTemp><myZone>1</myZone><freshAir>none</freshAir></info></aircon>"#;
 
 /// Unit id used by the scripted dump sample (`abcde`).
 pub(crate) const FEEDER_UNIT_ID: UnitId = match UnitId::try_new(0x0_ABCDE) {
@@ -185,6 +191,7 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
                     written_has_frame(&written, DUMP_SET_CAN)
                         || written_has_frame(&written, EMPTY_SET_CAN)
                         || written_has_frame(&written, ACK_CAN)
+                        || written_has_frame(&written, GET_SYSTEM_DATA)
                         || written
                             .windows(b"<U>setCAN".len())
                             .any(|x| x == b"<U>setCAN")
@@ -206,6 +213,8 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
         let written = take_written(&mock).await;
         if written_has_frame(&written, DUMP_SET_CAN) {
             push_frame(&mock, &notify, &get_can_with_sample()).await;
+        } else if written_has_frame(&written, GET_SYSTEM_DATA) {
+            push_frame(&mock, &notify, SAMPLE_SYSTEM_XML).await;
         } else if written_has_frame(&written, ACK_CAN) {
             // Ack consumed; wait for next Ping cycle.
         } else {
@@ -244,14 +253,14 @@ mod tests {
         let snap = timeout(Duration::from_secs(5), async {
             loop {
                 let ev = ev_rx.recv().await.expect("event");
-                if matches!(ev, EngineEvent::Snapshot(_)) {
+                if matches!(ev, EngineEvent::Snapshot { .. }) {
                     return ev;
                 }
             }
         })
         .await
         .expect("snapshot timeout");
-        assert!(matches!(snap, EngineEvent::Snapshot(_)));
+        assert!(matches!(snap, EngineEvent::Snapshot { .. }));
 
         cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
         let _ = timeout(Duration::from_secs(2), engine).await;
