@@ -20,7 +20,7 @@ pub enum EngineEvent {
     Negotiated { detail: String },
     /// Full mailbox snapshot after dump / resync.
     ///
-    /// `can_records` are the CB dump's opaque 25-char hex records for MyAir5
+    /// `can_records` are the CB dump's opaque 25-char hex records for `MyAir5`
     /// `rawCan` (USB parity). They intentionally exclude daemon-synthesized
     /// registers such as reg `05` seeded into [`bank`] for typed `system_status`.
     Snapshot {

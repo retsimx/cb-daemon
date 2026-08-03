@@ -17,7 +17,7 @@ pub(crate) const ACK_CAN: &[u8] = b"ackCAN 1";
 /// Initial mailbox dump `setCAN` matching live MyAir5/USB bring-up.
 ///
 /// Stock queues unit-type `08` flush tokens before/at open; the first non-empty
-/// `setCAN` after `CAN2 in use` is what returns the large `getCAN` MyAir5 uses
+/// `setCAN` after `CAN2 in use` is what returns the large `getCAN` `MyAir5` uses
 /// for `:2025`. The classic `07…06` zero-uid flush alone does not.
 pub(crate) const DUMP_SET_CAN: &[u8] =
     b"setCAN 0801000000600000000000000 0801000000236000000000000";

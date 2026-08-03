@@ -20,7 +20,7 @@ const ZONE_SCAN: std::ops::RangeInclusive<u8> = 1..=10;
 const ZONE_CONFIG_HEADER_CB_TO_TABLET: u8 = 0x20;
 
 /// Build a `mailbox_snapshot` from one unit in `bank`, optionally overriding
-/// `can_records` (CB dump hex for MyAir5 rawCan; excludes synthesized regs).
+/// `can_records` (CB dump hex for `MyAir5` `rawCan`; excludes synthesized regs).
 #[must_use]
 pub fn snapshot_from_bank_with_can_records(
     bank: &RegisterBank,

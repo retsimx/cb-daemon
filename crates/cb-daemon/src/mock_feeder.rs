@@ -12,15 +12,14 @@ use tracing::{debug, warn};
 
 /// Wire payloads mirrored from `aa-engine` (crate-private there).
 const GET_SYSTEM_DATA: &[u8] = b"getSystemData";
-const DUMP_SET_CAN: &[u8] =
-    b"setCAN 0801000000600000000000000 0801000000236000000000000";
+const DUMP_SET_CAN: &[u8] = b"setCAN 0801000000600000000000000 0801000000236000000000000";
 const EMPTY_SET_CAN: &[u8] = b"setCAN ";
 const ACK_CAN: &[u8] = b"ackCAN 1";
 
 /// Stock-shaped getSystemData XML so negotiate can leave CAN2-in-use and dump.
-const SAMPLE_SYSTEM_XML: &[u8] = br#"<request>getSystemData</request>
+const SAMPLE_SYSTEM_XML: &[u8] = b"<request>getSystemData</request>
 <aircon><info><state>on</state><mode>cool</mode><fan>high</fan>
-<setTemp>24.0</setTemp><myZone>1</myZone><freshAir>none</freshAir></info></aircon>"#;
+<setTemp>24.0</setTemp><myZone>1</myZone><freshAir>none</freshAir></info></aircon>";
 
 /// Unit id used by the scripted dump sample (`abcde`).
 pub(crate) const FEEDER_UNIT_ID: UnitId = match UnitId::try_new(0x0_ABCDE) {

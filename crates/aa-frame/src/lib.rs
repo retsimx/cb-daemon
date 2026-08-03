@@ -152,28 +152,25 @@ impl FrameScanner {
                 Err(e) => {
                     // Skip current byte / bad frame start and hunt for the next PREFIX.
                     // Keeping a short tail preserves a split `<U` across chunks.
-                    match find_slice(&self.buf[1..], PREFIX) {
-                        Some(rel) => {
-                            self.buf.drain(..1 + rel);
+                    if let Some(rel) = find_slice(&self.buf[1..], PREFIX) {
+                        self.buf.drain(..=rel);
+                        last_resync_err = Some(e);
+                    } else {
+                        let keep = PREFIX.len().saturating_sub(1).min(self.buf.len());
+                        let drop = self.buf.len() - keep;
+                        if drop > 0 {
+                            self.buf.drain(..drop);
                             last_resync_err = Some(e);
                         }
-                        None => {
-                            let keep = PREFIX.len().saturating_sub(1).min(self.buf.len());
-                            let drop = self.buf.len() - keep;
-                            if drop > 0 {
-                                self.buf.drain(..drop);
-                                last_resync_err = Some(e);
-                            }
-                            break;
-                        }
+                        break;
                     }
                 }
             }
         }
-        if frames.is_empty() {
-            if let Some(err) = last_resync_err {
-                return Err(err);
-            }
+        if frames.is_empty()
+            && let Some(err) = last_resync_err
+        {
+            return Err(err);
         }
         Ok(frames)
     }
@@ -355,10 +352,12 @@ mod tests {
         // Regression: live unit-08 dump replies are ~425-byte getCAN payloads.
         // AOA delivers them in ≤63-byte USB chunks; scanner must not Malformed-resync
         // mid-frame and destroy the payload.
+        use std::fmt::Write;
+
         let mut records = String::from("getCAN 1");
         for i in 0..16 {
             records.push(' ');
-            records.push_str(&format!("070311111050101033{i:02x}00100"));
+            let _ = write!(records, "070311111050101033{i:02x}00100");
         }
         let frame = Frame {
             payload: records.as_bytes().to_vec(),

@@ -73,7 +73,7 @@ pub struct SnapshotBody {
     pub zones: Option<BTreeMap<String, ZoneDto>>,
     /// Opaque 25-char hex CAN records for this unit (full bank dump).
     ///
-    /// aaservice joins these into a `getCAN` frame for MyAir5's rawCan path.
+    /// aaservice joins these into a `getCAN` frame for `MyAir5`'s `rawCan` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub can_records: Option<Vec<String>>,
 }
