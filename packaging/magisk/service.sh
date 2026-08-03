@@ -21,27 +21,34 @@ LOG_FILE="$RUNTIME_DIR/service.log"
     echo "cb-daemon-service: missing $CONTROL"
     exit 0
   fi
-  # The accessory may not be fully ready at boot_completed+5s on slow tablets;
-  # the daemon exits if it cannot open the accessory. Retry with a bounded
-  # window so a fresh boot still brings the bus up without blocking Magisk
-  # (we are already detached; control.sh start is idempotent).
-  ATTEMPTS=6
-  RETRY_SLEEP=10
+  # The accessory is not always usable at boot_completed+5s on slow tablets:
+  # the first read can fail with EIO, the engine exits, and the daemon process
+  # stays alive as a zombie (axum keeps serving; no negotiation ever happens).
+  # Retry until the engine actually negotiates, not merely until the process
+  # exists. control.sh start/stop are idempotent; we are already detached so
+  # Magisk never blocks.
+  DAEMON_LOG="/data/adb/cb-daemon/cb-daemon.log"
+  ATTEMPTS=8
+  RETRY_SLEEP=12
   n=0
   while [ "$n" -lt "$ATTEMPTS" ]; do
+    before="$(wc -l <"$DAEMON_LOG" 2>/dev/null || echo 0)"
     "$CONTROL" start
     rc=$?
     echo "cb-daemon-service: control.sh start exit=$rc (attempt $((n + 1))/$ATTEMPTS)"
-    # Give the daemon time to fail the accessory open before re-checking.
     sleep "$RETRY_SLEEP"
-    if pidof cb-daemon >/dev/null 2>&1; then
-      echo "cb-daemon-service: daemon alive after boot start"
+    if pidof cb-daemon >/dev/null 2>&1 &&
+      tail -n +$((before + 1)) "$DAEMON_LOG" 2>/dev/null | grep -q "negotiated"; then
+      echo "cb-daemon-service: daemon negotiated after boot start"
       break
     fi
+    # Zombie (process alive, engine dead) or never negotiated: stop and retry.
+    "$CONTROL" stop >/dev/null 2>&1 || true
     n=$((n + 1))
   done
-  if ! pidof cb-daemon >/dev/null 2>&1; then
-    echo "cb-daemon-service: daemon not running after $ATTEMPTS attempts (manual control.sh start required)"
+  if ! pidof cb-daemon >/dev/null 2>&1 ||
+    ! grep -q "negotiated" "$DAEMON_LOG" 2>/dev/null; then
+    echo "cb-daemon-service: daemon not negotiated after $ATTEMPTS attempts (manual control.sh start required)"
   fi
 } >>"$LOG_FILE" 2>&1 &
 
