@@ -14,6 +14,9 @@ pub(crate) const EMPTY_SET_CAN: &[u8] = b"setCAN ";
 /// Ack after applying a `getCAN` (`CRC = 0xaa`).
 pub(crate) const ACK_CAN: &[u8] = b"ackCAN 1";
 
+/// NACK sent when the last inbound `getCAN` failed CRC (`CRC = 0x94`).
+pub(crate) const ACK_CAN_ZERO: &[u8] = b"ackCAN 0";
+
 /// Initial mailbox dump `setCAN` matching live MyAir5/USB bring-up.
 ///
 /// Stock queues unit-type `08` flush tokens before/at open; the first non-empty

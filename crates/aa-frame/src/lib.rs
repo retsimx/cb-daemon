@@ -76,7 +76,11 @@ impl Frame {
 
         let actual = crc8(payload);
         if actual != expected {
-            return Err(FrameError::InvalidCrc { expected, actual });
+            return Err(FrameError::InvalidCrc {
+                expected,
+                actual,
+                payload: payload.to_vec(),
+            });
         }
 
         let frame_len = PREFIX.len() + payload.len() + MID.len() + 3;
@@ -187,6 +191,9 @@ pub enum FrameError {
         expected: u8,
         /// CRC computed over the payload bytes.
         actual: u8,
+        /// Payload of the rejected frame (lets the engine decide the
+        /// `ackCAN 0|1` polarity, USB parity).
+        payload: Vec<u8>,
     },
     /// Framing tokens or hex digits are not well-formed.
     Malformed,
@@ -304,9 +311,14 @@ mod tests {
     fn bad_crc_invalid() {
         let bad = b"<U>Ping</U=00>";
         match Frame::decode_one(bad) {
-            Err(FrameError::InvalidCrc { expected, actual }) => {
+            Err(FrameError::InvalidCrc {
+                expected,
+                actual,
+                payload,
+            }) => {
                 assert_eq!(expected, 0x00);
                 assert_eq!(actual, 0xdb);
+                assert_eq!(payload, b"Ping");
             }
             other => panic!("expected InvalidCrc, got {other:?}"),
         }

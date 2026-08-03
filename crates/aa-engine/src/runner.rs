@@ -98,6 +98,13 @@ impl<L: Link> CbEngine<L> {
         let frames = match scanner.push(&buf[..n]) {
             Ok(frames) => frames,
             Err(err) => {
+                // CRC-failed getCAN frames must arm ackCAN 0 on the next ping
+                // (aaservice parity) so the CB retries the records.
+                if let aa_frame::FrameError::InvalidCrc { payload, .. } = &err
+                    && payload.starts_with(b"getCAN")
+                {
+                    session.set_crc_ok(false);
+                }
                 let _ = ev_tx
                     .send(EngineEvent::ProtocolWarn(format!("frame scan: {err:?}")))
                     .await;
@@ -132,10 +139,15 @@ impl<L: Link> CbEngine<L> {
 
         if is_ping(&frame.payload) {
             if let Some(payload) = session.on_ping() {
+                let was_write = session.take_write_flushed();
                 let encoded = Frame { payload }.encode();
                 debug!(frame = %String::from_utf8_lossy(&encoded), "engine TX");
                 if let Err(err) = self.link.write_all(&encoded).await {
                     let _ = ev_tx.send(EngineEvent::LinkError(err.to_string())).await;
+                    let _ = self.link.close().await;
+                    return true;
+                }
+                if was_write && ev_tx.send(EngineEvent::WriteFlushed).await.is_err() {
                     let _ = self.link.close().await;
                     return true;
                 }

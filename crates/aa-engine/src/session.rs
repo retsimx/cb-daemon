@@ -7,8 +7,8 @@ use aa_registers::{
 
 use crate::event::{EngineCmd, EngineEvent};
 use crate::wire::{
-    ACK_CAN, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA, build_set_can,
-    is_can2_in_use, is_get_can, is_get_can_nack, parse_get_can,
+    ACK_CAN, ACK_CAN_ZERO, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA,
+    build_set_can, is_can2_in_use, is_get_can, is_get_can_nack, parse_get_can,
 };
 
 /// Protocol phase for the tablet-side CB session.
@@ -43,6 +43,15 @@ pub(crate) struct Session {
     /// The snapshot rawCan includes reg 05 only then; a bank slot synthesized
     /// from zones/XML must stay out of `MyAir5` rawCan (USB parity).
     system_status_real: bool,
+    /// Raw direct-message queue (one-shot polls / `setAllZoneSensorData` etc.).
+    direct_queue: Vec<Vec<u8>>,
+    /// Most recent direct payload written; the next non-getCAN frame is its reply.
+    last_direct_sent: Vec<u8>,
+    /// Set when `steady_tx` drained the write queue; consumed by the runner to
+    /// emit [`EngineEvent::WriteFlushed`] after the frame is transmitted.
+    write_flushed: bool,
+    /// Last inbound frame CRC outcome; feeds the outbound `ackCAN 0|1` polarity.
+    crc_ok: bool,
     /// System status parsed from getSystemData XML before the dump reveals unit id.
     pending_system: Option<SystemStatus>,
     /// Mirrors stock `canInUse`: after `CAN2 in use`, skip empty `setCAN`.
@@ -66,6 +75,10 @@ impl Session {
             dirty_reset_sent: false,
             reset_nacks: 0,
             system_status_real: false,
+            direct_queue: Vec::new(),
+            last_direct_sent: Vec::new(),
+            write_flushed: false,
+            crc_ok: true,
             pending_system: None,
             can_in_use: false,
             system_xml_ticks: 0,
@@ -79,11 +92,28 @@ impl Session {
         self.shutdown
     }
 
+    /// Consume the write-flushed flag (set when `steady_tx` drained the write
+    /// queue); the runner emits [`EngineEvent::WriteFlushed`] after TX.
+    #[must_use]
+    pub(crate) fn take_write_flushed(&mut self) -> bool {
+        std::mem::take(&mut self.write_flushed)
+    }
+
+    /// Record the last inbound frame's CRC outcome (drives `ackCAN 0|1`).
+    pub(crate) const fn set_crc_ok(&mut self, ok: bool) {
+        self.crc_ok = ok;
+    }
+
     /// Apply an inbound engine command.
     pub(crate) fn apply_cmd(&mut self, cmd: EngineCmd) {
         match cmd {
             EngineCmd::WriteRegisters(records) => {
                 self.write_queue.extend(records);
+            }
+            EngineCmd::WriteDirect(payload) => {
+                if !self.direct_queue.contains(&payload) {
+                    self.direct_queue.push(payload);
+                }
             }
             EngineCmd::ResyncMailbox => {
                 self.state = State::RequestDump;
@@ -147,13 +177,19 @@ impl Session {
             }
             State::Steady => {
                 // Match aaservice UartDispatchEngine.onPing:
-                // ack → queued writes → (while missing system status) getSystemData poll
-                // → else empty setCAN. Never send empty setCAN while can_in_use, and
-                // never send empty setCAN while still hunting getSystemData XML —
-                // aaservice skips empty setCAN because it leaves the CB returning
-                // "CAN2 in use" for getSystemData forever (starves :2025 / MyAir5).
+                // ack → queued writes → direct queue → (while missing system
+                // status) getSystemData poll → else empty setCAN. Never send
+                // empty setCAN while can_in_use, and never send empty setCAN
+                // while still hunting getSystemData XML — aaservice skips empty
+                // setCAN because it leaves the CB returning "CAN2 in use" for
+                // getSystemData forever (starves :2025 / MyAir5).
                 if self.ack_armed || !self.write_queue.is_empty() {
                     return Some(self.steady_tx());
+                }
+                if !self.direct_queue.is_empty() {
+                    self.last_direct_sent = self.direct_queue.remove(0);
+                    self.write_flushed = true;
+                    return Some(self.last_direct_sent.clone());
                 }
                 if self.needs_system_status_poll() {
                     self.system_xml_ticks = self.system_xml_ticks.saturating_add(1);
@@ -184,10 +220,17 @@ impl Session {
     fn steady_tx(&mut self) -> Vec<u8> {
         if self.ack_armed {
             self.ack_armed = false;
-            return ACK_CAN.to_vec();
+            // ackCAN polarity mirrors the last inbound CRC outcome (USB parity:
+            // aaservice sends ackCAN 0 when the getCAN frame failed CRC).
+            if self.crc_ok {
+                return ACK_CAN.to_vec();
+            }
+            self.crc_ok = true;
+            return ACK_CAN_ZERO.to_vec();
         }
         if !self.write_queue.is_empty() {
             let records = std::mem::take(&mut self.write_queue);
+            self.write_flushed = true;
             return build_set_can(&records);
         }
         EMPTY_SET_CAN.to_vec()
@@ -307,6 +350,14 @@ impl Session {
             }];
         }
         if !is_get_can(payload) {
+            // A non-getCAN frame while a direct request is outstanding is its
+            // reply (e.g. XML for setAllZoneSensorData / a one-shot poll tag).
+            if !self.last_direct_sent.is_empty() {
+                self.last_direct_sent.clear();
+                return vec![EngineEvent::DirectReply {
+                    payload: payload.to_vec(),
+                }];
+            }
             return vec![EngineEvent::ProtocolWarn(format!(
                 "unexpected steady frame: {}",
                 String::from_utf8_lossy(payload)
