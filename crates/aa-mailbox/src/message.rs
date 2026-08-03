@@ -22,6 +22,9 @@ pub enum ServerMessage {
         /// Zones keyed by decimal zone id string.
         #[serde(skip_serializing_if = "Option::is_none")]
         zones: Option<std::collections::BTreeMap<String, ZoneDto>>,
+        /// Opaque 25-char hex CAN records for this unit (full bank dump).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        can_records: Option<Vec<String>>,
     },
     /// Incremental register change notification.
     MailboxEvent {
@@ -59,6 +62,7 @@ impl ServerMessage {
             system_status: body.system_status,
             zone_config: body.zone_config,
             zones: body.zones,
+            can_records: body.can_records,
         }
     }
 }

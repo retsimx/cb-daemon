@@ -19,7 +19,14 @@ pub enum EngineEvent {
     /// Negotiation succeeded (`CAN2 in use`).
     Negotiated { detail: String },
     /// Full mailbox snapshot after dump / resync.
-    Snapshot(RegisterBank),
+    ///
+    /// `can_records` are the CB dump's opaque 25-char hex records for `MyAir5`
+    /// `rawCan` (USB parity). They intentionally exclude daemon-synthesized
+    /// registers such as reg `05` seeded into [`bank`] for typed `system_status`.
+    Snapshot {
+        bank: RegisterBank,
+        can_records: Option<Vec<String>>,
+    },
     /// Incremental register updates from a steady-state `getCAN`.
     RegistersChanged { records: Vec<CanRecord> },
     /// Link I/O failure; runner is exiting.
