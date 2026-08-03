@@ -3,6 +3,7 @@
 use aa_frame::{Frame, FrameScanner};
 use aa_link::Link;
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use crate::event::{EngineCmd, EngineEvent};
 use crate::session::Session;
@@ -132,6 +133,7 @@ impl<L: Link> CbEngine<L> {
         if is_ping(&frame.payload) {
             if let Some(payload) = session.on_ping() {
                 let encoded = Frame { payload }.encode();
+                debug!(frame = %String::from_utf8_lossy(&encoded), "engine TX");
                 if let Err(err) = self.link.write_all(&encoded).await {
                     let _ = ev_tx.send(EngineEvent::LinkError(err.to_string())).await;
                     let _ = self.link.close().await;
@@ -140,6 +142,8 @@ impl<L: Link> CbEngine<L> {
             }
             return false;
         }
+
+        debug!(frame = %String::from_utf8_lossy(&frame.payload), "engine RX");
 
         for event in session.on_frame(&frame.payload) {
             if ev_tx.send(event).await.is_err() {
@@ -164,7 +168,7 @@ mod tests {
 
     use super::CbEngine;
     use crate::event::{EngineCmd, EngineEvent};
-    use crate::wire::{ACK_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA};
+    use crate::wire::{ACK_CAN, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA};
 
     /// [`MockLink`] shared with tests; `read` waits when inbound is empty (not EOF).
     struct SharedMockLink {
@@ -287,6 +291,46 @@ mod tests {
         push_frame(mock, notify, b"CAN2 in use").await;
     }
 
+    fn get_can_body(records: &[CanRecord]) -> Vec<u8> {
+        let mut body = b"getCAN 1 ".to_vec();
+        for rec in records {
+            body.extend_from_slice(rec.to_wire().as_bytes());
+            body.push(b' ');
+        }
+        body.pop();
+        body
+    }
+
+    /// Two-phase dump: dirty reset → reset getCAN → ack → 08-flush dump.
+    async fn dump_via_two_phase(mock: &Arc<Mutex<MockLink>>, notify: &Notify) {
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(mock, notify, b"Ping").await;
+        wait_written_contains(mock, &encoded(DIRTY_RESET_SET_CAN)).await;
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        let reset_rec = CanRecord {
+            unit_type: UnitType::new(0x07),
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_ABCDE).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        push_frame(mock, notify, &get_can_body(&[reset_rec])).await;
+        push_frame(mock, notify, b"Ping").await;
+        wait_written_contains(mock, &encoded(ACK_CAN)).await;
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(mock, notify, b"Ping").await;
+        wait_written_contains(mock, &encoded(DUMP_SET_CAN)).await;
+    }
+
     // Single end-to-end acceptance scenario (negotiate→dump→poll→write→ack);
     // kept as one test despite length >50 for readability of the path.
     #[tokio::test]
@@ -303,12 +347,7 @@ mod tests {
         negotiate_through_can2(&mock, &notify).await;
         let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Negotiated { .. })).await;
 
-        {
-            let mut g = mock.lock().await;
-            let _ = g.take_written();
-        }
-        push_frame(&mock, &notify, b"Ping").await;
-        wait_written_contains(&mock, &encoded(DUMP_SET_CAN)).await;
+        dump_via_two_phase(&mock, &notify).await;
 
         {
             let rec = sample_record();
@@ -390,22 +429,12 @@ mod tests {
         });
 
         negotiate_through_can2(&mock, &notify).await;
-        {
-            let mut g = mock.lock().await;
-            let _ = g.take_written();
-        }
-        push_frame(&mock, &notify, b"Ping").await;
-        wait_written_contains(&mock, &encoded(DUMP_SET_CAN)).await;
+        dump_via_two_phase(&mock, &notify).await;
         push_frame(&mock, &notify, b"getCAN 1").await;
         let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
 
         cmd_tx.send(EngineCmd::ResyncMailbox).await.unwrap();
-        {
-            let mut g = mock.lock().await;
-            let _ = g.take_written();
-        }
-        push_frame(&mock, &notify, b"Ping").await;
-        wait_written_contains(&mock, &encoded(DUMP_SET_CAN)).await;
+        dump_via_two_phase(&mock, &notify).await;
         push_frame(&mock, &notify, b"getCAN 1 0703abcde0501010330000100").await;
         let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
 

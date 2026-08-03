@@ -267,6 +267,10 @@ async fn fanout_events(
     while let Some(ev) = ev_rx.recv().await {
         match &ev {
             EngineEvent::Snapshot { bank, can_records } => {
+                info!(
+                    records = can_records.as_ref().map_or(0, Vec::len),
+                    "engine dump snapshot held"
+                );
                 let _ = snapshot_tx.send(Some(ws::HeldSnapshot {
                     bank: bank.clone(),
                     can_records: can_records.clone(),
@@ -285,7 +289,23 @@ async fn fanout_events(
                 warn!(%msg, "link error");
                 let _ = broadcast_tx.send(ev);
             }
-            EngineEvent::RegistersChanged { .. } => {
+            EngineEvent::RegistersChanged { records } => {
+                // Keep the held bank current so late clients and mailbox_update
+                // merges see freshly-synced registers, not the last dump.
+                // Note: never send() while the watch value is borrowed (panic).
+                if !records.is_empty() {
+                    let current = snapshot_tx.borrow().clone();
+                    if let Some(held) = current {
+                        let mut bank = held.bank.clone();
+                        for record in records {
+                            bank.apply(record);
+                        }
+                        let _ = snapshot_tx.send(Some(ws::HeldSnapshot {
+                            bank,
+                            can_records: held.can_records.clone(),
+                        }));
+                    }
+                }
                 let _ = broadcast_tx.send(ev);
             }
         }

@@ -115,31 +115,169 @@ pub fn records_from_update(
     register: &str,
     payload: &Value,
 ) -> Result<Vec<CanRecord>, EncodeError> {
+    records_from_update_with_bank(&RegisterBank::new(), unit_type, unit_id, register, payload)
+}
+
+/// Partial `system_status` write patch: only provided fields are applied over
+/// the current bank value. aaservice's `setAircon` mapper sends sparse payloads
+/// (no `myzone_id` / `fresh_air`), and writing defaults for those would stomp
+/// real CB state.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct SystemStatusPatch {
+    power: Option<String>,
+    mode: Option<String>,
+    fan: Option<String>,
+    target_temp_c: Option<f64>,
+    myzone_id: Option<u8>,
+    fresh_air: Option<bool>,
+}
+
+/// Partial `zone_state` write patch (`zone_id` required).
+#[derive(Debug, Clone, Deserialize)]
+struct ZoneStatePatch {
+    zone_id: ZoneIdJson,
+    #[serde(default)]
+    open: Option<bool>,
+    #[serde(default)]
+    damper_pct: Option<u8>,
+    #[serde(default)]
+    sensor_type: Option<String>,
+    #[serde(default)]
+    target_temp_c: Option<f64>,
+    #[serde(default)]
+    measured_temp_c: Option<f64>,
+}
+
+/// Encode a `mailbox_update` as ControlBox-bound records.
+///
+/// Partial payloads are merged over the current `bank` register values (USB
+/// parity: the CB parses sparse `setAircon` JSON itself and only touches
+/// provided fields).
+///
+/// # Errors
+///
+/// Returns [`EncodeError`] for unsupported registers, bad payloads, or unknown
+/// enum strings.
+pub fn records_from_update_with_bank(
+    bank: &RegisterBank,
+    unit_type: UnitType,
+    unit_id: UnitId,
+    register: &str,
+    payload: &Value,
+) -> Result<Vec<CanRecord>, EncodeError> {
     match register {
-        "system_status" => {
-            let dto: SystemStatusDto = deserialize_payload(payload)?;
-            let status = system_status_from_dto(&dto)?;
-            Ok(vec![CanRecord {
-                unit_type,
-                dest: Dest::ControlBox,
-                unit_id,
-                reg: RegId::new(0x05),
-                data: status.into(),
-            }])
-        }
-        "zone_state" => {
-            let (zone_id, dto) = parse_zone_state_payload(payload)?;
-            let state = zone_state_from_dto(zone_id, &dto)?;
-            Ok(vec![CanRecord {
-                unit_type,
-                dest: Dest::ControlBox,
-                unit_id,
-                reg: RegId::new(0x03),
-                data: state.into(),
-            }])
-        }
+        "system_status" => encode_system_status_update(bank, unit_type, unit_id, payload),
+        "zone_state" => encode_zone_state_update(bank, unit_type, unit_id, payload),
         other => Err(EncodeError::UnsupportedRegister(other.to_owned())),
     }
+}
+
+fn encode_system_status_update(
+    bank: &RegisterBank,
+    unit_type: UnitType,
+    unit_id: UnitId,
+    payload: &Value,
+) -> Result<Vec<CanRecord>, EncodeError> {
+    let patch: SystemStatusPatch = deserialize_payload(payload)?;
+    let base = match bank.get_decoded(unit_type, unit_id, RegId::new(0x05)) {
+        Some(DecodedRegister::SystemStatus(status)) => status,
+        _ => SystemStatus {
+            power: Power::On,
+            mode: Mode::Cool,
+            fan: Fan::Auto,
+            set_temp_x2: 48,
+            myzone_id: 1,
+            fresh_air: FreshAir::None,
+            rf_sys_id: 0,
+        },
+    };
+    let status = SystemStatus {
+        power: patch
+            .power
+            .as_deref()
+            .map(power_from_str)
+            .transpose()?
+            .unwrap_or(base.power),
+        mode: patch
+            .mode
+            .as_deref()
+            .map(mode_from_str)
+            .transpose()?
+            .unwrap_or(base.mode),
+        fan: patch
+            .fan
+            .as_deref()
+            .map(fan_from_str)
+            .transpose()?
+            .unwrap_or(base.fan),
+        set_temp_x2: patch.target_temp_c.map_or(base.set_temp_x2, temp_c_to_x2),
+        myzone_id: patch.myzone_id.unwrap_or(base.myzone_id),
+        fresh_air: match patch.fresh_air {
+            Some(true) => FreshAir::On,
+            Some(false) => FreshAir::Off,
+            None => base.fresh_air,
+        },
+        rf_sys_id: base.rf_sys_id,
+    };
+    Ok(vec![CanRecord {
+        unit_type,
+        dest: Dest::ControlBox,
+        unit_id,
+        reg: RegId::new(0x05),
+        data: status.into(),
+    }])
+}
+
+fn encode_zone_state_update(
+    bank: &RegisterBank,
+    unit_type: UnitType,
+    unit_id: UnitId,
+    payload: &Value,
+) -> Result<Vec<CanRecord>, EncodeError> {
+    let patch: ZoneStatePatch = deserialize_payload(payload)?;
+    let zone_id = match patch.zone_id {
+        ZoneIdJson::Num(n) => u8::try_from(n)
+            .map_err(|_| EncodeError::BadPayload(format!("zone_id out of range: {n}")))?,
+        ZoneIdJson::Str(s) => parse_zone_id_str(&s)?,
+    };
+    let base = match bank.get_zone_decoded(unit_type, unit_id, RegId::new(0x03), zone_id) {
+        Some(DecodedRegister::ZoneState(state)) => state,
+        _ => ZoneState {
+            zone: zone_id,
+            open: false,
+            percent: 0,
+            sensor: SensorType::NoSensor,
+            set_temp_x2: 0,
+            meas_int: 0,
+            meas_dec: 0,
+        },
+    };
+    let state = ZoneState {
+        zone: zone_id,
+        open: patch.open.unwrap_or(base.open),
+        percent: patch.damper_pct.unwrap_or(base.percent),
+        sensor: match patch.sensor_type.as_deref() {
+            Some(s) => sensor_from_str(s)?,
+            None => base.sensor,
+        },
+        set_temp_x2: patch.target_temp_c.map_or(base.set_temp_x2, temp_c_to_x2),
+        meas_int: patch
+            .measured_temp_c
+            .map(measured_from_c)
+            .map_or(base.meas_int, |(i, _)| i),
+        meas_dec: patch
+            .measured_temp_c
+            .map(measured_from_c)
+            .map_or(base.meas_dec, |(_, d)| d),
+    };
+    Ok(vec![CanRecord {
+        unit_type,
+        dest: Dest::ControlBox,
+        unit_id,
+        reg: RegId::new(0x03),
+        data: state.into(),
+    }])
 }
 
 /// Apply a slice of records into `bank` (last-write-wins per [`RegisterBank::apply`]).
@@ -290,43 +428,7 @@ fn deserialize_payload<T: for<'de> Deserialize<'de>>(payload: &Value) -> Result<
     serde_json::from_value(payload.clone()).map_err(|e| EncodeError::BadPayload(e.to_string()))
 }
 
-fn parse_zone_state_payload(payload: &Value) -> Result<(u8, ZoneDto), EncodeError> {
-    #[derive(Deserialize)]
-    struct ZoneStateUpdate {
-        zone_id: ZoneIdJson,
-        open: bool,
-        damper_pct: u8,
-        sensor_type: String,
-        target_temp_c: f64,
-        measured_temp_c: f64,
-    }
-
-    let update: ZoneStateUpdate = deserialize_payload(payload)?;
-    let zone_id = match update.zone_id {
-        ZoneIdJson::Num(n) => {
-            if n > u64::from(u8::MAX) {
-                return Err(EncodeError::BadPayload(format!(
-                    "zone_id out of range: {n}"
-                )));
-            }
-            u8::try_from(n)
-                .map_err(|_| EncodeError::BadPayload(format!("zone_id out of range: {n}")))?
-        }
-        ZoneIdJson::Str(s) => parse_zone_id_str(&s)?,
-    };
-    Ok((
-        zone_id,
-        ZoneDto {
-            open: update.open,
-            damper_pct: update.damper_pct,
-            sensor_type: update.sensor_type,
-            target_temp_c: update.target_temp_c,
-            measured_temp_c: update.measured_temp_c,
-        },
-    ))
-}
-
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum ZoneIdJson {
     Num(u64),
@@ -495,7 +597,8 @@ fn sensor_from_str(s: &str) -> Result<SensorType, EncodeError> {
 mod tests {
     use super::*;
     use aa_registers::{
-        CanRecord, Dest, Fan, FreshAir, Mode, Power, RegId, SensorType, UnitId, UnitType,
+        CanRecord, Dest, Fan, FreshAir, Mode, Power, RegId, SensorType, SystemStatus, UnitId,
+        UnitType, ZoneState,
     };
     use serde_json::json;
 
@@ -681,6 +784,89 @@ mod tests {
         assert_eq!(z.set_temp_x2, 45);
         assert_eq!(z.meas_int, 23);
         assert_eq!(z.meas_dec, 4);
+    }
+
+    #[test]
+    fn records_from_update_with_bank_merges_partial_system_status() {
+        // aaservice setAircon sends sparse payloads (no myzone_id/fresh_air);
+        // the merge must preserve the bank's current values for absent fields.
+        let mut bank = RegisterBank::new();
+        let base = SystemStatus {
+            power: Power::On,
+            mode: Mode::Cool,
+            fan: Fan::Auto,
+            set_temp_x2: 0x30,
+            myzone_id: 3,
+            fresh_air: FreshAir::On,
+            rf_sys_id: 0x42,
+        };
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: unit_id(),
+            reg: RegId::new(0x05),
+            data: base.into(),
+        });
+        let payload = json!({"power": "off", "target_temp_c": 25.0});
+        let records = records_from_update_with_bank(
+            &bank,
+            UnitType::AIRCON,
+            unit_id(),
+            "system_status",
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let DecodedRegister::SystemStatus(s) = records[0].decode() else {
+            panic!("expected SystemStatus");
+        };
+        assert_eq!(s.power, Power::Off);
+        assert_eq!(s.mode, Mode::Cool); // preserved from bank
+        assert_eq!(s.fan, Fan::Auto); // preserved from bank
+        assert_eq!(s.set_temp_x2, 50);
+        assert_eq!(s.myzone_id, 3); // preserved from bank
+        assert_eq!(s.fresh_air, FreshAir::On); // preserved from bank
+        assert_eq!(s.rf_sys_id, 0x42); // preserved from bank
+    }
+
+    #[test]
+    fn records_from_update_with_bank_merges_partial_zone_state() {
+        let mut bank = RegisterBank::new();
+        let base = ZoneState {
+            zone: 2,
+            open: true,
+            percent: 80,
+            sensor: SensorType::Wired,
+            set_temp_x2: 45,
+            meas_int: 22,
+            meas_dec: 5,
+        };
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: unit_id(),
+            reg: RegId::new(0x03),
+            data: base.into(),
+        });
+        let payload = json!({"zone_id": "2", "open": false});
+        let records = records_from_update_with_bank(
+            &bank,
+            UnitType::AIRCON,
+            unit_id(),
+            "zone_state",
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let DecodedRegister::ZoneState(z) = records[0].decode() else {
+            panic!("expected ZoneState");
+        };
+        assert!(!z.open);
+        assert_eq!(z.percent, 80); // preserved from bank
+        assert_eq!(z.sensor, SensorType::Wired); // preserved from bank
+        assert_eq!(z.set_temp_x2, 45); // preserved from bank
+        assert_eq!(z.meas_int, 22); // preserved from bank
+        assert_eq!(z.meas_dec, 5); // preserved from bank
     }
 
     #[test]

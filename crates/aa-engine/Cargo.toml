@@ -8,6 +8,7 @@ aa-frame = { path = "../aa-frame" }
 aa-registers = { path = "../aa-registers" }
 aa-link = { path = "../aa-link" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time", "io-util"] }
+tracing = "0.1"
 
 [dev-dependencies]
 aa-crc = { workspace = true }

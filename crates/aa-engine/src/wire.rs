@@ -22,6 +22,15 @@ pub(crate) const ACK_CAN: &[u8] = b"ackCAN 1";
 pub(crate) const DUMP_SET_CAN: &[u8] =
     b"setCAN 0801000000600000000000000 0801000000236000000000000";
 
+/// Reg-06 zero-uid flush (`setCAN 0701000000600000000000000`).
+///
+/// `aa_interop` spec: this must be the **first** `setCAN` sent — it resets the CB
+/// "dirty" flag so the CB re-sends the content of all registers. Without it, the
+/// CB only reports registers it has never sent (or that changed) since the last
+/// ack, so later dumps shrink to a handful of records and `MyAir5` `rawCan`
+/// stays incomplete. Mirrors the seed token aaservice enqueues on USB open.
+pub(crate) const DIRTY_RESET_SET_CAN: &[u8] = b"setCAN 0701000000600000000000000";
+
 /// Substring present in a successful negotiate reply.
 pub(crate) const CAN2_IN_USE: &str = "CAN2 in use";
 const GET_CAN_PREFIX: &[u8] = b"getCAN";
@@ -97,6 +106,14 @@ mod tests {
         assert_eq!(crc8(EMPTY_SET_CAN), 0xb2);
         assert_eq!(crc8(ACK_CAN), 0xaa);
         assert_eq!(crc8(DUMP_SET_CAN), 0x9c);
+        assert_eq!(crc8(DIRTY_RESET_SET_CAN), 0x6a);
+    }
+
+    #[test]
+    fn dirty_reset_matches_aaservice_seed_token() {
+        // Parity: aaservice enqueues this exact token on USB accessory open.
+        assert_eq!(DIRTY_RESET_SET_CAN, b"setCAN 0701000000600000000000000");
+        assert_eq!(crc8(b"setCAN 0701000000600000000000000"), 0x6a);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 /// Wire payloads mirrored from `aa-engine` (crate-private there).
 const GET_SYSTEM_DATA: &[u8] = b"getSystemData";
+const DIRTY_RESET_SET_CAN: &[u8] = b"setCAN 0701000000600000000000000";
 const DUMP_SET_CAN: &[u8] = b"setCAN 0801000000600000000000000 0801000000236000000000000";
 const EMPTY_SET_CAN: &[u8] = b"setCAN ";
 const ACK_CAN: &[u8] = b"ackCAN 1";
@@ -159,6 +160,22 @@ async fn feeder_negotiate(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool 
 }
 
 async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
+    // Two-phase dump: reg-06 dirty reset → reset getCAN → ack → 08-flush dump.
+    push_frame(mock, notify, b"Ping").await;
+    if !wait_written_contains(mock, &encoded(DIRTY_RESET_SET_CAN)).await {
+        warn!("mock feeder: timed out waiting for dirty-reset setCAN");
+        return false;
+    }
+    let _ = take_written(mock).await;
+    push_frame(mock, notify, &get_can_with_sample()).await;
+
+    push_frame(mock, notify, b"Ping").await;
+    if !wait_written_contains(mock, &encoded(ACK_CAN)).await {
+        warn!("mock feeder: timed out waiting for reset ack");
+        return false;
+    }
+    let _ = take_written(mock).await;
+
     push_frame(mock, notify, b"Ping").await;
     if !wait_written_contains(mock, &encoded(DUMP_SET_CAN)).await {
         warn!("mock feeder: timed out waiting for dump setCAN");
