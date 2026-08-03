@@ -2,9 +2,7 @@
 # Magisk late_start service: start cb-daemon after a bounded wait for USB accessory.
 
 RUNTIME_DIR="/data/adb/cb-daemon"
-RUNTIME_BIN="$RUNTIME_DIR/cb-daemon"
-RUNTIME_CFG="$RUNTIME_DIR/config.toml"
-PID_FILE="$RUNTIME_DIR/cb-daemon.pid"
+CONTROL="$RUNTIME_DIR/control.sh"
 ACCESSORY="/dev/usb_accessory"
 WAIT_SECS=45
 SLEEP_SECS=2
@@ -13,34 +11,13 @@ log() {
   echo "cb-daemon: $*" >&2
 }
 
-already_running() {
-  if [ -f "$PID_FILE" ]; then
-    old_pid="$(cat "$PID_FILE" 2>/dev/null)"
-    if [ -n "$old_pid" ] && [ -d "/proc/$old_pid" ]; then
-      return 0
-    fi
-    rm -f "$PID_FILE"
-  fi
-  if [ -x "$RUNTIME_BIN" ]; then
-    # Match this exact binary path when busybox/toolbox pgrep is available.
-    if command -v pgrep >/dev/null 2>&1; then
-      pgrep -f "$RUNTIME_BIN" >/dev/null 2>&1 && return 0
-    fi
-  fi
-  return 1
-}
-
-if [ ! -x "$RUNTIME_BIN" ]; then
-  log "binary missing or not executable: $RUNTIME_BIN"
+if [ ! -x "$CONTROL" ]; then
+  log "control.sh missing or not executable: $CONTROL"
   exit 1
 fi
 
-if [ ! -f "$RUNTIME_CFG" ]; then
-  log "config missing: $RUNTIME_CFG"
-  exit 1
-fi
-
-if already_running; then
+# Idempotent — control.sh start is a no-op when already running.
+if "$CONTROL" status >/dev/null 2>&1; then
   log "already running; skip start"
   exit 0
 fi
@@ -56,7 +33,5 @@ if [ ! -e "$ACCESSORY" ]; then
   exit 1
 fi
 
-log "starting $RUNTIME_BIN"
-"$RUNTIME_BIN" --config "$RUNTIME_CFG" &
-echo $! >"$PID_FILE"
-exit 0
+log "starting via control.sh"
+exec "$CONTROL" start

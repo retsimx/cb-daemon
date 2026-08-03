@@ -19,6 +19,7 @@ BIN="${CB_DAEMON_BIN:-$OUT_DIR/cb-daemon}"
 REQUIRED_MEMBERS=(
   module.prop
   service.sh
+  control.sh
   uninstall.sh
   customize.sh
   config.toml.example
@@ -55,6 +56,7 @@ rm -f "$STAGE/README.md"
 cp -f "$BIN" "$STAGE/cb-daemon"
 chmod 755 "$STAGE/cb-daemon" \
   "$STAGE/service.sh" \
+  "$STAGE/control.sh" \
   "$STAGE/uninstall.sh" \
   "$STAGE/customize.sh" \
   "$STAGE/META-INF/com/google/android/update-binary"

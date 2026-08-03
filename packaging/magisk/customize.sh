@@ -1,5 +1,6 @@
 #!/system/bin/sh
-# Magisk install hook: install binary + optional default config under /data/adb/cb-daemon.
+# Magisk install hook: install binary + control.sh + optional default config
+# under /data/adb/cb-daemon.
 # Binary is shipped at $MODPATH/cb-daemon (same path the pack script stages).
 
 SKIPUNZIP=0
@@ -7,8 +8,10 @@ SKIPUNZIP=0
 RUNTIME_DIR="/data/adb/cb-daemon"
 RUNTIME_BIN="$RUNTIME_DIR/cb-daemon"
 RUNTIME_CFG="$RUNTIME_DIR/config.toml"
+RUNTIME_CTL="$RUNTIME_DIR/control.sh"
 MOD_BIN="$MODPATH/cb-daemon"
 MOD_CFG="$MODPATH/config.toml.example"
+MOD_CTL="$MODPATH/control.sh"
 
 ui_print "- Installing cb-daemon runtime to $RUNTIME_DIR"
 
@@ -21,6 +24,13 @@ fi
 
 cp -f "$MOD_BIN" "$RUNTIME_BIN"
 chmod 755 "$RUNTIME_BIN"
+
+if [ ! -f "$MOD_CTL" ]; then
+  ui_print "! Missing module control.sh: $MOD_CTL"
+  abort "! Repack the Magisk zip with packaging/magisk/control.sh"
+fi
+cp -f "$MOD_CTL" "$RUNTIME_CTL"
+chmod 755 "$RUNTIME_CTL"
 
 if [ ! -f "$RUNTIME_CFG" ]; then
   if [ -f "$MOD_CFG" ]; then
@@ -35,3 +45,4 @@ else
 fi
 
 ui_print "- Done. Service starts on late_start via service.sh"
+ui_print "- Ops: $RUNTIME_CTL {start|stop|status}"
