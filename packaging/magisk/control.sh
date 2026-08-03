@@ -13,12 +13,27 @@ RUNTIME_DIR="/data/adb/cb-daemon"
 RUNTIME_BIN="$RUNTIME_DIR/cb-daemon"
 RUNTIME_CFG="$RUNTIME_DIR/config.toml"
 PID_FILE="$RUNTIME_DIR/cb-daemon.pid"
-LOG_FILE="$RUNTIME_DIR/cb-daemon.log"
-# Temporary soak logging: keep file bounded across restarts.
-LOG_MAX_BYTES=5242880
+# Log lives on a tmpfs mount so tracing writes never wear the eMMC.
+RAMLOG_DIR="$RUNTIME_DIR/ramlog"
+LOG_FILE="$RAMLOG_DIR/cb-daemon.log"
+# 50MB RAM-backed rolling cap (rotate happens at next start).
+LOG_MAX_BYTES=52428800
 
 log() {
   echo "cb-daemon-control: $*" >&2
+}
+
+# Mount a tmpfs for the log directory (idempotent; falls back to eMMC if the
+# mount is unavailable, e.g. very early boot before /data settles).
+ensure_ramlog() {
+  [ -d "$RAMLOG_DIR" ] || mkdir -p "$RAMLOG_DIR"
+  if ! mountpoint -q "$RAMLOG_DIR" 2>/dev/null; then
+    if mount -t tmpfs -o size=64m,mode=755 tmpfs "$RAMLOG_DIR" 2>/dev/null; then
+      log "ramlog: tmpfs mounted at $RAMLOG_DIR"
+    else
+      log "ramlog: tmpfs mount failed (logging to eMMC at $RAMLOG_DIR)"
+    fi
+  fi
 }
 
 rotate_log_if_needed() {
@@ -92,6 +107,7 @@ cmd_start() {
     log "start: missing config $RUNTIME_CFG"
     exit 1
   fi
+  ensure_ramlog
   log "start: spawning $RUNTIME_BIN (log=$LOG_FILE)"
   rotate_log_if_needed
   {
