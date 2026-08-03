@@ -27,18 +27,21 @@ LOG_FILE="$RUNTIME_DIR/service.log"
   # Retry until the engine actually negotiates, not merely until the process
   # exists. control.sh start/stop are idempotent; we are already detached so
   # Magisk never blocks.
-  DAEMON_LOG="/data/adb/cb-daemon/cb-daemon.log"
+  DAEMON_LOG="/data/adb/cb-daemon/ramlog/cb-daemon.log"
   ATTEMPTS=8
   RETRY_SLEEP=12
   n=0
   while [ "$n" -lt "$ATTEMPTS" ]; do
-    before="$(wc -l <"$DAEMON_LOG" 2>/dev/null || echo 0)"
     "$CONTROL" start
     rc=$?
     echo "cb-daemon-service: control.sh start exit=$rc (attempt $((n + 1))/$ATTEMPTS)"
     sleep "$RETRY_SLEEP"
+    # Success when the daemon process is alive AND the engine negotiated.
+    # Boot log is fresh (tmpfs), so any 'negotiated' is this boot's — including
+    # a daemon aaservice spawned itself via control.sh (never kill a working
+    # engine just because OUR windowed marker missed it).
     if pidof cb-daemon >/dev/null 2>&1 &&
-      tail -n +$((before + 1)) "$DAEMON_LOG" 2>/dev/null | grep -q "negotiated"; then
+      grep -q "negotiated" "$DAEMON_LOG" 2>/dev/null; then
       echo "cb-daemon-service: daemon negotiated after boot start"
       break
     fi
