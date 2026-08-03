@@ -1,49 +1,28 @@
 #!/system/bin/sh
-# Magisk late_start service: start cb-daemon after USB accessory appears.
+# Magisk late_start: must return immediately (never block).
+# Start cb-daemon only after sys.boot_completed, in a detached background job.
 #
-# Important: return immediately. A long foreground wait here can trip Magisk
-# bootloop protection and leave the module disabled + Magisk in safe mode
-# (su only under /debug_ramdisk, not on PATH).
+# Do NOT call control.sh / touch USB in the foreground path — that previously
+# tripped Magisk safe-mode (module disabled, PATH su gone).
 
 RUNTIME_DIR="/data/adb/cb-daemon"
 CONTROL="$RUNTIME_DIR/control.sh"
-ACCESSORY="/dev/usb_accessory"
-WAIT_SECS=45
-SLEEP_SECS=2
 LOG_FILE="$RUNTIME_DIR/service.log"
 
-log() {
-  echo "cb-daemon: $*" >&2
-  echo "cb-daemon: $*" >>"$LOG_FILE" 2>/dev/null
-}
-
-if [ ! -x "$CONTROL" ]; then
-  log "control.sh missing or not executable: $CONTROL"
-  exit 1
-fi
-
-# Idempotent — control.sh start is a no-op when already running.
-if "$CONTROL" status >/dev/null 2>&1; then
-  log "already running; skip start"
-  exit 0
-fi
-
-# Background wait + start so Magisk late_start is not blocked for WAIT_SECS.
-(
-  elapsed=0
-  while [ ! -e "$ACCESSORY" ] && [ "$elapsed" -lt "$WAIT_SECS" ]; do
-    sleep "$SLEEP_SECS"
-    elapsed=$((elapsed + SLEEP_SECS))
+{
+  echo "cb-daemon-service: late_start spawn $(date 2>/dev/null || echo unknown)"
+  # Wait until Android reports boot finished (non-blocking for Magisk — we already &)
+  while [ "$(getprop sys.boot_completed)" != "1" ]; do
+    sleep 2
   done
-
-  if [ ! -e "$ACCESSORY" ]; then
-    log "accessory $ACCESSORY not present after ${WAIT_SECS}s; give up"
+  # Brief settle for /dev/usb_accessory + magiskd
+  sleep 5
+  if [ ! -x "$CONTROL" ]; then
+    echo "cb-daemon-service: missing $CONTROL"
     exit 0
   fi
+  "$CONTROL" start
+  echo "cb-daemon-service: control.sh start exit=$?"
+} >>"$LOG_FILE" 2>&1 &
 
-  log "starting via control.sh"
-  "$CONTROL" start >>"$LOG_FILE" 2>&1
-) &
-
-log "late_start: accessory wait spawned (pid=$!)"
 exit 0

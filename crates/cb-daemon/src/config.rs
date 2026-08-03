@@ -478,7 +478,12 @@ fn build_env_filter_inner(log_level: &str, rust_log: Option<&str>) -> Result<Env
 /// Returns an error if the filter cannot be built.
 pub fn init_tracing(log_level: &str) -> Result<()> {
     let filter = build_env_filter(log_level)?;
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // LineWriter so Magisk `control.sh` redirects to cb-daemon.log flush per line
+    // (stderr is fully buffered when not a TTY).
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(|| std::io::LineWriter::new(std::io::stderr()))
+        .init();
     Ok(())
 }
 
