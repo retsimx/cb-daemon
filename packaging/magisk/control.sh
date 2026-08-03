@@ -13,9 +13,29 @@ RUNTIME_DIR="/data/adb/cb-daemon"
 RUNTIME_BIN="$RUNTIME_DIR/cb-daemon"
 RUNTIME_CFG="$RUNTIME_DIR/config.toml"
 PID_FILE="$RUNTIME_DIR/cb-daemon.pid"
+LOG_FILE="$RUNTIME_DIR/cb-daemon.log"
+# Temporary soak logging: keep file bounded across restarts.
+LOG_MAX_BYTES=5242880
 
 log() {
   echo "cb-daemon-control: $*" >&2
+}
+
+rotate_log_if_needed() {
+  if [ -f "$LOG_FILE" ]; then
+    # Busybox/toybox `wc -c` works; fall back to skipping rotate.
+    sz="$(wc -c <"$LOG_FILE" 2>/dev/null)" || sz=0
+    if [ -n "$sz" ] && [ "$sz" -gt "$LOG_MAX_BYTES" ] 2>/dev/null; then
+      mv -f "$LOG_FILE" "$LOG_FILE.old" 2>/dev/null || rm -f "$LOG_FILE"
+    fi
+  fi
+}
+
+# Mirror one line to logcat when available (Magisk soak / adb).
+logcat_line() {
+  if command -v log >/dev/null 2>&1; then
+    log -p i -t cb-daemon -- "$1" 2>/dev/null || true
+  fi
 }
 
 pid_is_daemon() {
@@ -72,16 +92,24 @@ cmd_start() {
     log "start: missing config $RUNTIME_CFG"
     exit 1
   fi
-  log "start: spawning $RUNTIME_BIN"
-  "$RUNTIME_BIN" --config "$RUNTIME_CFG" &
+  log "start: spawning $RUNTIME_BIN (log=$LOG_FILE)"
+  rotate_log_if_needed
+  {
+    echo "----- cb-daemon start $(date 2>/dev/null || echo unknown) -----"
+  } >>"$LOG_FILE" 2>/dev/null
+  # Durable soak log (stdout+stderr). Inspect with:
+  #   tail -f /data/adb/cb-daemon/cb-daemon.log
+  # Magisk/adb: same file; logcat is not wired (keeps PID tracking simple).
+  "$RUNTIME_BIN" --config "$RUNTIME_CFG" >>"$LOG_FILE" 2>&1 &
   new_pid=$!
   echo "$new_pid" >"$PID_FILE"
   sleep 1
   if ! pid_is_daemon "$new_pid"; then
     rm -f "$PID_FILE"
-    log "start: process exited immediately"
+    log "start: process exited immediately (see $LOG_FILE)"
     exit 1
   fi
+  logcat_line "started pid=$new_pid"
   log "start: ok pid=$new_pid"
   exit 0
 }

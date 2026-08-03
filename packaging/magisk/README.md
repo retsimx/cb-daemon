@@ -11,6 +11,7 @@ devices such as the Samsung SM-T350 tablet.
 | `/data/adb/cb-daemon/config.toml` | Config (created on first install only) |
 | `/data/adb/cb-daemon/control.sh` | start / stop / status (aaservice + ops) |
 | `/data/adb/cb-daemon/cb-daemon.pid` | PID file written by `control.sh` |
+| `/data/adb/cb-daemon/cb-daemon.log` | Daemon stdout/stderr (rotated at 5 MiB) |
 
 Module scripts live under Magisk’s module directory; the binary, `control.sh`,
 and config are copied to `/data/adb/cb-daemon/` by `customize.sh` at install time.
