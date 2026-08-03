@@ -53,10 +53,9 @@ Under Magisk/`su` context:
 
 1. Confirm module enabled and reboot once after install.
 2. Check binary, `control.sh`, and config exist under `/data/adb/cb-daemon/`.
-3. On boot, late_start `service.sh` returns immediately and waits for
-   `/dev/usb_accessory` in the background (avoids Magisk bootloop/safe-mode).
-   Check: `/data/adb/cb-daemon/control.sh status` and `cb-daemon.log` /
-   `service.log`.
+3. On boot, late_start `service.sh` returns immediately and starts the daemon
+   only after `sys.boot_completed` (background). Check:
+   `/data/adb/cb-daemon/control.sh status`, `service.log`, `cb-daemon.log`.
 4. Manual:  
    `/data/adb/cb-daemon/control.sh start|stop|status`
 5. Uninstall module via Magisk; confirm `/data/adb/cb-daemon/` is removed.
