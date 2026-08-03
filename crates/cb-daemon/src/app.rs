@@ -313,6 +313,8 @@ async fn fanout_events(
             }
         }
     }
+    // Only reachable when the engine channel closed (engine exited).
+    warn!("event fanout ended (engine channel closed)");
 }
 
 async fn wait_shutdown_signal() {

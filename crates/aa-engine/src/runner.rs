@@ -3,7 +3,7 @@
 use aa_frame::{Frame, FrameScanner};
 use aa_link::Link;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::event::{EngineCmd, EngineEvent};
 use crate::session::Session;
@@ -148,6 +148,7 @@ impl<L: Link> CbEngine<L> {
                     return true;
                 }
                 if was_write && ev_tx.send(EngineEvent::WriteFlushed).await.is_err() {
+                    warn!("engine event channel closed; engine exiting");
                     let _ = self.link.close().await;
                     return true;
                 }
@@ -159,6 +160,7 @@ impl<L: Link> CbEngine<L> {
 
         for event in session.on_frame(&frame.payload) {
             if ev_tx.send(event).await.is_err() {
+                warn!("engine event channel closed; engine exiting");
                 let _ = self.link.close().await;
                 return true;
             }
