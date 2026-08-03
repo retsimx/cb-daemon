@@ -433,16 +433,26 @@ impl Session {
         {
             return;
         }
+        // Fallback when the dump never delivered reg 05: synthesize from zones,
+        // choosing the zone with the largest |measured − set| differential (the
+        // room that most needs conditioning — MyTemp semantics). Hardcoding
+        // zone 1 here told MyAir5 "myzone=1" on every dump lacking reg 05,
+        // which can suppress its own auto-move decision.
         let mut set_temp_x2 = 48; // 24°C fallback
         let mut myzone_id = 1u8;
+        let mut max_diff_x2 = -1.0f64;
         for z in 1u8..=10 {
             if let Some(DecodedRegister::ZoneState(state)) =
                 self.bank
                     .get_zone_decoded(UnitType::AIRCON, unit, RegId::new(0x03), z)
             {
-                set_temp_x2 = state.set_temp_x2;
-                myzone_id = state.zone;
-                break;
+                let meas_x2 = (f64::from(state.meas_int) + f64::from(state.meas_dec) / 10.0) * 2.0;
+                let diff = (meas_x2 - f64::from(state.set_temp_x2)).abs();
+                if diff > max_diff_x2 {
+                    max_diff_x2 = diff;
+                    set_temp_x2 = state.set_temp_x2;
+                    myzone_id = state.zone;
+                }
             }
         }
         let status = SystemStatus {
@@ -992,5 +1002,41 @@ mod tests {
         assert!(!s.is_shutdown());
         s.apply_cmd(EngineCmd::Shutdown);
         assert!(s.is_shutdown());
+    }
+
+    #[test]
+    fn dump_without_reg05_synthesizes_worst_off_zone_as_myzone() {
+        // Regression: synthesis hardcoded zone 1; MyAir5 was told myzone=1 on
+        // every dump lacking reg 05, suppressing its auto-move. The synthesized
+        // myzone must be the zone with the largest |measured - set| diff.
+        let mut s = Session::new();
+        advance_to_dump(&mut s);
+        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
+        let zone1 = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Unknown(0x03),
+            unit_id: UnitId::try_new(0x0_11111).unwrap(),
+            reg: RegId::new(0x03),
+            data: [0x01, 0xe4, 0x01, 0x2c, 0x14, 0x05, 0x00], // zone 1, meas 20.5C -> diff 3 (small)
+        };
+        let zone3 = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Unknown(0x03),
+            unit_id: UnitId::try_new(0x0_11111).unwrap(),
+            reg: RegId::new(0x03),
+            data: [0x03, 0x64, 0x01, 0x2c, 0x14, 0x00, 0x00], // zone 3, meas 20.0C -> diff 4 (large)
+        };
+        let live = live_unit_reg06();
+        let _ = s.on_frame(&get_can_payload(&[live, zone1, zone3]));
+        let data = s
+            .bank
+            .get(
+                UnitType::AIRCON,
+                UnitId::try_new(0x0_11111).unwrap(),
+                RegId::new(0x05),
+            )
+            .expect("synthesized reg 05");
+        let status = SystemStatus::from(data);
+        assert_eq!(status.myzone_id, 3);
     }
 }
