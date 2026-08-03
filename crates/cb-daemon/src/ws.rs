@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
-    AckStatus, ClientMessage, ServerMessage, records_from_update, snapshot_from_bank,
-    system_status_to_dto, zone_config_to_dto, zone_dto_from_state,
+    AckStatus, ClientMessage, ServerMessage, records_from_update,
+    snapshot_from_bank_with_can_records, system_status_to_dto, zone_config_to_dto,
+    zone_dto_from_state,
 };
-use aa_registers::{DecodedRegister, RegisterBank, UnitType};
+use aa_registers::{DecodedRegister, RegisterBank, UnitId, UnitType};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -26,19 +27,39 @@ pub(crate) const SINGLE_CLIENT_CLOSE_CODE: u16 = 4009;
 /// Close reason for the single-session gate.
 pub(crate) const SINGLE_CLIENT_CLOSE_REASON: &str = "Single client limit enforced";
 
+/// Held engine snapshot for late WebSocket clients (bank + CB dump hex).
+#[derive(Debug, Clone)]
+pub(crate) struct HeldSnapshot {
+    pub bank: RegisterBank,
+    /// CB dump `can_records` for `MyAir5` `rawCan` (excludes synthesized regs).
+    pub can_records: Option<Vec<String>>,
+}
+
 /// Shared state for the axum router.
 #[derive(Clone)]
 pub(crate) struct WsState {
     /// Engine command sender (bound 32 upstream).
     pub cmd_tx: mpsc::Sender<EngineCmd>,
-    /// Latest dump/resync bank (`None` until first [`EngineEvent::Snapshot`]).
-    pub snapshot: watch::Receiver<Option<RegisterBank>>,
+    /// Latest dump/resync snapshot (`None` until first [`EngineEvent::Snapshot`]).
+    pub snapshot: watch::Receiver<Option<HeldSnapshot>>,
     /// Fan-out of non-snapshot engine events to the active session.
     pub events: broadcast::Sender<EngineEvent>,
     /// Single-session gate (`true` while a client holds the slot).
     pub session_held: Arc<AtomicBool>,
     /// Optional spy for tests (records cmds accepted from WS).
     pub cmd_spy: Option<Arc<tokio::sync::Mutex<Vec<EngineCmd>>>>,
+    /// Config `unit_id_hint` (preferred when present in the bank).
+    pub unit_id_hint: Option<UnitId>,
+}
+
+fn resolve_unit_id(bank: &RegisterBank, hint: Option<UnitId>) -> UnitId {
+    let id = bank.preferred_unit_id(UnitType::AIRCON, hint);
+    if id == UnitId::ZERO {
+        // Mock feeder / empty bank fallback.
+        hint.unwrap_or(FEEDER_UNIT_ID)
+    } else {
+        id
+    }
 }
 
 /// Build the axum router with `GET /v1/mailbox-stream`.
@@ -80,8 +101,15 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
 }
 
 async fn run_session(mut socket: WebSocket, state: WsState) -> anyhow::Result<()> {
-    let bank = wait_for_snapshot(&mut socket, state.snapshot.clone()).await?;
-    let snap = snapshot_from_bank(&bank, UnitType::AIRCON, FEEDER_UNIT_ID);
+    let held = wait_for_snapshot(&mut socket, state.snapshot.clone()).await?;
+    let unit_id = resolve_unit_id(&held.bank, state.unit_id_hint);
+    info!(%unit_id, "mailbox snapshot unit_id");
+    let snap = snapshot_from_bank_with_can_records(
+        &held.bank,
+        UnitType::AIRCON,
+        unit_id,
+        held.can_records,
+    );
     send_json(&mut socket, &snap).await?;
     bridge_until_disconnect(&mut socket, &state).await
 }
@@ -92,12 +120,12 @@ async fn run_session(mut socket: WebSocket, state: WsState) -> anyhow::Result<()
 /// (otherwise `session_held` would stick until a Snapshot arrives — or forever).
 async fn wait_for_snapshot(
     socket: &mut WebSocket,
-    mut rx: watch::Receiver<Option<RegisterBank>>,
-) -> anyhow::Result<RegisterBank> {
+    mut rx: watch::Receiver<Option<HeldSnapshot>>,
+) -> anyhow::Result<HeldSnapshot> {
     loop {
         let current = rx.borrow_and_update().clone();
-        if let Some(bank) = current {
-            return Ok(bank);
+        if let Some(held) = current {
+            return Ok(held);
         }
         tokio::select! {
             changed = rx.changed() => {
@@ -134,7 +162,7 @@ async fn bridge_until_disconnect(socket: &mut WebSocket, state: &WsState) -> any
                 }
             }
             ev = ev_rx.recv() => {
-                if !forward_engine_event(socket, ev).await? {
+                if !forward_engine_event(socket, state, ev).await? {
                     break;
                 }
             }
@@ -181,6 +209,7 @@ async fn handle_ws_message(
 /// Returns `false` when the session should end.
 async fn forward_engine_event(
     socket: &mut WebSocket,
+    state: &WsState,
     ev: Result<EngineEvent, broadcast::error::RecvError>,
 ) -> anyhow::Result<bool> {
     match ev {
@@ -190,8 +219,10 @@ async fn forward_engine_event(
             }
             Ok(true)
         }
-        Ok(EngineEvent::Snapshot(bank)) => {
-            let snap = snapshot_from_bank(&bank, UnitType::AIRCON, FEEDER_UNIT_ID);
+        Ok(EngineEvent::Snapshot { bank, can_records }) => {
+            let unit_id = resolve_unit_id(&bank, state.unit_id_hint);
+            let snap =
+                snapshot_from_bank_with_can_records(&bank, UnitType::AIRCON, unit_id, can_records);
             send_json(socket, &snap).await?;
             Ok(true)
         }
@@ -218,20 +249,26 @@ async fn handle_client_text(
             msg_id,
             register,
             payload,
-        }) => match records_from_update(UnitType::AIRCON, FEEDER_UNIT_ID, &register, &payload) {
-            Ok(records) => {
-                let cmd = EngineCmd::WriteRegisters(records);
-                record_spy(state, &cmd).await;
-                if let Err(err) = state.cmd_tx.send(cmd).await {
+        }) => {
+            let unit_id = state.snapshot.borrow().as_ref().map_or_else(
+                || state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID),
+                |held| resolve_unit_id(&held.bank, state.unit_id_hint),
+            );
+            match records_from_update(UnitType::AIRCON, unit_id, &register, &payload) {
+                Ok(records) => {
+                    let cmd = EngineCmd::WriteRegisters(records);
+                    record_spy(state, &cmd).await;
+                    if let Err(err) = state.cmd_tx.send(cmd).await {
+                        send_ack(socket, &msg_id, AckStatus::Error, Some(err.to_string())).await?;
+                    } else {
+                        send_ack(socket, &msg_id, AckStatus::Success, None).await?;
+                    }
+                }
+                Err(err) => {
                     send_ack(socket, &msg_id, AckStatus::Error, Some(err.to_string())).await?;
-                } else {
-                    send_ack(socket, &msg_id, AckStatus::Success, None).await?;
                 }
             }
-            Err(err) => {
-                send_ack(socket, &msg_id, AckStatus::Error, Some(err.to_string())).await?;
-            }
-        },
+        }
         Ok(ClientMessage::Command { msg_id, action }) => {
             if action == "resync_mailbox" {
                 let cmd = EngineCmd::ResyncMailbox;
@@ -333,4 +370,31 @@ fn mailbox_events_from_records(records: &[aa_registers::CanRecord]) -> Vec<Serve
         }
     }
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use aa_registers::{CanRecord, Dest, RegId, UnitType};
+
+    #[test]
+    fn resolve_unit_id_prefers_live_dump_over_feeder_default() {
+        // Regression: mailbox snapshot used hardcoded abcde while AOA dump was 11111.
+        let mut bank = RegisterBank::new();
+        let live = UnitId::try_new(0x0_11111).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: live,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        assert_eq!(resolve_unit_id(&bank, Some(live)), live);
+        assert_eq!(resolve_unit_id(&bank, None), live);
+        // Empty bank still falls back to feeder id (or hint).
+        let empty = RegisterBank::new();
+        assert_eq!(resolve_unit_id(&empty, None), FEEDER_UNIT_ID);
+        assert_eq!(resolve_unit_id(&empty, Some(live)), live);
+    }
 }

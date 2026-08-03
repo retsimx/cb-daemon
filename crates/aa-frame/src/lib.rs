@@ -115,13 +115,22 @@ impl FrameScanner {
     /// Leading/trailing spaces between frames are accepted. Soft incompleteness
     /// yields an empty (or partial) `Ok` list rather than [`FrameError::Incomplete`].
     ///
+    /// On [`FrameError::Malformed`] / [`FrameError::InvalidCrc`], the scanner
+    /// **resyncs** to the next `<U>` (or keeps a short partial-prefix tail) and
+    /// continues — it does not wedge on leading AOA/bus garbage. Those errors
+    /// are returned only when no frames were extracted **and** resync discarded
+    /// bytes with no subsequent `<U>` in this push (caller may log a warn).
+    ///
     /// # Errors
     ///
-    /// Propagates [`FrameError::InvalidCrc`] and [`FrameError::Malformed`].
+    /// May return [`FrameError::InvalidCrc`] or [`FrameError::Malformed`] when
+    /// a push discarded noise and produced no frames (resync with no recovery
+    /// target yet). Incomplete data alone is never an error from `push`.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Frame>, FrameError> {
         self.buf.extend_from_slice(chunk);
 
         let mut frames = Vec::new();
+        let mut last_resync_err: Option<FrameError> = None;
         loop {
             // Drop pure leading spaces so an idle trailing gap does not grow forever.
             let leading = self.buf.iter().take_while(|&&b| b == b' ').count();
@@ -137,10 +146,31 @@ impl FrameScanner {
                 Ok((frame, consumed)) => {
                     self.buf.drain(..consumed);
                     frames.push(frame);
+                    last_resync_err = None;
                 }
                 Err(FrameError::Incomplete) => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Skip current byte / bad frame start and hunt for the next PREFIX.
+                    // Keeping a short tail preserves a split `<U` across chunks.
+                    if let Some(rel) = find_slice(&self.buf[1..], PREFIX) {
+                        self.buf.drain(..=rel);
+                        last_resync_err = Some(e);
+                    } else {
+                        let keep = PREFIX.len().saturating_sub(1).min(self.buf.len());
+                        let drop = self.buf.len() - keep;
+                        if drop > 0 {
+                            self.buf.drain(..drop);
+                            last_resync_err = Some(e);
+                        }
+                        break;
+                    }
+                }
             }
+        }
+        if frames.is_empty()
+            && let Some(err) = last_resync_err
+        {
+            return Err(err);
         }
         Ok(frames)
     }
@@ -292,5 +322,71 @@ mod tests {
             Frame::decode_one(b"<X>Ping</U=db>"),
             Err(FrameError::Malformed)
         );
+    }
+
+    #[test]
+    fn scanner_resyncs_past_leading_garbage_to_ping() {
+        // Regression: AOA noise before `<U>` wedged the scanner on Malformed forever.
+        let mut scanner = FrameScanner::new();
+        let noise = b"\x00\xe1\x00\x00\x08\x01\x00\x00";
+        let ping = b"<U>Ping</U=db>";
+        let mut burst = noise.to_vec();
+        burst.extend_from_slice(ping);
+        let frames = scanner.push(&burst).expect("resync should yield ping");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, b"Ping");
+    }
+
+    #[test]
+    fn scanner_resyncs_past_bad_crc_to_next_frame() {
+        // Regression: bad CRC must consume the bad frame and continue, not wedge.
+        let mut scanner = FrameScanner::new();
+        let burst = b"<U>Ping</U=00><U>Ping</U=db>";
+        let frames = scanner.push(burst).expect("bad crc should not wedge");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, b"Ping");
+    }
+
+    #[test]
+    fn scanner_reassembles_large_getcan_in_aoa_chunks() {
+        // Regression: live unit-08 dump replies are ~425-byte getCAN payloads.
+        // AOA delivers them in ≤63-byte USB chunks; scanner must not Malformed-resync
+        // mid-frame and destroy the payload.
+        use std::fmt::Write;
+
+        let mut records = String::from("getCAN 1");
+        for i in 0..16 {
+            records.push(' ');
+            let _ = write!(records, "070311111050101033{i:02x}00100");
+        }
+        let frame = Frame {
+            payload: records.as_bytes().to_vec(),
+        };
+        let encoded = frame.encode();
+        assert!(encoded.len() > 200, "encoded len {}", encoded.len());
+
+        let mut scanner = FrameScanner::new();
+        let chunk = 63usize;
+        let mut got = Vec::new();
+        for start in (0..encoded.len()).step_by(chunk) {
+            let end = (start + chunk).min(encoded.len());
+            let frames = scanner
+                .push(&encoded[start..end])
+                .expect("chunked large getCAN must not Malformed");
+            got.extend(frames);
+        }
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload, records.as_bytes());
+    }
+
+    #[test]
+    fn scanner_noise_only_returns_malformed_once() {
+        let mut scanner = FrameScanner::new();
+        let err = scanner
+            .push(b"\x00\xe1\x00\x00")
+            .expect_err("noise with no <U> should surface");
+        assert_eq!(err, FrameError::Malformed);
+        // Buffer kept a short prefix tail; further empty push is quiet.
+        assert!(scanner.push(&[]).unwrap().is_empty());
     }
 }

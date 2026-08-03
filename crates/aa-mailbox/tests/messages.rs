@@ -29,6 +29,7 @@ fn golden_mailbox_snapshot_round_trip() {
         ref system_status,
         ref zone_config,
         ref zones,
+        ref can_records,
     } = msg
     else {
         panic!("expected mailbox_snapshot");
@@ -37,6 +38,8 @@ fn golden_mailbox_snapshot_round_trip() {
     assert!(system_status.is_some());
     assert!(zone_config.is_some());
     assert_eq!(zones.as_ref().map(BTreeMap::len), Some(2));
+    // Fixture predates can_records; omitted field deserializes as None.
+    assert!(can_records.is_none());
 
     let encoded = serde_json::to_value(&msg).expect("serialize");
     let expected: Value = serde_json::from_str(raw).expect("parse fixture");
@@ -127,6 +130,7 @@ fn golden_command_round_trip() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn acceptance_snapshot_bank_round_trip() {
     let mut bank = RegisterBank::new();
     let status = SystemStatus {
@@ -187,6 +191,7 @@ fn acceptance_snapshot_bank_round_trip() {
         system_status,
         zone_config,
         zones,
+        can_records,
     } = snap
     else {
         panic!("expected snapshot");
@@ -196,25 +201,43 @@ fn acceptance_snapshot_bank_round_trip() {
         system_status,
         zone_config,
         zones,
+        can_records,
     };
 
     let mut bank2 = RegisterBank::new();
     apply_snapshot_body_to_bank(&mut bank2, UnitType::AIRCON, unit_id(), &body).unwrap();
     let snap2 = snapshot_from_bank(&bank2, UnitType::AIRCON, unit_id());
-    assert_eq!(
-        serde_json::to_value(ServerMessage::from_snapshot_body(body.clone())).unwrap(),
-        serde_json::to_value(&snap2).unwrap()
-    );
-    // rf_sys_id is not in JSON; bank2 will have 0 — compare DTO fields only.
+    // Typed DTO fields round-trip; can_records also re-emit from the bank but may
+    // differ in bytes not represented in JSON (zone-config constant ids, rf_sys_id).
     assert_eq!(body.system_status, {
         let ServerMessage::MailboxSnapshot {
             system_status: s, ..
-        } = snap2
+        } = &snap2
         else {
             panic!("expected snapshot");
         };
-        s
+        s.clone()
     });
+    assert_eq!(body.zone_config, {
+        let ServerMessage::MailboxSnapshot { zone_config: c, .. } = &snap2 else {
+            panic!("expected snapshot");
+        };
+        c.clone()
+    });
+    assert_eq!(body.zones, {
+        let ServerMessage::MailboxSnapshot { zones: z, .. } = &snap2 else {
+            panic!("expected snapshot");
+        };
+        z.clone()
+    });
+    let ServerMessage::MailboxSnapshot {
+        can_records: Some(recs2),
+        ..
+    } = snap2
+    else {
+        panic!("expected can_records on resnapshot");
+    };
+    assert_eq!(body.can_records.as_ref().map(Vec::len), Some(recs2.len()));
 }
 
 #[test]
@@ -271,6 +294,7 @@ fn omit_empty_optional_snapshot_fields() {
         system_status: None,
         zone_config: None,
         zones: None,
+        can_records: None,
     };
     let v = serde_json::to_value(&msg).unwrap();
     assert_eq!(v["type"], "mailbox_snapshot");
@@ -278,6 +302,7 @@ fn omit_empty_optional_snapshot_fields() {
     assert!(v.get("system_status").is_none());
     assert!(v.get("zone_config").is_none());
     assert!(v.get("zones").is_none());
+    assert!(v.get("can_records").is_none());
 }
 
 #[test]
