@@ -10,5 +10,5 @@ mod runner;
 mod session;
 mod wire;
 
-pub use event::{EngineCmd, EngineEvent};
+pub use event::{EngineCmd, EngineEvent, SessionState};
 pub use runner::CbEngine;

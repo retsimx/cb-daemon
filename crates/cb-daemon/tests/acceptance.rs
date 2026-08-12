@@ -102,6 +102,31 @@ fn reg05_write(msg_id: &str) -> Value {
     })
 }
 
+/// Wait until a JSON message of type `ty` arrives; panics on close/timeout.
+///
+/// Tolerates interleaved `status` frames (D-8): sessions send the
+/// connect-time `status` before the snapshot, and transitions may be
+/// broadcast between other messages.
+async fn wait_for_type(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ty: &str,
+) -> Value {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(ws)
+                .await
+                .expect("closed before message arrived");
+            if msg["type"] == ty {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("message timeout")
+}
+
 /// Wait until the ack for `msg_id` arrives; panics on close/timeout.
 async fn wait_for_ack(
     ws: &mut tokio_tungstenite::WebSocketStream<
@@ -152,8 +177,8 @@ async fn mock_backend_ws_receives_mailbox_snapshot() {
     let handle = spawn_daemon().await;
     let mut ws = connect_ws(handle.local_addr()).await;
 
-    let msg = recv_json(&mut ws).await;
-    assert_eq!(msg["type"], "snapshot");
+    // D-8: the connect-time `status` frame precedes the snapshot.
+    let msg = wait_for_type(&mut ws, "snapshot").await;
     // Multi-unit map keyed "{unit_type}:{unit_id}" (D-3): the mock feeder
     // round-trips the 07 sample dump and the 08-type flush dump.
     // Mock feeder dump delivers reg 05 (system status) for `abcde`:
@@ -234,12 +259,10 @@ async fn two_clients_both_receive_snapshot() {
     let mut a = connect_ws(addr).await;
     let mut b = connect_ws(addr).await;
 
-    let snap_a = recv_json(&mut a).await;
-    assert_eq!(snap_a["type"], "snapshot");
+    let snap_a = wait_for_type(&mut a, "snapshot").await;
     assert!(snap_a["units"]["07:abcde"].is_object());
 
-    let snap_b = recv_json(&mut b).await;
-    assert_eq!(snap_b["type"], "snapshot");
+    let snap_b = wait_for_type(&mut b, "snapshot").await;
     assert!(snap_b["units"]["07:abcde"].is_object());
 
     let _ = a.close(None).await;
@@ -285,7 +308,7 @@ async fn event_fanout_to_all_clients() {
 async fn batch_ack_two_writes() {
     let handle = spawn_daemon().await;
     let mut ws = connect_ws(handle.local_addr()).await;
-    let _ = recv_json(&mut ws).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
 
     ws.send(Message::Text(reg05_write("req-b1").to_string().into()))
         .await
@@ -329,8 +352,8 @@ async fn disconnect_isolation() {
     let addr = handle.local_addr();
     let mut a = connect_ws(addr).await;
     let mut b = connect_ws(addr).await;
-    let _ = recv_json(&mut a).await;
-    let _ = recv_json(&mut b).await;
+    let _ = wait_for_type(&mut a, "snapshot").await;
+    let _ = wait_for_type(&mut b, "snapshot").await;
 
     let _ = a.close(None).await;
     // Drain until the server observes A's close / stream ends.
@@ -357,7 +380,7 @@ async fn disconnect_isolation() {
 async fn mailbox_update_and_resync_reach_engine() {
     let handle = spawn_daemon().await;
     let mut ws = connect_ws(handle.local_addr()).await;
-    let _ = recv_json(&mut ws).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
 
     let update = reg05_write("req-101");
     ws.send(Message::Text(update.to_string().into()))
@@ -418,7 +441,7 @@ fn mock_backend_does_not_open_usb_accessory() {
 async fn write_zone_bearing_register_stamps_wire_zone() {
     let handle = spawn_daemon().await;
     let mut ws = connect_ws(handle.local_addr()).await;
-    let _ = recv_json(&mut ws).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
 
     let update = json!({
         "type": "write",
@@ -477,7 +500,7 @@ async fn write_zone_bearing_register_stamps_wire_zone() {
 async fn write_non_zone_register_ignores_zone() {
     let handle = spawn_daemon().await;
     let mut ws = connect_ws(handle.local_addr()).await;
-    let _ = recv_json(&mut ws).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
 
     let update = json!({
         "type": "write",
@@ -526,5 +549,182 @@ async fn write_non_zone_register_ignores_zone() {
     .expect("reg-05 write not observed on spy");
 
     let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-8: the first frame every client receives is a `status` frame with the
+/// current session state (connect-time health), before any snapshot. The
+/// state is whatever the watch currently holds — `negotiating` when the
+/// client joins during negotiation, `synced` if the initial dump already
+/// landed (both are valid wire values).
+#[tokio::test]
+async fn status_first_message_on_connect() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], "status");
+    assert!(
+        matches!(
+            msg["state"].as_str(),
+            Some("negotiating" | "synced" | "resyncing" | "link_down")
+        ),
+        "unexpected status state: {msg}"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-8: a client connected during negotiation observes `negotiating`, then
+/// `synced` once the initial dump snapshot lands. `synced` is mandatory; a
+/// `negotiating` frame is expected unless the dump already completed before
+/// the connection (then the connect-time status is legitimately `synced`
+/// and no `negotiating` transition is observable on that session).
+#[tokio::test]
+async fn status_negotiating_then_synced() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+
+    let mut saw_negotiating = false;
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before synced status");
+            if msg["type"] != "status" {
+                continue;
+            }
+            match msg["state"].as_str() {
+                Some("negotiating") => saw_negotiating = true,
+                Some("synced") => return,
+                Some(other) => panic!("unexpected status state: {other}: {msg}"),
+                None => panic!("status without state: {msg}"),
+            }
+        }
+    })
+    .await
+    .expect("synced status timeout");
+
+    if !saw_negotiating {
+        // Join-after-sync: the connect-time status was already `synced` —
+        // the snapshot must still be delivered to reach bridge mode.
+        let _ = wait_for_type(&mut ws, "snapshot").await;
+    }
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-8: a `resync` command re-enters the dump path: `resyncing` on command
+/// apply, then `synced` once the fresh snapshot lands.
+#[tokio::test]
+async fn status_resync_emits_resyncing_then_synced() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    // Bridge mode (status frames only reach sessions past the snapshot wait).
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let resync = json!({
+        "type": "command",
+        "msg_id": "req-resync",
+        "action": "resync"
+    });
+    ws.send(Message::Text(resync.to_string().into()))
+        .await
+        .unwrap();
+
+    let mut saw_resyncing = false;
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before resync statuses");
+            if msg["type"] != "status" {
+                continue;
+            }
+            match msg["state"].as_str() {
+                Some("resyncing") => saw_resyncing = true,
+                Some("synced") if saw_resyncing => return,
+                // Pre-resync `synced` / any other frame: keep waiting.
+                Some(_) => {}
+                None => panic!("status without state: {msg}"),
+            }
+        }
+    })
+    .await
+    .expect("resyncing → synced statuses timeout");
+    assert!(saw_resyncing);
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-8: forcing the mock link closed drives the engine's
+/// `SessionState(LinkDown)` → `LinkError` path; clients receive a
+/// `link_down` status whose `detail` carries the link error string
+/// (the `SessionState` broadcast carries `detail: None` first).
+#[tokio::test]
+async fn status_link_down_on_forced_link_close() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, ctrl) = App::spawn_mock_ctrl(bind, true)
+        .await
+        .expect("spawn mock with ctrl");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    // Bridge mode: the fan-out only reaches sessions past the snapshot wait.
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ctrl.close().await;
+
+    let status = timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before link_down status");
+            if msg["type"] == "status" && msg["state"] == "link_down" && msg["detail"].is_string() {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("link_down status with detail timeout");
+    assert_eq!(status["detail"], "link closed");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-8: a client connecting after the mailbox is in sync immediately receives
+/// a `synced` status on connect — no waiting for the next transition.
+#[tokio::test]
+async fn status_late_client_receives_current_synced() {
+    let handle = spawn_daemon().await;
+    let addr = handle.local_addr();
+    let mut a = connect_ws(addr).await;
+    // Wait until A has observed the `synced` transition (the status watch
+    // now holds Synced, so B's connect-time read is deterministic).
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(&mut a)
+                .await
+                .expect("closed before synced status");
+            if msg["type"] == "status" && msg["state"] == "synced" {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("synced status timeout");
+
+    let mut b = connect_ws(addr).await;
+    let first = recv_json(&mut b).await;
+    assert_eq!(first["type"], "status");
+    assert_eq!(
+        first["state"], "synced",
+        "late client connect-time status: {first}"
+    );
+
+    let _ = a.close(None).await;
+    let _ = b.close(None).await;
     handle.shutdown().await.expect("shutdown");
 }
