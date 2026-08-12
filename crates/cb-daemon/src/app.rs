@@ -366,6 +366,12 @@ async fn fanout_events(
                 warn!(%msg, "protocol warn");
                 let _ = broadcast_tx.send(WsEvent::Engine(ev));
             }
+            EngineEvent::RegisterRead { .. } => {
+                // Correlated by the WS bridge per session (read_result or
+                // error ack); every session with a pending read on the key
+                // gets its own reply from this broadcast.
+                let _ = broadcast_tx.send(WsEvent::Engine(ev));
+            }
             EngineEvent::LinkError(msg) => {
                 warn!(%msg, "link error");
                 // LinkDown carries the link error string (D-8). The engine
