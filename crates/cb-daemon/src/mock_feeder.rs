@@ -105,8 +105,29 @@ const fn sample_record_08() -> CanRecord {
     }
 }
 
+/// Unknown-register (16) record carried only by the flush full-set reply, so
+/// reads of an unknown register resolve to a raw-hex `read_result` (D-5).
+const fn sample_record_16() -> CanRecord {
+    CanRecord {
+        unit_type: UnitType::AIRCON,
+        dest: Dest::Tablet,
+        unit_id: FEEDER_UNIT_ID,
+        reg: RegId::new(0x16),
+        data: [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03],
+    }
+}
+
 fn get_can_with_sample() -> Vec<u8> {
     get_can_from_records(&[sample_record(), sample_record_08()])
+}
+
+/// A reg-06 `ControlBox` flush: `ControlBox`-destined record with register `0x06`
+/// and all-zero data. The engine queues these to pull a unit's full register
+/// set (the read verb's unit-scoped flush and the missing-reg-05 recovery);
+/// real CBs answer a flush with the full set, so the mock replies likewise.
+/// JZ18 reg-07 replies and regular writes never match (reg `0x06` only).
+fn is_reg06_flush(record: &CanRecord) -> bool {
+    record.dest == Dest::ControlBox && record.reg == RegId::new(0x06) && record.data == [0; 7]
 }
 
 /// Parse the records carried by the first `setCAN …` frame in `written`.
@@ -237,7 +258,25 @@ async fn reply_to_poll(
         // reports the updated registers back in its next getCAN
         // (aaservice parity); queue the echo so RegistersChanged fan-out
         // events reach WebSocket sessions after the write's ack.
-        pending_echo.extend(records);
+        //
+        // A reg-06 ControlBox flush flips the CB into full-set reply mode:
+        // the getCAN carries the whole sample register set plus every flush
+        // record from the batch (mirrors real CB flush behavior and lets
+        // read-verb pending reads resolve against reg 05). The full-set
+        // reply wins over write echoes for that batch; all flush records
+        // found are included, in batch order.
+        let flush_records: Vec<CanRecord> = records
+            .iter()
+            .filter(|record| is_reg06_flush(record))
+            .cloned()
+            .collect();
+        if flush_records.is_empty() {
+            pending_echo.extend(records);
+        } else {
+            let mut reply = vec![sample_record(), sample_record_08(), sample_record_16()];
+            reply.extend(flush_records);
+            push_frame(mock, notify, &get_can_from_records(&reply)).await;
+        }
     }
 }
 
@@ -300,6 +339,133 @@ mod tests {
     use aa_engine::{CbEngine, EngineCmd, EngineEvent};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, timeout};
+
+    fn flush_record(unit_type: UnitType) -> CanRecord {
+        CanRecord {
+            unit_type,
+            dest: Dest::ControlBox,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        }
+    }
+
+    fn set_can_payload(records: &[CanRecord]) -> Vec<u8> {
+        let mut body = b"setCAN ".to_vec();
+        for rec in records {
+            body.extend_from_slice(rec.to_wire().as_bytes());
+            body.push(b' ');
+        }
+        body.pop();
+        body
+    }
+
+    /// One polled `written` batch exactly as `feeder_steady_loop` sees it:
+    /// full encoded frames on the wire.
+    fn written_batch(records: &[CanRecord]) -> Vec<u8> {
+        encoded(&set_can_payload(records))
+    }
+
+    /// Drain the frame `reply_to_poll` pushed into the mock's inbound.
+    async fn take_inbound_payload(mock: &Arc<Mutex<MockLink>>) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let mut g = mock.lock().await;
+        let n = g.read(&mut buf).await.expect("inbound read");
+        drop(g);
+        FrameScanner::new()
+            .push(&buf[..n])
+            .expect("frame scan")
+            .into_iter()
+            .next()
+            .map(|frame| frame.payload)
+            .expect("reply frame")
+    }
+
+    async fn parse_reply_records(mock: &Arc<Mutex<MockLink>>) -> Vec<CanRecord> {
+        let payload = take_inbound_payload(mock).await;
+        let body = payload.strip_prefix(b"getCAN 1 ").expect("getCAN reply");
+        CanRecord::parse_many(std::str::from_utf8(body).expect("utf8")).expect("records")
+    }
+
+    #[tokio::test]
+    async fn flush_set_can_replies_with_full_sample_set() {
+        let (_, mock, notify) = SharedMockLink::new();
+        let aircon_flush = flush_record(UnitType::AIRCON);
+        let e08_flush = flush_record(UnitType::new(0x08));
+        let write = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        };
+        let mut pending_echo = Vec::new();
+
+        // Batch with two flush records + a regular write: the full-set reply
+        // wins, carrying the sample set and every flush record in batch order.
+        reply_to_poll(
+            &mock,
+            &notify,
+            written_batch(&[aircon_flush.clone(), e08_flush.clone(), write]),
+            &mut pending_echo,
+        )
+        .await;
+
+        assert_eq!(
+            parse_reply_records(&mock).await,
+            vec![
+                sample_record(),
+                sample_record_08(),
+                sample_record_16(),
+                aircon_flush,
+                e08_flush
+            ],
+            "flush batch must reply with the full sample set plus the flush records"
+        );
+        assert!(pending_echo.is_empty(), "flush batch must not defer echoes");
+    }
+
+    #[tokio::test]
+    async fn non_flush_set_can_keeps_echo_behavior() {
+        let (_, mock, notify) = SharedMockLink::new();
+        let write = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        };
+        let jz18 = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::ControlBox,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x07),
+            data: [0; 7],
+        };
+        let mut pending_echo = Vec::new();
+
+        reply_to_poll(
+            &mock,
+            &notify,
+            written_batch(&[write.clone(), jz18.clone()]),
+            &mut pending_echo,
+        )
+        .await;
+
+        assert_eq!(
+            pending_echo,
+            vec![write, jz18],
+            "writes and JZ18 reg-07 replies must still echo"
+        );
+        let mut buf = vec![0u8; 64];
+        let n = mock
+            .lock()
+            .await
+            .read(&mut buf)
+            .await
+            .expect("inbound read");
+        assert_eq!(n, 0, "non-flush batch must not push an immediate reply");
+    }
 
     #[tokio::test]
     async fn feeder_task_emits_snapshot() {

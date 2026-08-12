@@ -477,6 +477,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mocklink_read_register_resolves_on_flush_get_can() {
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        negotiate_through_can2(&mock, &notify).await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Negotiated { .. })).await;
+
+        dump_via_two_phase(&mock, &notify).await;
+        let rec = sample_record();
+        push_frame(&mock, &notify, &get_can_body(std::slice::from_ref(&rec))).await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
+
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &encoded(ACK_CAN)).await;
+
+        // The reset-response getCAN announced reg 06, so JZ18 precedes the poll.
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        let jz18 =
+            crate::wire::build_jz18(UnitType::new(0x07), UnitId::try_new(0x0_ABCDE).unwrap());
+        let expected_jz18 = encoded(&crate::wire::build_set_can(std::slice::from_ref(&jz18)));
+        wait_written_contains(&mock, &expected_jz18).await;
+
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &encoded(EMPTY_SET_CAN)).await;
+
+        // Queue a read of reg 05 on the announced unit.
+        cmd_tx
+            .send(EngineCmd::ReadRegister {
+                unit_type: UnitType::new(0x07),
+                unit_id: UnitId::try_new(0x0_ABCDE).unwrap(),
+                reg: RegId::new(0x05),
+                zone: None,
+            })
+            .await
+            .unwrap();
+
+        // Next ping TXs the unit-scoped reg-06 flush (same record shape as the
+        // write-path test's flush).
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        let flush = CanRecord {
+            unit_type: UnitType::new(0x07),
+            dest: Dest::ControlBox,
+            unit_id: UnitId::try_new(0x0_ABCDE).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        let expected_flush = encoded(&crate::wire::build_set_can(std::slice::from_ref(&flush)));
+        wait_written_contains(&mock, &expected_flush).await;
+
+        // The flush's getCAN carries a fresh reg-05 payload → RegisterRead.
+        let mut fresh = rec.clone();
+        fresh.data = [0x02, 0x02, 0x04, 0x31, 0x00, 0x02, 0x00];
+        push_frame(&mock, &notify, &get_can_body(&[fresh.clone()])).await;
+        let read = recv_event(&mut ev_rx, |e| {
+            matches!(e, EngineEvent::RegisterRead { .. })
+        })
+        .await;
+        match read {
+            EngineEvent::RegisterRead {
+                unit_type,
+                unit_id,
+                reg,
+                zone,
+                data: Some(data),
+            } => {
+                assert_eq!(unit_type, fresh.unit_type);
+                assert_eq!(unit_id, fresh.unit_id);
+                assert_eq!(reg, fresh.reg);
+                assert_eq!(zone, None);
+                assert_eq!(data, fresh.data);
+            }
+            other => panic!("expected resolved RegisterRead, got {other:?}"),
+        }
+
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &encoded(ACK_CAN)).await;
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    #[tokio::test]
     async fn mocklink_resync_emits_fresh_snapshot() {
         let (link, mock, notify) = SharedMockLink::new();
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
