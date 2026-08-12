@@ -8,7 +8,7 @@
 //! Server → client examples:
 //!
 //! ```json
-//! {"type":"snapshot","units":[{"unit_type":"07","unit_id":"11111","registers":{}}]}
+//! {"type":"snapshot","units":{"07:11111":{}}}
 //! ```
 //!
 //! ```json
@@ -30,12 +30,12 @@ pub mod dto;
 pub mod error;
 pub mod message;
 
-pub use convert::{decode_payload, encode_payload};
+pub use convert::{decode_payload, encode_payload, event_body, snapshot_units};
 pub use dto::{
     AckStatus, ActionEnum, ActivationStatus, FanEnum, FirmwareDto, InfoByteDto, ModeEnum,
     PowerEnum, RfDeviceCalibrationDto, RfDevicePairingDto, SensorPairingDto, SensorPairingWriteDto,
     SensorTypeEnum, StatusState, SystemErrorDto, SystemStatusDto, UnitActivationDto,
-    UnitAnnouncementDto, UnitSnapshot, UnitTypeEnum, ZoneConfigDto, ZoneLimitsDto, ZoneStateDto,
+    UnitAnnouncementDto, UnitTypeEnum, ZoneConfigDto, ZoneLimitsDto, ZoneStateDto,
 };
 pub use error::EncodeError;
 pub use message::{ClientMessage, ServerMessage};

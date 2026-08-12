@@ -291,8 +291,12 @@ impl Session {
                     return Vec::new();
                 }
                 let mut events = Vec::new();
-                if let Some(status) = self.pending_system.take() {
-                    let unit = self.primary_unit_id();
+                // Reg-05 synthesis is AIRCON-scoped: skip on banks without an
+                // AIRCON unit rather than applying a 07-typed record to the
+                // cross-type fallback id (phantom unit on 08-only banks).
+                if let Some(status) = self.pending_system.take()
+                    && let Some(unit) = self.aircon_primary_unit_id()
+                {
                     let record = system_status_record(unit, status);
                     self.bank.apply(&record);
                     events.push(EngineEvent::RegistersChanged {
@@ -305,13 +309,16 @@ impl Session {
                 self.ack_armed = true;
                 self.can_in_use = false;
                 // Capture CB dump hex *before* synthesizing reg 05 into the bank:
-                // full bank for the primary unit (dirty-reset + 08-flush dumps and
-                // any steady-state deltas), excluding a synthesized reg 05 that
-                // never came from the bus. MyAir5 rawCan must match USB; typed
-                // system_status still comes from the bank slot via mailbox DTOs.
-                let unit = self.primary_unit_id();
-                let mut bank_records: Vec<CanRecord> =
-                    self.bank.records_for_unit(UnitType::AIRCON, unit);
+                // full bank across all unit types (dirty-reset + 08-flush dumps
+                // and any steady-state deltas), excluding a synthesized reg 05
+                // that never came from the bus (synthesis is AIRCON-primary only,
+                // so retaining only real reg-05s stays safe). MyAir5 rawCan must
+                // match USB; typed system_status still comes from the bank slot
+                // via mailbox DTOs.
+                let mut bank_records: Vec<CanRecord> = Vec::new();
+                for unit_type in self.bank.unit_types() {
+                    bank_records.extend(self.bank.records_for_any_unit(unit_type));
+                }
                 if !self.system_status_real {
                     bank_records.retain(|r| r.reg != RegId::new(0x05));
                 }
@@ -342,7 +349,12 @@ impl Session {
         }
         if let Some(status) = parse_system_data_xml_status(payload) {
             self.can_in_use = false;
-            let unit = self.primary_unit_id();
+            // Reg-05 synthesis is AIRCON-scoped: skip on banks without an
+            // AIRCON unit rather than applying a 07-typed record to the
+            // cross-type fallback id (phantom unit on 08-only banks).
+            let Some(unit) = self.aircon_primary_unit_id() else {
+                return Vec::new();
+            };
             let record = system_status_record(unit, status);
             self.bank.apply(&record);
             return vec![EngineEvent::RegistersChanged {
@@ -381,15 +393,25 @@ impl Session {
         }
     }
 
-    fn primary_unit_id(&self) -> UnitId {
-        self.bank.preferred_unit_id(UnitType::AIRCON, None)
+    /// Primary AIRCON unit for reg-05 synthesis/poll machinery.
+    ///
+    /// Reg-05 synthesis and getSystemData polling are AIRCON-scoped by design:
+    /// they must never run against a cross-type id (an 08-only bank would
+    /// otherwise get a phantom AIRCON-typed record addressed to an 08 id).
+    fn aircon_primary_unit_id(&self) -> Option<UnitId> {
+        if self.bank.unit_ids(UnitType::AIRCON).is_empty() {
+            return None;
+        }
+        Some(self.bank.preferred_unit_id(UnitType::AIRCON, None))
     }
 
     fn needs_system_status_poll(&self) -> bool {
         if self.pending_system.is_some() {
             return false;
         }
-        let unit = self.primary_unit_id();
+        let Some(unit) = self.aircon_primary_unit_id() else {
+            return false;
+        };
         self.bank
             .get(UnitType::AIRCON, unit, RegId::new(0x05))
             .is_none()
@@ -397,10 +419,9 @@ impl Session {
 
     /// If the zero-uid flush dump omitted reg 05, queue one unit-scoped flush.
     fn maybe_queue_unit_flush_for_missing_system_status(&mut self) {
-        let unit = self.primary_unit_id();
-        if unit == UnitId::ZERO {
+        let Some(unit) = self.aircon_primary_unit_id() else {
             return;
-        }
+        };
         if self
             .bank
             .get(UnitType::AIRCON, unit, RegId::new(0x05))
@@ -422,10 +443,9 @@ impl Session {
     /// Without this, mailbox snapshots have zones but no `system_status`, so aaservice
     /// never emits `getSystemData` and `MyAir5` `:2025` keeps `aircons: {}`.
     fn maybe_synthesize_system_status_from_zones(&mut self) {
-        let unit = self.primary_unit_id();
-        if unit == UnitId::ZERO {
+        let Some(unit) = self.aircon_primary_unit_id() else {
             return;
-        }
+        };
         if self
             .bank
             .get(UnitType::AIRCON, unit, RegId::new(0x05))
@@ -699,6 +719,103 @@ mod tests {
         );
         assert!(recs.iter().any(|r| &r[9..11] == "03"));
         assert!(recs.iter().any(|r| &r[9..11] == "06"));
+    }
+
+    #[test]
+    fn reg05_machinery_skipped_on_08_only_bank() {
+        // F-1: the reg-05 machinery is AIRCON-scoped. On an 08-only bank no
+        // AIRCON-typed record may be synthesized/queued for the 08 id (phantom
+        // 07 unit, setCAN addressed as type 07 to an 08 unit).
+        let mut s = Session::new();
+        let rf = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_0ABCD).unwrap(),
+            reg: RegId::new(0x03),
+            data: [0x01, 0xe4, 0x01, 0x2c, 0x14, 0x05, 0x00],
+        };
+        s.bank.apply(&rf);
+
+        s.maybe_synthesize_system_status_from_zones();
+        assert!(
+            s.bank
+                .get(UnitType::AIRCON, rf.unit_id, RegId::new(0x05))
+                .is_none(),
+            "no AIRCON-typed reg 05 may be synthesized for an 08 id"
+        );
+        assert!(
+            !s.bank.has_unit(UnitType::AIRCON, rf.unit_id),
+            "no phantom AIRCON unit may appear"
+        );
+        assert!(
+            !s.needs_system_status_poll(),
+            "no getSystemData poll on an 08-only bank"
+        );
+        s.maybe_queue_unit_flush_for_missing_system_status();
+        assert!(
+            s.write_queue.is_empty(),
+            "no AIRCON-typed setCAN may be queued for an 08 id"
+        );
+    }
+
+    #[test]
+    fn steady_system_xml_skipped_on_08_only_bank() {
+        // F-1: steady-state getSystemData XML must not synthesize an
+        // AIRCON-typed reg 05 for the cross-type fallback id on an 08-only
+        // bank (phantom 07 unit).
+        let mut s = Session::new();
+        s.state = State::Steady;
+        let rf = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_0ABCD).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        s.bank.apply(&rf);
+        let ev = s.on_frame(SAMPLE_SYSTEM_XML);
+        assert!(ev.is_empty(), "no reg-05 event on an 08-only bank: {ev:?}");
+        assert!(
+            s.bank
+                .get(UnitType::AIRCON, rf.unit_id, RegId::new(0x05))
+                .is_none(),
+            "no AIRCON-typed reg 05 may be synthesized for an 08 id"
+        );
+        assert!(
+            s.bank.unit_ids(UnitType::AIRCON).is_empty(),
+            "no phantom AIRCON unit may appear"
+        );
+    }
+
+    #[test]
+    fn snapshot_can_records_include_non_aircon_unit_records() {
+        // D-3: rawCan must surface the 08 flush-dump records, not just AIRCON.
+        let mut s = Session::new();
+        advance_to_dump(&mut s);
+        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
+        let aircon = live_unit_reg06();
+        let rf = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Unknown(0x03),
+            unit_id: UnitId::try_new(0x0_0F0F0).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        let ev = s.on_frame(&get_can_payload(&[aircon, rf]));
+        let Some(EngineEvent::Snapshot {
+            can_records: Some(recs),
+            ..
+        }) = ev
+            .into_iter()
+            .find(|e| matches!(e, EngineEvent::Snapshot { .. }))
+        else {
+            panic!("expected Snapshot with can_records");
+        };
+        assert!(
+            recs.iter().any(|r| &r[0..2] == "08"),
+            "can_records must include the 08 record: {recs:?}"
+        );
+        assert!(recs.iter().any(|r| &r[0..2] == "07"));
     }
 
     #[test]

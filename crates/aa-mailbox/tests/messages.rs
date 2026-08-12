@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 
 use aa_mailbox::{
-    AckStatus, ClientMessage, EncodeError, ServerMessage, StatusState, UnitSnapshot,
-    decode_payload, encode_payload,
+    AckStatus, ClientMessage, EncodeError, ServerMessage, StatusState, decode_payload,
+    encode_payload, event_body, snapshot_units,
 };
-use aa_registers::RegId;
+use aa_registers::{CanRecord, RegId, RegisterBank};
 use serde_json::{Value, json};
 
 fn assert_wire_round_trip(reg: RegId, payload: &Value, expected: [u8; 7]) {
@@ -632,16 +632,12 @@ fn golden_snapshot_message() {
         }),
     );
     let msg = ServerMessage::Snapshot {
-        units: vec![UnitSnapshot {
-            unit_type: "07".to_owned(),
-            unit_id: "11111".to_owned(),
-            registers,
-        }],
+        units: BTreeMap::from([("07:11111".to_owned(), registers)]),
     };
     let v = serde_json::to_value(&msg).unwrap();
     assert_eq!(v["type"], "snapshot");
     let expected: Value = serde_json::from_str(
-        r#"{"type":"snapshot","units":[{"unit_type":"07","unit_id":"11111","registers":{"01":{"header":32,"total_zones":3,"constant_zones":1,"constant_zone_ids":[1,0,0],"filter_clean_required":false}}}]}"#,
+        r#"{"type":"snapshot","units":{"07:11111":{"01":{"header":32,"total_zones":3,"constant_zones":1,"constant_zone_ids":[1,0,0],"filter_clean_required":false}}}}"#,
     )
     .unwrap();
     assert_eq!(v, expected);
@@ -667,16 +663,14 @@ fn golden_snapshot_nested_zones_and_raw_hex() {
         }),
     );
     registers.insert("16".to_owned(), json!("a1b2c3d4e5f607"));
-    let snap = UnitSnapshot {
-        unit_type: "07".to_owned(),
-        unit_id: "11111".to_owned(),
-        registers,
+    let msg = ServerMessage::Snapshot {
+        units: BTreeMap::from([("07:11111".to_owned(), registers)]),
     };
-    let v = serde_json::to_value(&snap).unwrap();
-    assert_eq!(v["registers"]["03"]["1"]["damper_pct"], 100);
-    assert_eq!(v["registers"]["16"], "a1b2c3d4e5f607");
-    let back: UnitSnapshot = serde_json::from_value(v).unwrap();
-    assert_eq!(back, snap);
+    let v = serde_json::to_value(&msg).unwrap();
+    assert_eq!(v["units"]["07:11111"]["03"]["1"]["damper_pct"], 100);
+    assert_eq!(v["units"]["07:11111"]["16"], "a1b2c3d4e5f607");
+    let back: ServerMessage = serde_json::from_value(v).unwrap();
+    assert_eq!(back, msg);
 }
 
 #[test]
@@ -927,4 +921,77 @@ fn read_with_zone_deserializes_zone() {
         panic!("expected read");
     };
     assert_eq!(*zone, Some(1));
+}
+
+// --- 6. Multi-unit snapshot projection (design D-3) ------------------------
+
+#[test]
+fn snapshot_units_covers_all_unit_types() {
+    let mut bank = RegisterBank::new();
+    bank.apply(&CanRecord::parse_one("0703111110501010330000100").unwrap());
+    bank.apply(&CanRecord::parse_one("0803111110501010330000100").unwrap());
+    bank.apply(&CanRecord::parse_one("0803abcde0601020300000000").unwrap());
+
+    let units = snapshot_units(&bank);
+    assert_eq!(
+        units.keys().collect::<Vec<_>>(),
+        vec!["07:11111", "08:11111", "08:abcde"]
+    );
+}
+
+#[test]
+fn snapshot_units_decodes_dtos_and_nested_zones() {
+    let mut bank = RegisterBank::new();
+    // Reg 05 (non-zone) and reg 03 zone 1 (zone-bearing) for the same unit.
+    bank.apply(&CanRecord::parse_one("0703111110501010330000100").unwrap());
+    bank.apply(&CanRecord::parse_one("0703111110301e40230170100").unwrap());
+
+    let units = snapshot_units(&bank);
+    let unit = &units["07:11111"];
+    assert_eq!(
+        unit["05"],
+        json!({
+            "power": "on",
+            "mode": "cool",
+            "fan": "high",
+            "target_temp_c": 24.0,
+            "myzone_id": 0,
+            "fresh_air": false,
+            "rf_sys_id": 0,
+        })
+    );
+    assert_eq!(
+        unit["03"]["1"],
+        json!({
+            "open": true,
+            "damper_pct": 100,
+            "sensor_type": "wired",
+            "target_temp_c": 24.0,
+            "measured_temp_c": 23.1,
+        })
+    );
+}
+
+#[test]
+fn event_body_zone_bearing_and_plain_records() {
+    // Zone-bearing reg 03: zone is taken from data[0].
+    let record = CanRecord::parse_one("0703111110301e40030000000").unwrap();
+    let (register, zone, payload) = event_body(&record);
+    assert_eq!(register, "03");
+    assert_eq!(zone, Some(1));
+    assert_eq!(payload["damper_pct"], 100);
+
+    // Non-zone reg 05: no zone, decoded DTO payload.
+    let record = CanRecord::parse_one("0703111110501010330000100").unwrap();
+    let (register, zone, payload) = event_body(&record);
+    assert_eq!(register, "05");
+    assert_eq!(zone, None);
+    assert_eq!(payload["power"], "on");
+
+    // Unknown register falls back to the raw 14-char hex string.
+    let record = CanRecord::parse_one("07031111116a1b2c3d4e5f607").unwrap();
+    let (register, zone, payload) = event_body(&record);
+    assert_eq!(register, "16");
+    assert_eq!(zone, None);
+    assert_eq!(payload, json!("a1b2c3d4e5f607"));
 }
