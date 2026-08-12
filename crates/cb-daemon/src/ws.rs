@@ -1,22 +1,21 @@
 //! Axum WebSocket bridge: single-session gate + JSON ↔ engine cmds/events.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
-    AckStatus, ClientMessage, ServerMessage, records_from_update_with_bank,
-    snapshot_from_bank_with_can_records, system_status_to_dto, zone_config_to_dto,
-    zone_dto_from_state,
+    AckStatus, ClientMessage, ServerMessage, UnitSnapshot, decode_payload, encode_payload,
 };
-use aa_registers::{DecodedRegister, RegisterBank, UnitId, UnitType};
+use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -27,12 +26,10 @@ pub(crate) const SINGLE_CLIENT_CLOSE_CODE: u16 = 4009;
 /// Close reason for the single-session gate.
 pub(crate) const SINGLE_CLIENT_CLOSE_REASON: &str = "Single client limit enforced";
 
-/// Held engine snapshot for late WebSocket clients (bank + CB dump hex).
+/// Held engine snapshot for late WebSocket clients (bank).
 #[derive(Debug, Clone)]
 pub(crate) struct HeldSnapshot {
     pub bank: RegisterBank,
-    /// CB dump `can_records` for `MyAir5` `rawCan` (excludes synthesized regs).
-    pub can_records: Option<Vec<String>>,
 }
 
 /// Shared state for the axum router.
@@ -59,6 +56,50 @@ fn resolve_unit_id(bank: &RegisterBank, hint: Option<UnitId>) -> UnitId {
         hint.unwrap_or(FEEDER_UNIT_ID)
     } else {
         id
+    }
+}
+
+/// Build the mailbox `Snapshot` for one (primary) unit from the held bank.
+///
+/// Non-zone registers decode to typed DTOs (or raw 14-char hex for unknown
+/// registers); zone-bearing registers (`03`/`04`) are nested zone → DTO maps.
+/// Registers with no bank slot are skipped.
+fn snapshot_message(bank: &RegisterBank, unit_type: UnitType, unit_id: UnitId) -> ServerMessage {
+    let mut registers = BTreeMap::new();
+    for record in bank.records_for_unit(unit_type, unit_id) {
+        if is_zone_bearing(record.reg) {
+            continue;
+        }
+        match decode_payload(record.reg, record.data) {
+            Ok(payload) => {
+                registers.insert(format!("{:02x}", record.reg.get()), payload);
+            }
+            Err(err) => debug!(%err, "snapshot: skipping undecodable register"),
+        }
+    }
+    for reg_id in [0x03, 0x04] {
+        let reg = RegId::new(reg_id);
+        let mut zones: BTreeMap<String, Value> = BTreeMap::new();
+        for zone in 1..=10u8 {
+            if let Some(data) = bank.get_zone(unit_type, unit_id, reg, zone)
+                && let Ok(payload) = decode_payload(reg, data)
+            {
+                zones.insert(zone.to_string(), payload);
+            }
+        }
+        if !zones.is_empty() {
+            registers.insert(
+                format!("{reg_id:02x}"),
+                Value::Object(zones.into_iter().collect()),
+            );
+        }
+    }
+    ServerMessage::Snapshot {
+        units: vec![UnitSnapshot {
+            unit_type: unit_type.to_string(),
+            unit_id: unit_id.to_string(),
+            registers,
+        }],
     }
 }
 
@@ -104,12 +145,7 @@ async fn run_session(mut socket: WebSocket, state: WsState) -> anyhow::Result<()
     let held = wait_for_snapshot(&mut socket, state.snapshot.clone()).await?;
     let unit_id = resolve_unit_id(&held.bank, state.unit_id_hint);
     info!(%unit_id, "mailbox snapshot unit_id");
-    let snap = snapshot_from_bank_with_can_records(
-        &held.bank,
-        UnitType::AIRCON,
-        unit_id,
-        held.can_records,
-    );
+    let snap = snapshot_message(&held.bank, UnitType::AIRCON, unit_id);
     send_json(&mut socket, &snap).await?;
     bridge_until_disconnect(&mut socket, &state).await
 }
@@ -152,7 +188,7 @@ async fn wait_for_snapshot(
     }
 }
 
-/// Per-session `mailbox_update` ack state: acks are deferred until the engine
+/// Per-session write ack state: acks are deferred until the engine
 /// confirms the write was transmitted ([`EngineEvent::WriteFlushed`]), so a
 /// success ack never lies when the bus is dead. FIFO: aaservice serializes
 /// outbound actions, so at most one write is in flight at a time.
@@ -267,25 +303,26 @@ async fn forward_engine_event(
 ) -> anyhow::Result<bool> {
     match ev {
         Ok(EngineEvent::RegistersChanged { records }) => {
-            // USB parity: forward non-empty steady getCANs as a rawCan frame
-            // (MyAir5 secure rawCan), plus the typed DTO events for the mapper.
-            if !records.is_empty() {
-                let mut payload = String::from("getCAN 1");
-                for record in &records {
-                    payload.push(' ');
-                    payload.push_str(&record.to_wire());
+            for record in records {
+                match decode_payload(record.reg, record.data) {
+                    Ok(payload) => {
+                        let event = ServerMessage::Event {
+                            unit_type: record.unit_type.to_string(),
+                            unit_id: record.unit_id.to_string(),
+                            register: format!("{:02x}", record.reg.get()),
+                            zone: is_zone_bearing(record.reg).then_some(record.data[0]),
+                            payload,
+                        };
+                        send_json(socket, &event).await?;
+                    }
+                    Err(err) => debug!(%err, "event: skipping undecodable register"),
                 }
-                send_json(socket, &ServerMessage::RawCan { payload }).await?;
-            }
-            for msg in mailbox_events_from_records(&records) {
-                send_json(socket, &msg).await?;
             }
             Ok(true)
         }
-        Ok(EngineEvent::Snapshot { bank, can_records }) => {
+        Ok(EngineEvent::Snapshot { bank, .. }) => {
             let unit_id = resolve_unit_id(&bank, state.unit_id_hint);
-            let snap =
-                snapshot_from_bank_with_can_records(&bank, UnitType::AIRCON, unit_id, can_records);
+            let snap = snapshot_message(&bank, UnitType::AIRCON, unit_id);
             send_json(socket, &snap).await?;
             Ok(true)
         }
@@ -293,11 +330,6 @@ async fn forward_engine_event(
             if let Some(msg_id) = pending.pop_front() {
                 send_ack(socket, &msg_id, AckStatus::Success, None).await?;
             }
-            Ok(true)
-        }
-        Ok(EngineEvent::DirectReply { payload }) => {
-            let text = String::from_utf8_lossy(&payload).into_owned();
-            send_json(socket, &ServerMessage::DirectReply { payload: text }).await?;
             Ok(true)
         }
         Ok(other) => {
@@ -320,21 +352,35 @@ async fn handle_client_text(
 ) -> anyhow::Result<()> {
     let parsed: Result<ClientMessage, _> = serde_json::from_str(text);
     match parsed {
-        Ok(ClientMessage::MailboxUpdate {
+        Ok(ClientMessage::Write {
             msg_id,
+            unit_type,
+            unit_id,
             register,
+            zone,
             payload,
         }) => {
-            handle_mailbox_update(socket, state, pending, &msg_id, &register, &payload).await?;
+            let req = WriteRequest {
+                msg_id,
+                unit_type,
+                unit_id,
+                register,
+                zone,
+                payload,
+            };
+            handle_write(socket, state, pending, req).await?;
         }
-        Ok(ClientMessage::WriteCan { msg_id, tokens }) => {
-            handle_write_can(socket, state, pending, &msg_id, &tokens).await?;
+        Ok(ClientMessage::Read { msg_id, .. }) => {
+            send_ack(
+                socket,
+                &msg_id,
+                AckStatus::Error,
+                Some("read not implemented yet".into()),
+            )
+            .await?;
         }
-        Ok(ClientMessage::Direct { msg_id, payload }) => {
-            handle_direct(socket, state, pending, &msg_id, &payload).await?;
-        }
-        Ok(ClientMessage::Command { msg_id, action }) => {
-            if action == "resync_mailbox" {
+        Ok(ClientMessage::Command { msg_id, action }) => match action.as_str() {
+            "resync" => {
                 let cmd = EngineCmd::ResyncMailbox;
                 record_spy(state, &cmd).await;
                 if let Err(err) = state.cmd_tx.send(cmd).await {
@@ -342,16 +388,26 @@ async fn handle_client_text(
                 } else {
                     send_ack(socket, &msg_id, AckStatus::Success, None).await?;
                 }
-            } else {
+            }
+            "flush_unit" => {
                 send_ack(
                     socket,
                     &msg_id,
                     AckStatus::Error,
-                    Some(format!("unknown action: {action}")),
+                    Some("flush_unit not implemented yet".into()),
                 )
                 .await?;
             }
-        }
+            other => {
+                send_ack(
+                    socket,
+                    &msg_id,
+                    AckStatus::Error,
+                    Some(format!("unknown action: {other}")),
+                )
+                .await?;
+            }
+        },
         Err(err) => {
             let msg = ServerMessage::Error {
                 message: "invalid client message".into(),
@@ -363,105 +419,98 @@ async fn handle_client_text(
     Ok(())
 }
 
-/// `mailbox_update`: sparse register write merged over the held bank.
-/// Ack is deferred until the engine confirms the frame was transmitted.
-async fn handle_mailbox_update(
+/// Decoded `write` fields for [`handle_write`].
+struct WriteRequest {
+    msg_id: String,
+    unit_type: Option<String>,
+    unit_id: Option<String>,
+    register: String,
+    /// Zone id for zone-bearing registers (`03`/`04`); part of the CAN address.
+    zone: Option<u8>,
+    payload: Value,
+}
+
+/// `write`: encode the register payload and queue it as a single register
+/// write. Ack is deferred until the engine confirms the frame was transmitted.
+async fn handle_write(
     socket: &mut WebSocket,
     state: &WsState,
     pending: &mut PendingAcks,
-    msg_id: &str,
-    register: &str,
-    payload: &serde_json::Value,
+    msg: WriteRequest,
 ) -> anyhow::Result<()> {
-    let unit_id = state.snapshot.borrow().as_ref().map_or_else(
+    let resolved_id = state.snapshot.borrow().as_ref().map_or_else(
         || state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID),
         |held| resolve_unit_id(&held.bank, state.unit_id_hint),
     );
-    let held_bank = state
-        .snapshot
-        .borrow()
-        .as_ref()
-        .map(|held| held.bank.clone())
-        .unwrap_or_default();
-    match records_from_update_with_bank(&held_bank, UnitType::AIRCON, unit_id, register, payload) {
-        Ok(records) => {
-            let cmd = EngineCmd::WriteRegisters(records);
-            record_spy(state, &cmd).await;
-            if let Err(err) = state.cmd_tx.send(cmd).await {
-                send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
-            } else {
-                pending.push(msg_id.to_owned());
-            }
-        }
+    let unit_type = match msg.unit_type.map(|s| UnitType::from_hex(&s)).transpose() {
+        Ok(Some(unit_type)) => unit_type,
+        Ok(None) => UnitType::AIRCON,
         Err(err) => {
-            send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
+            send_ack(
+                socket,
+                &msg.msg_id,
+                AckStatus::Error,
+                Some(format!("invalid unit_type: {err:?}")),
+            )
+            .await?;
+            return Ok(());
         }
-    }
-    Ok(())
-}
-
-/// `write_can`: raw 25-char CAN2 tokens forwarded as register writes
-/// (`MyAir5` `CAN_TO_CB` / `BROADCAST_CAN_TO_CB` parity).
-async fn handle_write_can(
-    socket: &mut WebSocket,
-    state: &WsState,
-    pending: &mut PendingAcks,
-    msg_id: &str,
-    tokens: &[String],
-) -> anyhow::Result<()> {
-    let mut records = Vec::with_capacity(tokens.len());
-    let mut first_err: Option<aa_registers::WireError> = None;
-    for token in tokens {
-        match aa_registers::CanRecord::parse_one(token) {
-            Ok(record) => records.push(record),
-            Err(err) => {
-                first_err.get_or_insert(err);
-            }
+    };
+    let unit_id = match msg.unit_id.map(|s| UnitId::from_hex(&s)).transpose() {
+        Ok(Some(unit_id)) => unit_id,
+        Ok(None) => resolved_id,
+        Err(err) => {
+            send_ack(
+                socket,
+                &msg.msg_id,
+                AckStatus::Error,
+                Some(format!("invalid unit_id: {err:?}")),
+            )
+            .await?;
+            return Ok(());
         }
-    }
-    if let Some(err) = first_err {
-        send_ack(
-            socket,
-            msg_id,
-            AckStatus::Error,
-            Some(format!("invalid CAN token: {err:?}")),
-        )
-        .await?;
-    } else if records.is_empty() {
-        send_ack(
-            socket,
-            msg_id,
-            AckStatus::Error,
-            Some("no CAN tokens".into()),
-        )
-        .await?;
-    } else {
-        let cmd = EngineCmd::WriteRegisters(records);
-        record_spy(state, &cmd).await;
-        if let Err(err) = state.cmd_tx.send(cmd).await {
-            send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
-        } else {
-            pending.push(msg_id.to_owned());
+    };
+    let reg = match RegId::from_hex(&msg.register) {
+        Ok(reg) => reg,
+        Err(err) => {
+            send_ack(
+                socket,
+                &msg.msg_id,
+                AckStatus::Error,
+                Some(format!("invalid register: {err:?}")),
+            )
+            .await?;
+            return Ok(());
         }
+    };
+    let mut data = match encode_payload(reg, &msg.payload) {
+        Ok(data) => data,
+        Err(err) => {
+            send_ack(socket, &msg.msg_id, AckStatus::Error, Some(err.to_string())).await?;
+            return Ok(());
+        }
+    };
+    // The zone id is part of the CAN address, not the payload: the codec stamps
+    // wire byte 0 as 0x00, so a zone-bearing write (regs 03/04) addressed by
+    // the client must be stamped here to reach the addressed zone.
+    if is_zone_bearing(reg)
+        && let Some(zone) = msg.zone
+    {
+        data[0] = zone;
     }
-    Ok(())
-}
-
-/// `direct`: one-shot raw request (poll tag / `setAllZoneSensorData?`); the CB
-/// reply is delivered as [`ServerMessage::DirectReply`].
-async fn handle_direct(
-    socket: &mut WebSocket,
-    state: &WsState,
-    pending: &mut PendingAcks,
-    msg_id: &str,
-    payload: &str,
-) -> anyhow::Result<()> {
-    let cmd = EngineCmd::WriteDirect(payload.as_bytes().to_vec());
+    let record = CanRecord {
+        unit_type,
+        dest: Dest::ControlBox,
+        unit_id,
+        reg,
+        data,
+    };
+    let cmd = EngineCmd::WriteRegisters(vec![record]);
     record_spy(state, &cmd).await;
     if let Err(err) = state.cmd_tx.send(cmd).await {
-        send_ack(socket, msg_id, AckStatus::Error, Some(err.to_string())).await?;
+        send_ack(socket, &msg.msg_id, AckStatus::Error, Some(err.to_string())).await?;
     } else {
-        pending.push(msg_id.to_owned());
+        pending.push(msg.msg_id.clone());
     }
     Ok(())
 }
@@ -494,49 +543,6 @@ async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> anyhow::Resul
     let text = serde_json::to_string(msg)?;
     socket.send(Message::Text(text.into())).await?;
     Ok(())
-}
-
-/// Daemon-local map of changed registers → `mailbox_event` messages.
-fn mailbox_events_from_records(records: &[aa_registers::CanRecord]) -> Vec<ServerMessage> {
-    let mut out = Vec::with_capacity(records.len());
-    for record in records {
-        match record.decode() {
-            DecodedRegister::SystemStatus(status) => {
-                if let Ok(payload) = serde_json::to_value(system_status_to_dto(&status)) {
-                    out.push(ServerMessage::MailboxEvent {
-                        register: "system_status".into(),
-                        payload,
-                    });
-                }
-            }
-            DecodedRegister::ZoneState(state) => {
-                if let Ok(mut payload) = serde_json::to_value(zone_dto_from_state(&state)) {
-                    if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("zone_id".into(), json!(state.zone.to_string()));
-                    }
-                    out.push(ServerMessage::MailboxEvent {
-                        register: "zone_state".into(),
-                        payload,
-                    });
-                }
-            }
-            DecodedRegister::ZoneConfig(cfg) => {
-                if let Ok(payload) = serde_json::to_value(zone_config_to_dto(&cfg)) {
-                    out.push(ServerMessage::MailboxEvent {
-                        register: "zone_config".into(),
-                        payload,
-                    });
-                }
-            }
-            other => {
-                out.push(ServerMessage::MailboxEvent {
-                    register: format!("{:02x}", other.reg_id().get()),
-                    payload: json!({ "opaque": true }),
-                });
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]

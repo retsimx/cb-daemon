@@ -1,4 +1,4 @@
-//! Register JSON DTOs aligned with aaservice northbound fixtures.
+//! Typed register DTOs and wire-string enums for the register catalog.
 
 use std::collections::BTreeMap;
 
@@ -14,66 +14,309 @@ pub enum AckStatus {
     Error,
 }
 
-/// Reg `05` system status as JSON.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SystemStatusDto {
-    /// Power: `off` | `on` (or `unknown_XX` on read).
-    pub power: String,
-    /// Mode: `cool`, `heat`, `vent`, `auto`, `dry`, `my_auto`, …
-    pub mode: String,
-    /// Fan: `off`, `low`, `medium`, `high`, `auto`, `auto_aa`, …
-    pub fan: String,
-    /// Target temperature in °C.
-    pub target_temp_c: f64,
-    /// `MyZone` id (`0` = disabled / default).
-    pub myzone_id: u8,
-    /// Fresh-air on/off (wire `On` → `true`, anything else → `false` on read).
-    pub fresh_air: bool,
+/// HVAC operating mode (reg `05`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeEnum {
+    /// Cool.
+    Cool,
+    /// Heat.
+    Heat,
+    /// Vent.
+    Vent,
+    /// Auto.
+    Auto,
+    /// Dry.
+    Dry,
+    /// `MyAuto` — `myauto` on the wire (`snake_case` would give `my_auto`).
+    #[serde(rename = "myauto")]
+    MyAuto,
 }
 
-/// Reg `01` zone configuration as JSON (opaque wire header omitted).
+/// Fan speed (reg `05`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FanEnum {
+    /// Off.
+    Off,
+    /// Low.
+    Low,
+    /// Medium.
+    Medium,
+    /// High.
+    High,
+    /// Auto.
+    Auto,
+    /// `AutoAA`.
+    AutoAa,
+}
+
+/// Power / system on-off (reg `05`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerEnum {
+    /// On.
+    On,
+    /// Off.
+    Off,
+}
+
+/// Zone temperature sensor type (reg `03`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensorTypeEnum {
+    /// No sensor.
+    NoSensor,
+    /// RF sensor.
+    Rf,
+    /// Wired sensor.
+    Wired,
+    /// RF2CAN booster — `rf2can_booster` on the wire (`snake_case` would give
+    /// `rf2_can_booster`).
+    #[serde(rename = "rf2can_booster")]
+    Rf2CanBooster,
+    /// `RF_X`.
+    RfX,
+}
+
+/// Unit activation status (reg `02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationStatus {
+    /// No activation code present.
+    NoCode,
+    /// Activation code enabled.
+    CodeEnabled,
+    /// Activation code expired.
+    Expired,
+}
+
+/// Unit type (reg `02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitTypeEnum {
+    /// Daikin.
+    Daikin,
+    /// Panasonic.
+    Panasonic,
+    /// Fujitsu.
+    Fujitsu,
+    /// Samsung DVM.
+    SamsungDvm,
+}
+
+/// Activation-code action (reg `09`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionEnum {
+    /// Set a new activation code.
+    SetCode,
+    /// Unlock the unit.
+    Unlock,
+}
+
+/// Broker link state (`ServerMessage::Status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusState {
+    /// Negotiating with the unit.
+    Negotiating,
+    /// Link established, mailbox in sync.
+    Synced,
+    /// Resynchronising the mailbox.
+    Resyncing,
+    /// Link down.
+    LinkDown,
+}
+
+/// Reg `01` zone configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ZoneConfigDto {
-    /// Number of zones (`num_zones` on the wire).
+    /// Opaque wire header byte.
+    pub header: u8,
+    /// Number of zones.
     pub total_zones: u8,
-    /// Number of constant zones (`num_constant` on the wire).
+    /// Number of constant zones.
     pub constant_zones: u8,
-    /// Filter-clean flag (`filter_clean` on the wire).
+    /// Constant zone ids (unused slots `0`).
+    pub constant_zone_ids: [u8; 3],
+    /// Filter-clean flag.
     pub filter_clean_required: bool,
 }
 
-/// Per-zone state as JSON (snapshot map value / event body fields).
+/// Reg `02` unit activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UnitActivationDto {
+    /// Unit type.
+    pub unit_type: UnitTypeEnum,
+    /// Activation status.
+    pub activation_status: ActivationStatus,
+    /// Dictionary firmware major.
+    pub dict_fw_major: u8,
+    /// Dictionary firmware minor.
+    pub dict_fw_minor: u8,
+}
+
+/// Reg `03` per-zone state (snapshot map value / event body fields).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ZoneDto {
+#[serde(rename_all = "snake_case")]
+pub struct ZoneStateDto {
     /// Zone damper open.
     pub open: bool,
     /// Damper percent 0–100.
     pub damper_pct: u8,
-    /// Sensor type string (`wired`, `rf`, `temp` alias on write, …).
-    pub sensor_type: String,
+    /// Sensor type.
+    pub sensor_type: SensorTypeEnum,
     /// Target temperature in °C.
     pub target_temp_c: f64,
     /// Measured temperature in °C.
     pub measured_temp_c: f64,
 }
 
-/// Body fields of a `mailbox_snapshot` message (without the `type` tag).
+/// Reg `04` per-zone limits and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ZoneLimitsDto {
+    /// Minimum damper percent.
+    pub min_damper: u8,
+    /// Maximum damper percent.
+    pub max_damper: u8,
+    /// Motion status.
+    pub motion_status: u8,
+    /// Motion configuration.
+    pub motion_config: u8,
+    /// Zone error code.
+    pub zone_error: u8,
+    /// RF signal strength.
+    pub rssi: u8,
+}
+
+/// Reg `05` system status.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotBody {
-    /// Lowercase hex unit id without `0x` (e.g. `abcde`).
+#[serde(rename_all = "snake_case")]
+pub struct SystemStatusDto {
+    /// Power state.
+    pub power: PowerEnum,
+    /// Operating mode.
+    pub mode: ModeEnum,
+    /// Fan speed.
+    pub fan: FanEnum,
+    /// Target temperature in °C.
+    pub target_temp_c: f64,
+    /// `MyZone` id (`0` = disabled / default).
+    pub myzone_id: u8,
+    /// Fresh-air on/off.
+    pub fresh_air: bool,
+    /// RF system id.
+    pub rf_sys_id: u8,
+}
+
+/// Reg `06` firmware versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FirmwareDto {
+    /// Firmware major version.
+    pub fw_major: u8,
+    /// Firmware minor version.
+    pub fw_minor: u8,
+    /// Control-board type.
+    pub cb_type: u8,
+    /// RF firmware major version.
+    pub rf_fw_major: u8,
+}
+
+/// Reg `08` system error code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SystemErrorDto {
+    /// ASCII error code (5 chars).
+    pub error_code: String,
+}
+
+/// Reg `09` activation-code write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ActivationCodeDto {
+    /// Action (`set_code` | `unlock`).
+    pub action: ActionEnum,
+    /// Unlock code (4 hex chars).
+    pub unlock_code: String,
+    /// Activation days.
+    pub activation_days: u8,
+}
+
+/// Reg `0a` unit announcement (empty payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitAnnouncementDto {}
+
+/// Reg `12` sensor pairing read shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SensorPairingDto {
+    /// Sensor uid (6 hex chars).
+    pub sensor_uid: String,
+    /// Pairing in progress.
+    pub pairing: bool,
+    /// Sensor revision.
+    pub sensor_rev: u8,
+}
+
+/// Reg `12` sensor pairing write shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SensorPairingWriteDto {
+    /// Sensor uid (6 hex chars).
+    pub sensor_uid: String,
+    /// Zone to pair the sensor to.
+    pub zone: u8,
+}
+
+/// Reg `13` info byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InfoByteDto {
+    /// Info byte.
+    pub info_byte: u8,
+}
+
+/// Reg `26` RF device pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RfDevicePairingDto {
+    /// Pairing control code.
+    pub pairing_control: u8,
+    /// RF device type.
+    pub rf_device_type: u8,
+    /// Zone channel.
+    pub zone_channel: u8,
+}
+
+/// Reg `27` RF device calibration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RfDeviceCalibrationDto {
+    /// Calibration control code.
+    pub calibration_control: u8,
+    /// Channel.
+    pub channel: u8,
+    /// Up/down position.
+    pub up_down_position: u8,
+}
+
+/// One unit's full register snapshot.
+///
+/// `registers` is keyed by 2-hex register id; zone-bearing registers (`03`/`04`)
+/// are nested zone → DTO maps; unknown registers are raw 14-char hex strings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)] // `serde_json::Value` is not `Eq`.
+#[serde(rename_all = "snake_case")]
+pub struct UnitSnapshot {
+    /// Unit type (2-hex lowercase).
+    pub unit_type: String,
+    /// Unit id (5-hex lowercase).
     pub unit_id: String,
-    /// System status when present in the bank.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_status: Option<SystemStatusDto>,
-    /// Zone config when present in the bank.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub zone_config: Option<ZoneConfigDto>,
-    /// Zones keyed by decimal zone id string (`"1"`…`"10"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub zones: Option<BTreeMap<String, ZoneDto>>,
-    /// Opaque 25-char hex CAN records for this unit (full bank dump).
-    ///
-    /// aaservice joins these into a `getCAN` frame for `MyAir5`'s `rawCan` path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub can_records: Option<Vec<String>>,
+    /// Register id → typed DTO (or nested zone map / raw hex).
+    pub registers: BTreeMap<String, serde_json::Value>,
 }

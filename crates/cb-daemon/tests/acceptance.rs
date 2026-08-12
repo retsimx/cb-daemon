@@ -67,9 +67,19 @@ async fn mock_backend_ws_receives_mailbox_snapshot() {
     let mut ws = connect_ws(handle.local_addr()).await;
 
     let msg = recv_json(&mut ws).await;
-    assert_eq!(msg["type"], "mailbox_snapshot");
-    assert_eq!(msg["unit_id"], "abcde");
-    assert!(msg.get("system_status").is_some());
+    assert_eq!(msg["type"], "snapshot");
+    assert_eq!(msg["units"][0]["unit_type"], "07");
+    assert_eq!(msg["units"][0]["unit_id"], "abcde");
+    // Mock feeder dump delivers reg 05 (system status) for `abcde`:
+    // [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00] → on/cool/high/24.0/off.
+    let reg05 = &msg["units"][0]["registers"]["05"];
+    assert!(reg05.is_object(), "reg 05 missing from snapshot: {msg}");
+    assert_eq!(reg05["power"], "on");
+    assert_eq!(reg05["mode"], "cool");
+    assert_eq!(reg05["fan"], "high");
+    assert_eq!(reg05["target_temp_c"], 24.0);
+    assert_eq!(reg05["fresh_air"], false);
+    assert_eq!(reg05["rf_sys_id"], 0);
 
     handle.shutdown().await.expect("shutdown");
 }
@@ -165,16 +175,17 @@ async fn mailbox_update_and_resync_reach_engine() {
     let _ = recv_json(&mut ws).await;
 
     let update = json!({
-        "type": "mailbox_update",
+        "type": "write",
         "msg_id": "req-101",
-        "register": "system_status",
+        "register": "05",
         "payload": {
             "power": "on",
             "mode": "cool",
             "fan": "high",
             "target_temp_c": 23.0,
             "myzone_id": 0,
-            "fresh_air": false
+            "fresh_air": false,
+            "rf_sys_id": 0
         }
     });
     ws.send(Message::Text(update.to_string().into()))
@@ -188,7 +199,7 @@ async fn mailbox_update_and_resync_reach_engine() {
     let resync = json!({
         "type": "command",
         "msg_id": "req-201",
-        "action": "resync_mailbox"
+        "action": "resync"
     });
     ws.send(Message::Text(resync.to_string().into()))
         .await
@@ -227,4 +238,121 @@ fn mock_backend_does_not_open_usb_accessory() {
     // selects AoaLink / `/dev/usb_accessory`.
     let cfg = cb_daemon::Config::default();
     assert_eq!(cfg.backend, Backend::Mock);
+}
+
+/// M1 regression: a zone-bearing write (regs 03/04) must stamp the client's
+/// zone into the wire zone byte (`data[0]`) so the frame addresses the zone.
+#[tokio::test]
+async fn write_zone_bearing_register_stamps_wire_zone() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = recv_json(&mut ws).await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-301",
+        "register": "03",
+        "zone": 2,
+        "payload": {
+            "open": true,
+            "damper_pct": 100,
+            "sensor_type": "wired",
+            "target_temp_c": 24.0,
+            "measured_temp_c": 23.1
+        }
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = recv_json(&mut ws).await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["msg_id"], "req-301");
+    assert_eq!(ack["status"], "success");
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let spy = handle.cmd_spy.lock().await;
+            if let Some(cmd) = spy
+                .iter()
+                .find(|c| matches!(c, EngineCmd::WriteRegisters(_)))
+            {
+                match cmd {
+                    EngineCmd::WriteRegisters(records) => {
+                        assert_eq!(records.len(), 1);
+                        let rec = &records[0];
+                        assert_eq!(rec.reg.get(), 0x03);
+                        assert_eq!(rec.data[0], 2, "zone must be stamped into wire byte 0");
+                        assert_eq!(rec.data[1], 0xE4, "payload bytes must be untouched");
+                        return;
+                    }
+                    _ => unreachable!("spy only records WriteRegisters here"),
+                }
+            }
+            drop(spy);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("zone write not observed on spy");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// M1 guard: a `zone` on a non-zone-bearing write must be ignored — the zone
+/// byte belongs to the register's payload, not the CAN address.
+#[tokio::test]
+async fn write_non_zone_register_ignores_zone() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = recv_json(&mut ws).await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-302",
+        "register": "05",
+        "zone": 9,
+        "payload": {
+            "power": "on",
+            "mode": "cool",
+            "fan": "high",
+            "target_temp_c": 24.0,
+            "myzone_id": 0,
+            "fresh_air": false,
+            "rf_sys_id": 0
+        }
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = recv_json(&mut ws).await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["status"], "success");
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let spy = handle.cmd_spy.lock().await;
+            if let Some(cmd) = spy
+                .iter()
+                .find(|c| matches!(c, EngineCmd::WriteRegisters(_)))
+            {
+                match cmd {
+                    EngineCmd::WriteRegisters(records) => {
+                        let rec = &records[0];
+                        assert_eq!(rec.reg.get(), 0x05);
+                        assert_eq!(rec.data[0], 0x01, "power byte must not be overwritten");
+                        return;
+                    }
+                    _ => unreachable!("spy only records WriteRegisters here"),
+                }
+            }
+            drop(spy);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reg-05 write not observed on spy");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
 }
