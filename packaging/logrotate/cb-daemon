@@ -1,21 +1,55 @@
 # cb-daemon log rotation (Alpine: /etc/logrotate.d/cb-daemon).
 # Installed with: apk add logrotate
-# Alpine runs logrotate via /etc/periodic/daily/logrotate.
+# Alpine runs logrotate via /etc/periodic/daily/logrotate — but the daily
+# schedule alone lets a debug session overrun the tmpfs. This config REQUIRES
+# logrotate to also run from the 1-minute periodic:
+#   mkdir -p /etc/periodic/1min
+#   cp /etc/periodic/daily/logrotate /etc/periodic/1min/logrotate
+#   echo '* * * * * run-parts /etc/periodic/1min' >> /etc/crontabs/root
+#   # Remove any earlier copy from /etc/periodic/15min: two logrotate runs
+#   # colliding on the state-file lock exit with code 3 (ALERT at :00/:15/:30/:45).
+#   rm -f /etc/periodic/15min/logrotate
+#
+# Why every minute: copytruncate copies the whole live log before truncating,
+# so the copy must fit in the remaining tmpfs space. With the 15-minute
+# periodic, a debug-level frame flood (~70 KB/s) grew the log ~60 MB between
+# runs; once the file exceeded the free space, every rotation failed with
+# ENOSPC and nothing could free the tmpfs again — a permanent deadlock
+# (logrotate ALERTs every run, /var/log stays 100% full, daemon logs die).
+# Every minute the log can grow at most maxsize + 1 min of writes (~9 MB at
+# the debug flood rate), so the copy transient always fits and rotation can
+# never deadlock.
 #
 # /var/log is a RAM-backed tmpfs (fstab entry, see openrc template header)
-# to spare SD card IOPS, so rotation must bound memory usage: this config
-# caps cb-daemon at ~100 MB (5 MB x 19 copies) within the 128 MB tmpfs.
-# copytruncate keeps the running daemon's fd valid (no service restart).
-# Logs are intentionally volatile (lost on reboot) — SD durability wins.
+# to spare SD card IOPS. Budget at the debug flood rate: current log (~9 MB)
+# + copy transient (~9 MB) + 20 compressed generations (~0.5 MB each — the
+# repeated frame lines compress ~10x) ~= 28 MB of the 128 MB tmpfs.
+# Generations ARE compressed (the global /etc/logrotate.conf enables
+# `compress` + `dateext`; the per-file directives keep that). gzip of a 5–9 MB
+# generation takes ~2–5 s on the Pi Zero W's single core: ~0.1% CPU in steady
+# state (one rotation every ~28 min at 3 KB/s) and ~3–5% during a 70 KB/s
+# debug flood (one rotation every ~2 min). `delaycompress` keeps the newest
+# generation uncompressed for immediate reading. With `dateext` in force,
+# rotated files are `cb-daemon.log-YYYYMMDD(.gz)` (self-evicting after
+# `rotate 20`), and anything created outside that naming scheme (e.g. a manual
+# `logrotate -f` renaming to `cb-daemon.log.1`) is invisible to eviction and
+# must be removed by hand. copytruncate keeps the running daemon's fd valid
+# (no service restart). Logs are intentionally volatile (lost on reboot) —
+# SD durability wins.
+#
+# Recovery if /var/log ever fills anyway (trace-level flood, logrotate
+# outage, ...): truncation needs no free space, then restart the daemon so
+# it reopens the log with a fresh offset:
+#   : > /var/log/cb-daemon.log && rc-service cb-daemon restart
 
 /var/log/cb-daemon.log {
     daily
     maxsize 5M
-    rotate 19
-    compress
-    delaycompress
+    rotate 20
     missingok
     notifempty
     copytruncate
+    compress
+    delaycompress
     su root wheel
 }

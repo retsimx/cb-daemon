@@ -90,7 +90,7 @@ Override binary path for packing with `CB_DAEMON_BIN=/path/to/cb-daemon`.
 ## Packaging
 
 - **Magisk** (`packaging/magisk/`): installable module (flash the zip from `pack-magisk.sh`). Runtime binary/config live under `/data/adb/cb-daemon/`. Ops notes and a device start/stop checklist: [`packaging/magisk/README.md`](packaging/magisk/README.md).
-- **OpenRC** (`packaging/openrc/cb-daemon`): init script for the Pi Zero W on Alpine (the systemd placeholder is retired). Install and enable steps in the template header. `/var/log` is RAM-backed (tmpfs, fstab) to spare SD card IOPS; daemon output goes to `/var/log/cb-daemon.log`, rotated with a size cap via `packaging/logrotate/cb-daemon` (copytruncate keeps the live fd; logs are intentionally volatile across reboot).
+- **OpenRC** (`packaging/openrc/cb-daemon`): init script for the Pi Zero W on Alpine (the systemd placeholder is retired). Install and enable steps in the template header. `/var/log` is RAM-backed (tmpfs, fstab) to spare SD card IOPS; daemon output goes to `/var/log/cb-daemon.log`, rotated with a size cap via `packaging/logrotate/cb-daemon` (copytruncate keeps the live fd; rotation runs from the 1-minute periodic — see the config header — because a slower cadence lets a debug frame flood outgrow the tmpfs and deadlock rotation; logs are intentionally volatile across reboot).
 - Canonical host config example: [`packaging/cb-daemon.example.toml`](packaging/cb-daemon.example.toml).
 
 ## Tracking
