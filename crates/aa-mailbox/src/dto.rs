@@ -1,7 +1,5 @@
 //! Typed register DTOs and wire-string enums for the register catalog.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 /// Ack status string on the wire (`success` | `error`).
@@ -303,20 +301,4 @@ pub struct RfDeviceCalibrationDto {
     pub channel: u8,
     /// Up/down position.
     pub up_down_position: u8,
-}
-
-/// One unit's full register snapshot.
-///
-/// `registers` is keyed by 2-hex register id; zone-bearing registers (`03`/`04`)
-/// are nested zone → DTO maps; unknown registers are raw 14-char hex strings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(clippy::derive_partial_eq_without_eq)] // `serde_json::Value` is not `Eq`.
-#[serde(rename_all = "snake_case")]
-pub struct UnitSnapshot {
-    /// Unit type (2-hex lowercase).
-    pub unit_type: String,
-    /// Unit id (5-hex lowercase).
-    pub unit_id: String,
-    /// Register id → typed DTO (or nested zone map / raw hex).
-    pub registers: BTreeMap<String, serde_json::Value>,
 }

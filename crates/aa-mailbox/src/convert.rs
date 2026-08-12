@@ -63,9 +63,12 @@
 
 mod codec;
 
-use aa_registers::RegId;
+use std::collections::BTreeMap;
+
+use aa_registers::{CanRecord, RegId, RegisterBank, ZONE_BEARING_REGS, is_zone_bearing};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use tracing::debug;
 
 use crate::error::EncodeError;
 
@@ -148,6 +151,73 @@ pub fn decode_payload(reg: RegId, data: [u8; 7]) -> Result<Value, EncodeError> {
         0x27 => decode_rf_device_calibration(data),
         _ => Ok(Value::String(bytes_to_hex(data))),
     }
+}
+
+/// Maximum zone id scanned for zone-bearing registers in a snapshot.
+const MAX_ZONE: u8 = 10;
+
+/// Build the multi-unit snapshot body from a register bank.
+///
+/// Keyed by `"{unit_type}:{unit_id}"` via the [`std::fmt::Display`] impls
+/// (2-hex type, 5-hex id, lowercase — e.g. `"07:181f3"`); each value is that
+/// unit's register map. Non-zone registers decode to typed DTOs (or raw
+/// 14-char hex for unknown registers); zone-bearing registers (`03`/`04`)
+/// are nested zone → DTO maps, inserted only when non-empty. Registers with no
+/// bank slot are skipped.
+pub fn snapshot_units(bank: &RegisterBank) -> BTreeMap<String, BTreeMap<String, Value>> {
+    let mut units = BTreeMap::new();
+    for unit_type in bank.unit_types() {
+        let records = bank.records_for_any_unit(unit_type);
+        for unit_id in bank.unit_ids(unit_type) {
+            let mut registers = BTreeMap::new();
+            for record in &records {
+                if record.unit_id != unit_id || is_zone_bearing(record.reg) {
+                    continue;
+                }
+                match decode_payload(record.reg, record.data) {
+                    Ok(payload) => {
+                        registers.insert(format!("{:02x}", record.reg.get()), payload);
+                    }
+                    Err(err) => debug!(%err, "snapshot: skipping undecodable register"),
+                }
+            }
+            for &reg_id in ZONE_BEARING_REGS {
+                let reg = RegId::new(reg_id);
+                let mut zones: BTreeMap<String, Value> = BTreeMap::new();
+                for zone in 1..=MAX_ZONE {
+                    if let Some(data) = bank.get_zone(unit_type, unit_id, reg, zone)
+                        && let Ok(payload) = decode_payload(reg, data)
+                    {
+                        zones.insert(zone.to_string(), payload);
+                    }
+                }
+                if !zones.is_empty() {
+                    registers.insert(
+                        format!("{reg_id:02x}"),
+                        Value::Object(zones.into_iter().collect()),
+                    );
+                }
+            }
+            units.insert(format!("{unit_type}:{unit_id}"), registers);
+        }
+    }
+    units
+}
+
+/// Build the per-unit event fields `(register_hex, zone, payload)` for a wire
+/// record.
+///
+/// `zone` is `Some(record.data[0])` for zone-bearing registers (`03`/`04`);
+/// otherwise `None`. Undecodable payloads fall back to the raw 14-char
+/// lowercase hex string (same fallback as [`decode_payload`] for unknown
+/// registers).
+#[must_use]
+pub fn event_body(record: &CanRecord) -> (String, Option<u8>, Value) {
+    let register = format!("{:02x}", record.reg.get());
+    let zone = is_zone_bearing(record.reg).then_some(record.data[0]);
+    let payload = decode_payload(record.reg, record.data)
+        .unwrap_or_else(|_| Value::String(bytes_to_hex(record.data)));
+    (register, zone, payload)
 }
 
 // --- Shared helpers ----------------------------------------------------------

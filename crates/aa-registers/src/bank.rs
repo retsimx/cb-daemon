@@ -227,6 +227,56 @@ impl RegisterBank {
             })
             .collect()
     }
+
+    /// Distinct unit types with at least one slot, ascending by byte value.
+    #[must_use]
+    pub fn unit_types(&self) -> Vec<UnitType> {
+        let mut types: Vec<UnitType> = self.slots.keys().map(|k| k.unit_type).collect();
+        types.sort_by_key(|t| t.get());
+        types.dedup();
+        types
+    }
+
+    /// Distinct unit ids for `unit_type` with at least one slot, ascending by value.
+    #[must_use]
+    pub fn unit_ids(&self, unit_type: UnitType) -> Vec<UnitId> {
+        let mut ids: Vec<UnitId> = self
+            .slots
+            .keys()
+            .filter(|k| k.unit_type == unit_type)
+            .map(|k| k.unit_id)
+            .collect();
+        ids.sort_by_key(|id| id.get());
+        ids.dedup();
+        ids
+    }
+
+    /// All slots for `unit_type` across every unit id as tablet-bound [`CanRecord`]s.
+    ///
+    /// Multi-unit sibling of [`Self::records_for_unit`]: sorted by
+    /// `(unit_id, reg, zone)`; dest is always [`crate::wire::Dest::Tablet`].
+    #[must_use]
+    pub fn records_for_any_unit(&self, unit_type: UnitType) -> Vec<CanRecord> {
+        use crate::wire::Dest;
+        let mut keys: Vec<&BankKey> = self
+            .slots
+            .keys()
+            .filter(|k| k.unit_type == unit_type)
+            .collect();
+        keys.sort_by_key(|k| (k.unit_id.get(), k.reg.get(), k.zone.unwrap_or(0)));
+        keys.into_iter()
+            .filter_map(|k| {
+                let data = self.slots.get(k).copied()?;
+                Some(CanRecord {
+                    unit_type: k.unit_type,
+                    dest: Dest::Tablet,
+                    unit_id: k.unit_id,
+                    reg: k.reg,
+                    data,
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +437,129 @@ mod tests {
         let hint = UnitId::try_new(0x0_181F3).unwrap();
         assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, Some(hint)), hint);
         assert_eq!(bank.preferred_unit_id(UnitType::AIRCON, None), UnitId::ZERO);
+    }
+
+    #[test]
+    fn unit_types_distinct_ascending() {
+        let mut bank = RegisterBank::new();
+        let type08 = UnitType::new(0x08);
+        let id = UnitId::try_new(0x0_181F3).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: type08,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: type08,
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_ABCDE).unwrap(),
+            reg: RegId::new(0x05),
+            data: [1; 7],
+        });
+
+        assert_eq!(bank.unit_types(), vec![UnitType::AIRCON, type08]);
+        assert_eq!(bank.unit_types().len(), 2);
+    }
+
+    #[test]
+    fn unit_ids_ascending_per_type() {
+        let mut bank = RegisterBank::new();
+        let small = UnitId::try_new(0x0_181F3).unwrap();
+        let large = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: large,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: small,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: large,
+            reg: RegId::new(0x06),
+            data: [1; 7],
+        });
+
+        assert_eq!(bank.unit_ids(UnitType::AIRCON), vec![small, large]);
+        assert_eq!(bank.unit_ids(UnitType::new(0x08)), vec![large]);
+        assert!(bank.unit_ids(UnitType::new(0x02)).is_empty());
+    }
+
+    #[test]
+    fn records_for_any_unit_across_ids_sorted_and_tablet() {
+        let mut bank = RegisterBank::new();
+        let small = UnitId::try_new(0x0_181F3).unwrap();
+        let large = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: large,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
+        // Zone-bearing reg 0x03: zone from data[0], applied out of zone order.
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: small,
+            reg: RegId::new(0x03),
+            data: [0x02, 0xe4, 0x00, 0x03, 0x00, 0x00, 0x00],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: small,
+            reg: RegId::new(0x03),
+            data: [0x01, 0xe4, 0x00, 0x03, 0x00, 0x00, 0x00],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: small,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
+        // 08-type record must not leak into the 07 projection.
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: small,
+            reg: RegId::new(0x06),
+            data: [1; 7],
+        });
+
+        let records = bank.records_for_any_unit(UnitType::AIRCON);
+        let summary: Vec<(u32, u8, u8)> = records
+            .iter()
+            .map(|r| (r.unit_id.get(), r.reg.get(), r.data[0]))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (small.get(), 0x03, 0x01),
+                (small.get(), 0x03, 0x02),
+                (small.get(), 0x05, 0x01),
+                (large.get(), 0x05, 0x01),
+            ]
+        );
+        assert!(records.iter().all(|r| r.dest == Dest::Tablet));
+        assert!(records.iter().all(|r| r.unit_type == UnitType::AIRCON));
     }
 }

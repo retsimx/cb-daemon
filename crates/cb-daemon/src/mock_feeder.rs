@@ -101,8 +101,18 @@ const fn sample_record() -> CanRecord {
     }
 }
 
+const fn sample_record_08() -> CanRecord {
+    CanRecord {
+        unit_type: UnitType::new(0x08),
+        dest: Dest::Tablet,
+        unit_id: FEEDER_UNIT_ID,
+        reg: RegId::new(0x06),
+        data: [0; 7],
+    }
+}
+
 fn get_can_with_sample() -> Vec<u8> {
-    get_can_from_records(&[sample_record()])
+    get_can_from_records(&[sample_record(), sample_record_08()])
 }
 
 /// Parse the records carried by the first `setCAN …` frame in `written`.
