@@ -1,8 +1,7 @@
-//! Axum WebSocket bridge: single-session gate + JSON ↔ engine cmds/events.
+//! Axum WebSocket bridge: multi-consumer sessions + JSON ↔ engine cmds/events.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
@@ -11,20 +10,15 @@ use aa_mailbox::{
 use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::mock_feeder::FEEDER_UNIT_ID;
-
-/// Close code when a second client tries to open `/v1/mailbox-stream`.
-pub(crate) const SINGLE_CLIENT_CLOSE_CODE: u16 = 4009;
-/// Close reason for the single-session gate.
-pub(crate) const SINGLE_CLIENT_CLOSE_REASON: &str = "Single client limit enforced";
 
 /// Held engine snapshot for late WebSocket clients (bank).
 #[derive(Debug, Clone)]
@@ -39,10 +33,8 @@ pub(crate) struct WsState {
     pub cmd_tx: mpsc::Sender<EngineCmd>,
     /// Latest dump/resync snapshot (`None` until first [`EngineEvent::Snapshot`]).
     pub snapshot: watch::Receiver<Option<HeldSnapshot>>,
-    /// Fan-out of non-snapshot engine events to the active session.
+    /// Fan-out of non-snapshot engine events to every connected session.
     pub events: broadcast::Sender<EngineEvent>,
-    /// Single-session gate (`true` while a client holds the slot).
-    pub session_held: Arc<AtomicBool>,
     /// Optional spy for tests (records cmds accepted from WS).
     pub cmd_spy: Option<Arc<tokio::sync::Mutex<Vec<EngineCmd>>>>,
     /// Config `unit_id_hint` (preferred when present in the bank).
@@ -117,25 +109,9 @@ async fn mailbox_stream_upgrade(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: WsState) {
-    if state
-        .session_held
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        info!("rejecting second WebSocket client with {SINGLE_CLIENT_CLOSE_CODE}");
-        let _ = socket
-            .send(Message::Close(Some(CloseFrame {
-                code: SINGLE_CLIENT_CLOSE_CODE,
-                reason: SINGLE_CLIENT_CLOSE_REASON.into(),
-            })))
-            .await;
-        let _ = socket.close().await;
-        return;
-    }
-
-    let result = run_session(socket, state.clone()).await;
-    state.session_held.store(false, Ordering::SeqCst);
+/// Run one independent session per connection (no single-session gate).
+async fn handle_socket(socket: WebSocket, state: WsState) {
+    let result = run_session(socket, state).await;
     if let Err(err) = result {
         debug!(?err, "mailbox-stream session ended");
     }
@@ -152,8 +128,8 @@ async fn run_session(mut socket: WebSocket, state: WsState) -> anyhow::Result<()
 
 /// Wait for the first engine Snapshot, aborting if the client disconnects.
 ///
-/// Releases the session gate promptly when the holder drops before dump completes
-/// (otherwise `session_held` would stick until a Snapshot arrives — or forever).
+/// Aborts promptly when the holder drops before dump completes: no bank is ever
+/// published, so a waiting session would hang forever otherwise.
 async fn wait_for_snapshot(
     socket: &mut WebSocket,
     mut rx: watch::Receiver<Option<HeldSnapshot>>,
@@ -190,41 +166,47 @@ async fn wait_for_snapshot(
 
 /// Per-session write ack state: acks are deferred until the engine
 /// confirms the write was transmitted ([`EngineEvent::WriteFlushed`]), so a
-/// success ack never lies when the bus is dead. FIFO: aaservice serializes
-/// outbound actions, so at most one write is in flight at a time.
+/// success ack never lies when the bus is dead. The engine batches the entire
+/// write queue into one CAN TX and emits exactly one `WriteFlushed` per TX, so
+/// every pending `msg_id` since the last flush belongs to that TX and is acked
+/// together.
 struct PendingAcks {
-    queue: std::collections::VecDeque<(String, tokio::time::Instant)>,
+    deadlines: BTreeMap<String, tokio::time::Instant>,
     timeout: std::time::Duration,
 }
 
 impl PendingAcks {
     const fn new() -> Self {
         Self {
-            queue: std::collections::VecDeque::new(),
+            deadlines: BTreeMap::new(),
             timeout: std::time::Duration::from_secs(10),
         }
     }
 
+    /// Track `msg_id` with a 10s deadline; acked on [`EngineEvent::WriteFlushed`].
     fn push(&mut self, msg_id: String) {
-        self.queue
-            .push_back((msg_id, tokio::time::Instant::now() + self.timeout));
+        self.deadlines
+            .insert(msg_id, tokio::time::Instant::now() + self.timeout);
     }
 
-    /// Pop the oldest pending ack as a success (write was flushed).
-    fn pop_front(&mut self) -> Option<String> {
-        self.queue.pop_front().map(|(msg_id, _)| msg_id)
+    /// Drain every pending `msg_id` as a success (writes were flushed).
+    fn drain_all(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.deadlines).into_keys().collect()
     }
 
-    /// Pop the oldest pending ack only when its deadline has passed.
-    fn pop_expired(&mut self) -> Option<String> {
-        let expired = self
-            .queue
-            .front()
-            .is_some_and(|(_, deadline)| tokio::time::Instant::now() >= *deadline);
-        if expired {
-            return self.queue.pop_front().map(|(msg_id, _)| msg_id);
+    /// Remove and return every `msg_id` whose deadline has passed.
+    fn drain_expired(&mut self) -> Vec<String> {
+        let now = tokio::time::Instant::now();
+        let expired: Vec<String> = self
+            .deadlines
+            .iter()
+            .filter(|(_, deadline)| now >= **deadline)
+            .map(|(msg_id, _)| msg_id.clone())
+            .collect();
+        for msg_id in &expired {
+            self.deadlines.remove(msg_id);
         }
-        None
+        expired
     }
 }
 
@@ -233,7 +215,7 @@ async fn bridge_until_disconnect(socket: &mut WebSocket, state: &WsState) -> any
     let mut pending = PendingAcks::new();
     loop {
         // Expire stale write acks so a dead bus surfaces as an error ack.
-        if let Some(msg_id) = pending.pop_expired() {
+        for msg_id in pending.drain_expired() {
             send_ack(
                 socket,
                 &msg_id,
@@ -327,7 +309,7 @@ async fn forward_engine_event(
             Ok(true)
         }
         Ok(EngineEvent::WriteFlushed) => {
-            if let Some(msg_id) = pending.pop_front() {
+            for msg_id in pending.drain_all() {
                 send_ack(socket, &msg_id, AckStatus::Success, None).await?;
             }
             Ok(true)
