@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
-    AckStatus, ClientMessage, ServerMessage, encode_payload, event_body, snapshot_units,
+    AckStatus, ClientMessage, ServerMessage, StatusState, encode_payload, event_body,
+    snapshot_units,
 };
 use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
 use axum::Router;
@@ -26,6 +27,18 @@ pub(crate) struct HeldSnapshot {
     pub bank: RegisterBank,
 }
 
+/// Fan-out message broadcast to every connected session.
+#[derive(Debug, Clone)]
+pub(crate) enum WsEvent {
+    /// Raw engine event (snapshot, register change, write flush, …).
+    Engine(EngineEvent),
+    /// Wire `status` frame: session-state transitions + link-down detail.
+    Status {
+        state: StatusState,
+        detail: Option<String>,
+    },
+}
+
 /// Shared state for the axum router.
 #[derive(Clone)]
 pub(crate) struct WsState {
@@ -33,12 +46,24 @@ pub(crate) struct WsState {
     pub cmd_tx: mpsc::Sender<EngineCmd>,
     /// Latest dump/resync snapshot (`None` until first [`EngineEvent::Snapshot`]).
     pub snapshot: watch::Receiver<Option<HeldSnapshot>>,
-    /// Fan-out of non-snapshot engine events to every connected session.
-    pub events: broadcast::Sender<EngineEvent>,
+    /// Fan-out of non-snapshot events to every connected session.
+    pub events: broadcast::Sender<WsEvent>,
+    /// Latest engine session state (`negotiating` before the first snapshot).
+    pub status: watch::Receiver<StatusState>,
     /// Optional spy for tests (records cmds accepted from WS).
     pub cmd_spy: Option<Arc<tokio::sync::Mutex<Vec<EngineCmd>>>>,
     /// Config `unit_id_hint` (preferred when present in the bank).
     pub unit_id_hint: Option<UnitId>,
+}
+
+/// Map an engine session-state onto the wire `status` state (1:1, D-8).
+pub(crate) const fn map_session_state(state: aa_engine::SessionState) -> StatusState {
+    match state {
+        aa_engine::SessionState::Negotiating => StatusState::Negotiating,
+        aa_engine::SessionState::Synced => StatusState::Synced,
+        aa_engine::SessionState::Resyncing => StatusState::Resyncing,
+        aa_engine::SessionState::LinkDown => StatusState::LinkDown,
+    }
 }
 
 /// Resolve the primary (`unit_type`, `unit_id`) from the bank.
@@ -102,15 +127,39 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     }
 }
 
-async fn run_session(mut socket: WebSocket, state: WsState) -> anyhow::Result<()> {
+async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Result<()> {
+    // Late clients learn the current health instantly (D-8): send the latest
+    // session state on connect, before the snapshot wait. The watch already
+    // holds the most recent transition (negotiating until the first dump).
+    let connect_state = *state.status.borrow_and_update();
+    let status = ServerMessage::Status {
+        state: connect_state,
+        detail: None,
+    };
+    send_json(&mut socket, &status).await?;
     let held = wait_for_snapshot(&mut socket, state.snapshot.clone()).await?;
+
+    // Subscribe to the event fan-out BEFORE re-reading the status watch: the
+    // broadcast has no history, so a transition that raced the snapshot wait
+    // must either arrive on this subscription or be echoed from the watch
+    // here. The fanout writes the watch before broadcasting, so exactly one
+    // of the two paths is guaranteed to deliver a changed state.
+    let ev_rx = state.events.subscribe();
+    let current_state = *state.status.borrow_and_update();
+    if current_state != connect_state {
+        let status = ServerMessage::Status {
+            state: current_state,
+            detail: None,
+        };
+        send_json(&mut socket, &status).await?;
+    }
     let (_, unit_id) = primary_unit(&held.bank, state.unit_id_hint);
     info!(%unit_id, "mailbox snapshot unit_id");
     let snap = ServerMessage::Snapshot {
         units: snapshot_units(&held.bank),
     };
     send_json(&mut socket, &snap).await?;
-    bridge_until_disconnect(&mut socket, &state).await
+    bridge_until_disconnect(&mut socket, &state, ev_rx).await
 }
 
 /// Wait for the first engine Snapshot, aborting if the client disconnects.
@@ -197,8 +246,11 @@ impl PendingAcks {
     }
 }
 
-async fn bridge_until_disconnect(socket: &mut WebSocket, state: &WsState) -> anyhow::Result<()> {
-    let mut ev_rx = state.events.subscribe();
+async fn bridge_until_disconnect(
+    socket: &mut WebSocket,
+    state: &WsState,
+    mut ev_rx: broadcast::Receiver<WsEvent>,
+) -> anyhow::Result<()> {
     let mut pending = PendingAcks::new();
     loop {
         // Expire stale write acks so a dead bus surfaces as an error ack.
@@ -283,30 +335,43 @@ fn event_message(record: &CanRecord) -> ServerMessage {
 async fn forward_engine_event(
     socket: &mut WebSocket,
     _state: &WsState,
-    ev: Result<EngineEvent, broadcast::error::RecvError>,
+    ev: Result<WsEvent, broadcast::error::RecvError>,
     pending: &mut PendingAcks,
 ) -> anyhow::Result<bool> {
     match ev {
-        Ok(EngineEvent::RegistersChanged { records }) => {
+        Ok(WsEvent::Engine(EngineEvent::RegistersChanged { records })) => {
             for record in records {
                 send_json(socket, &event_message(&record)).await?;
             }
             Ok(true)
         }
-        Ok(EngineEvent::Snapshot { bank, .. }) => {
+        Ok(WsEvent::Engine(EngineEvent::Snapshot { bank, .. })) => {
             let snap = ServerMessage::Snapshot {
                 units: snapshot_units(&bank),
             };
             send_json(socket, &snap).await?;
             Ok(true)
         }
-        Ok(EngineEvent::WriteFlushed) => {
+        Ok(WsEvent::Engine(EngineEvent::WriteFlushed)) => {
             for msg_id in pending.drain_all() {
                 send_ack(socket, &msg_id, AckStatus::Success, None).await?;
             }
             Ok(true)
         }
-        Ok(other) => {
+        Ok(WsEvent::Engine(EngineEvent::SessionState(state))) => {
+            let status = ServerMessage::Status {
+                state: map_session_state(state),
+                detail: None,
+            };
+            send_json(socket, &status).await?;
+            Ok(true)
+        }
+        Ok(WsEvent::Status { state, detail }) => {
+            let status = ServerMessage::Status { state, detail };
+            send_json(socket, &status).await?;
+            Ok(true)
+        }
+        Ok(WsEvent::Engine(other)) => {
             debug!(?other, "engine event (not forwarded to WS)");
             Ok(true)
         }
