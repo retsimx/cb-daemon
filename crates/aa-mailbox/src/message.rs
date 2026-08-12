@@ -1,9 +1,11 @@
 //! Client- and server-directed protocol message enums.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::dto::{AckStatus, StatusState, UnitSnapshot};
+use crate::dto::{AckStatus, StatusState};
 
 /// Messages sent from the daemon to the client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -12,8 +14,10 @@ use crate::dto::{AckStatus, StatusState, UnitSnapshot};
 pub enum ServerMessage {
     /// Full register snapshot of all known units (after connect / resync).
     Snapshot {
-        /// One snapshot per unit.
-        units: Vec<UnitSnapshot>,
+        /// `"{unit_type}:{unit_id}"` (`Display` 2-hex type / 5-hex id, e.g.
+        /// `"07:11111"`) → register id → typed DTO (or nested zone map / raw
+        /// hex).
+        units: BTreeMap<String, BTreeMap<String, Value>>,
     },
     /// Incremental register change notification for one unit.
     Event {

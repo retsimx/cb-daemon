@@ -154,11 +154,11 @@ async fn mock_backend_ws_receives_mailbox_snapshot() {
 
     let msg = recv_json(&mut ws).await;
     assert_eq!(msg["type"], "snapshot");
-    assert_eq!(msg["units"][0]["unit_type"], "07");
-    assert_eq!(msg["units"][0]["unit_id"], "abcde");
+    // Multi-unit map keyed "{unit_type}:{unit_id}" (D-3): the mock feeder
+    // round-trips the 07 sample dump and the 08-type flush dump.
     // Mock feeder dump delivers reg 05 (system status) for `abcde`:
     // [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00] → on/cool/high/24.0/off.
-    let reg05 = &msg["units"][0]["registers"]["05"];
+    let reg05 = &msg["units"]["07:abcde"]["05"];
     assert!(reg05.is_object(), "reg 05 missing from snapshot: {msg}");
     assert_eq!(reg05["power"], "on");
     assert_eq!(reg05["mode"], "cool");
@@ -166,6 +166,10 @@ async fn mock_backend_ws_receives_mailbox_snapshot() {
     assert_eq!(reg05["target_temp_c"], 24.0);
     assert_eq!(reg05["fresh_air"], false);
     assert_eq!(reg05["rf_sys_id"], 0);
+    // 08-type record from the flush-dump reply must surface as its own unit.
+    let reg06 = &msg["units"]["08:abcde"]["06"];
+    assert!(reg06.is_object(), "reg 06 missing from 08 unit: {msg}");
+    assert_eq!(reg06["fw_major"], 0);
 
     handle.shutdown().await.expect("shutdown");
 }
@@ -232,11 +236,11 @@ async fn two_clients_both_receive_snapshot() {
 
     let snap_a = recv_json(&mut a).await;
     assert_eq!(snap_a["type"], "snapshot");
-    assert_eq!(snap_a["units"][0]["unit_id"], "abcde");
+    assert!(snap_a["units"]["07:abcde"].is_object());
 
     let snap_b = recv_json(&mut b).await;
     assert_eq!(snap_b["type"], "snapshot");
-    assert_eq!(snap_b["units"][0]["unit_id"], "abcde");
+    assert!(snap_b["units"]["07:abcde"].is_object());
 
     let _ = a.close(None).await;
     let _ = b.close(None).await;

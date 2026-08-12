@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
-    AckStatus, ClientMessage, ServerMessage, UnitSnapshot, decode_payload, encode_payload,
+    AckStatus, ClientMessage, ServerMessage, encode_payload, event_body, snapshot_units,
 };
 use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
 use axum::Router;
@@ -41,58 +41,43 @@ pub(crate) struct WsState {
     pub unit_id_hint: Option<UnitId>,
 }
 
-fn resolve_unit_id(bank: &RegisterBank, hint: Option<UnitId>) -> UnitId {
-    let id = bank.preferred_unit_id(UnitType::AIRCON, hint);
-    if id == UnitId::ZERO {
-        // Mock feeder / empty bank fallback.
-        hint.unwrap_or(FEEDER_UNIT_ID)
-    } else {
-        id
-    }
-}
-
-/// Build the mailbox `Snapshot` for one (primary) unit from the held bank.
+/// Resolve the primary (`unit_type`, `unit_id`) from the bank.
 ///
-/// Non-zone registers decode to typed DTOs (or raw 14-char hex for unknown
-/// registers); zone-bearing registers (`03`/`04`) are nested zone → DTO maps.
-/// Registers with no bank slot are skipped.
-fn snapshot_message(bank: &RegisterBank, unit_type: UnitType, unit_id: UnitId) -> ServerMessage {
-    let mut registers = BTreeMap::new();
-    for record in bank.records_for_unit(unit_type, unit_id) {
-        if is_zone_bearing(record.reg) {
+/// A hint present in the bank wins (preferring AIRCON when the id exists under
+/// multiple types); else the smallest unit id across all unit types (tie-break
+/// by unit type byte); empty bank falls back to `(AIRCON, hint |
+/// FEEDER_UNIT_ID)` for the mock feeder.
+fn primary_unit(bank: &RegisterBank, hint: Option<UnitId>) -> (UnitType, UnitId) {
+    if let Some(hint) = hint {
+        let found = if bank.unit_ids(UnitType::AIRCON).contains(&hint) {
+            Some(UnitType::AIRCON)
+        } else {
+            bank.unit_types()
+                .into_iter()
+                .find(|t| bank.unit_ids(*t).contains(&hint))
+        };
+        if let Some(unit_type) = found {
+            return (unit_type, hint);
+        }
+    }
+    let mut best: Option<(UnitType, UnitId)> = None;
+    for unit_type in bank.unit_types() {
+        let ids = bank.unit_ids(unit_type);
+        let Some(first) = ids.first() else {
             continue;
-        }
-        match decode_payload(record.reg, record.data) {
-            Ok(payload) => {
-                registers.insert(format!("{:02x}", record.reg.get()), payload);
-            }
-            Err(err) => debug!(%err, "snapshot: skipping undecodable register"),
-        }
-    }
-    for reg_id in [0x03, 0x04] {
-        let reg = RegId::new(reg_id);
-        let mut zones: BTreeMap<String, Value> = BTreeMap::new();
-        for zone in 1..=10u8 {
-            if let Some(data) = bank.get_zone(unit_type, unit_id, reg, zone)
-                && let Ok(payload) = decode_payload(reg, data)
+        };
+        let candidate = (unit_type, *first);
+        best = Some(match best {
+            None => candidate,
+            Some((best_type, best_id))
+                if (candidate.1.get(), candidate.0.get()) < (best_id.get(), best_type.get()) =>
             {
-                zones.insert(zone.to_string(), payload);
+                candidate
             }
-        }
-        if !zones.is_empty() {
-            registers.insert(
-                format!("{reg_id:02x}"),
-                Value::Object(zones.into_iter().collect()),
-            );
-        }
+            Some(cur) => cur,
+        });
     }
-    ServerMessage::Snapshot {
-        units: vec![UnitSnapshot {
-            unit_type: unit_type.to_string(),
-            unit_id: unit_id.to_string(),
-            registers,
-        }],
-    }
+    best.unwrap_or_else(|| (UnitType::AIRCON, hint.unwrap_or(FEEDER_UNIT_ID)))
 }
 
 /// Build the axum router with `GET /v1/mailbox-stream`.
@@ -119,9 +104,11 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 
 async fn run_session(mut socket: WebSocket, state: WsState) -> anyhow::Result<()> {
     let held = wait_for_snapshot(&mut socket, state.snapshot.clone()).await?;
-    let unit_id = resolve_unit_id(&held.bank, state.unit_id_hint);
+    let (_, unit_id) = primary_unit(&held.bank, state.unit_id_hint);
     info!(%unit_id, "mailbox snapshot unit_id");
-    let snap = snapshot_message(&held.bank, UnitType::AIRCON, unit_id);
+    let snap = ServerMessage::Snapshot {
+        units: snapshot_units(&held.bank),
+    };
     send_json(&mut socket, &snap).await?;
     bridge_until_disconnect(&mut socket, &state).await
 }
@@ -276,35 +263,40 @@ async fn handle_ws_message(
     }
 }
 
+/// Shape an engine register-change record into its WS `event` body.
+///
+/// Type-agnostic: an 08-type record produces `unit_type: "08"` with the record's
+/// own `unit_id` (multi-unit D-3). Undecodable payloads fall back to the raw
+/// 14-char hex string (see [`event_body`]).
+fn event_message(record: &CanRecord) -> ServerMessage {
+    let (register, zone, payload) = event_body(record);
+    ServerMessage::Event {
+        unit_type: record.unit_type.to_string(),
+        unit_id: record.unit_id.to_string(),
+        register,
+        zone,
+        payload,
+    }
+}
+
 /// Returns `false` when the session should end.
 async fn forward_engine_event(
     socket: &mut WebSocket,
-    state: &WsState,
+    _state: &WsState,
     ev: Result<EngineEvent, broadcast::error::RecvError>,
     pending: &mut PendingAcks,
 ) -> anyhow::Result<bool> {
     match ev {
         Ok(EngineEvent::RegistersChanged { records }) => {
             for record in records {
-                match decode_payload(record.reg, record.data) {
-                    Ok(payload) => {
-                        let event = ServerMessage::Event {
-                            unit_type: record.unit_type.to_string(),
-                            unit_id: record.unit_id.to_string(),
-                            register: format!("{:02x}", record.reg.get()),
-                            zone: is_zone_bearing(record.reg).then_some(record.data[0]),
-                            payload,
-                        };
-                        send_json(socket, &event).await?;
-                    }
-                    Err(err) => debug!(%err, "event: skipping undecodable register"),
-                }
+                send_json(socket, &event_message(&record)).await?;
             }
             Ok(true)
         }
         Ok(EngineEvent::Snapshot { bank, .. }) => {
-            let unit_id = resolve_unit_id(&bank, state.unit_id_hint);
-            let snap = snapshot_message(&bank, UnitType::AIRCON, unit_id);
+            let snap = ServerMessage::Snapshot {
+                units: snapshot_units(&bank),
+            };
             send_json(socket, &snap).await?;
             Ok(true)
         }
@@ -412,6 +404,69 @@ struct WriteRequest {
     payload: Value,
 }
 
+/// Resolve and encode a `write` into a single-register [`CanRecord`].
+///
+/// Omitted `unit_type` / `unit_id` default to the bank's primary unit (or the
+/// hint / feeder id when no snapshot exists); a `unit_id` present under exactly
+/// one unit type resolves that type when `unit_type` is omitted. Zone-bearing
+/// registers (`03`/`04`) stamp the client's zone into wire byte 0.
+///
+/// # Errors
+///
+/// Returns a human-readable reason for invalid identifiers/register or an
+/// unencodable payload (mirrors the ack `reason` field).
+fn build_write_record(
+    bank: Option<&RegisterBank>,
+    hint: Option<UnitId>,
+    unit_type: Option<String>,
+    unit_id: Option<String>,
+    register: &str,
+    zone: Option<u8>,
+    payload: &Value,
+) -> Result<CanRecord, String> {
+    let (primary_type, primary_id) = bank.map_or_else(
+        || (UnitType::AIRCON, hint.unwrap_or(FEEDER_UNIT_ID)),
+        |bank| primary_unit(bank, hint),
+    );
+    let parsed_type = unit_type
+        .map(|s| UnitType::from_hex(&s))
+        .transpose()
+        .map_err(|err| format!("invalid unit_type: {err:?}"))?;
+    let parsed_id = unit_id
+        .map(|s| UnitId::from_hex(&s))
+        .transpose()
+        .map_err(|err| format!("invalid unit_id: {err:?}"))?;
+    let unit_type = match (parsed_type, parsed_id) {
+        (Some(unit_type), _) => unit_type,
+        (None, Some(unit_id)) => bank
+            .and_then(|bank| {
+                bank.unit_types()
+                    .into_iter()
+                    .find(|t| bank.unit_ids(*t).contains(&unit_id))
+            })
+            .unwrap_or(primary_type),
+        (None, None) => primary_type,
+    };
+    let unit_id = parsed_id.unwrap_or(primary_id);
+    let reg = RegId::from_hex(register).map_err(|err| format!("invalid register: {err:?}"))?;
+    let mut data = encode_payload(reg, payload).map_err(|err| err.to_string())?;
+    // The zone id is part of the CAN address, not the payload: the codec stamps
+    // wire byte 0 as 0x00, so a zone-bearing write (regs 03/04) addressed by
+    // the client must be stamped here to reach the addressed zone.
+    if is_zone_bearing(reg)
+        && let Some(zone) = zone
+    {
+        data[0] = zone;
+    }
+    Ok(CanRecord {
+        unit_type,
+        dest: Dest::ControlBox,
+        unit_id,
+        reg,
+        data,
+    })
+}
+
 /// `write`: encode the register payload and queue it as a single register
 /// write. Ack is deferred until the engine confirms the frame was transmitted.
 async fn handle_write(
@@ -420,72 +475,23 @@ async fn handle_write(
     pending: &mut PendingAcks,
     msg: WriteRequest,
 ) -> anyhow::Result<()> {
-    let resolved_id = state.snapshot.borrow().as_ref().map_or_else(
-        || state.unit_id_hint.unwrap_or(FEEDER_UNIT_ID),
-        |held| resolve_unit_id(&held.bank, state.unit_id_hint),
-    );
-    let unit_type = match msg.unit_type.map(|s| UnitType::from_hex(&s)).transpose() {
-        Ok(Some(unit_type)) => unit_type,
-        Ok(None) => UnitType::AIRCON,
-        Err(err) => {
-            send_ack(
-                socket,
-                &msg.msg_id,
-                AckStatus::Error,
-                Some(format!("invalid unit_type: {err:?}")),
-            )
-            .await?;
+    // Clone the held snapshot: `watch::Ref` is not `Send`, so the borrow guard
+    // must not span the awaits below.
+    let bank = state.snapshot.borrow().as_ref().cloned();
+    let record = match build_write_record(
+        bank.as_ref().map(|held| &held.bank),
+        state.unit_id_hint,
+        msg.unit_type,
+        msg.unit_id,
+        &msg.register,
+        msg.zone,
+        &msg.payload,
+    ) {
+        Ok(record) => record,
+        Err(reason) => {
+            send_ack(socket, &msg.msg_id, AckStatus::Error, Some(reason)).await?;
             return Ok(());
         }
-    };
-    let unit_id = match msg.unit_id.map(|s| UnitId::from_hex(&s)).transpose() {
-        Ok(Some(unit_id)) => unit_id,
-        Ok(None) => resolved_id,
-        Err(err) => {
-            send_ack(
-                socket,
-                &msg.msg_id,
-                AckStatus::Error,
-                Some(format!("invalid unit_id: {err:?}")),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let reg = match RegId::from_hex(&msg.register) {
-        Ok(reg) => reg,
-        Err(err) => {
-            send_ack(
-                socket,
-                &msg.msg_id,
-                AckStatus::Error,
-                Some(format!("invalid register: {err:?}")),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let mut data = match encode_payload(reg, &msg.payload) {
-        Ok(data) => data,
-        Err(err) => {
-            send_ack(socket, &msg.msg_id, AckStatus::Error, Some(err.to_string())).await?;
-            return Ok(());
-        }
-    };
-    // The zone id is part of the CAN address, not the payload: the codec stamps
-    // wire byte 0 as 0x00, so a zone-bearing write (regs 03/04) addressed by
-    // the client must be stamped here to reach the addressed zone.
-    if is_zone_bearing(reg)
-        && let Some(zone) = msg.zone
-    {
-        data[0] = zone;
-    }
-    let record = CanRecord {
-        unit_type,
-        dest: Dest::ControlBox,
-        unit_id,
-        reg,
-        data,
     };
     let cmd = EngineCmd::WriteRegisters(vec![record]);
     record_spy(state, &cmd).await;
@@ -534,7 +540,7 @@ mod tests {
     use aa_registers::{CanRecord, Dest, RegId, UnitType};
 
     #[test]
-    fn resolve_unit_id_prefers_live_dump_over_feeder_default() {
+    fn primary_unit_prefers_live_dump_over_feeder_default() {
         // Regression: mailbox snapshot used hardcoded abcde while AOA dump was 11111.
         let mut bank = RegisterBank::new();
         let live = UnitId::try_new(0x0_11111).unwrap();
@@ -545,11 +551,195 @@ mod tests {
             reg: RegId::new(0x06),
             data: [0; 7],
         });
-        assert_eq!(resolve_unit_id(&bank, Some(live)), live);
-        assert_eq!(resolve_unit_id(&bank, None), live);
+        assert_eq!(primary_unit(&bank, Some(live)), (UnitType::AIRCON, live));
+        assert_eq!(primary_unit(&bank, None), (UnitType::AIRCON, live));
         // Empty bank still falls back to feeder id (or hint).
         let empty = RegisterBank::new();
-        assert_eq!(resolve_unit_id(&empty, None), FEEDER_UNIT_ID);
-        assert_eq!(resolve_unit_id(&empty, Some(live)), live);
+        assert_eq!(
+            primary_unit(&empty, None),
+            (UnitType::AIRCON, FEEDER_UNIT_ID)
+        );
+        assert_eq!(primary_unit(&empty, Some(live)), (UnitType::AIRCON, live));
+    }
+
+    #[test]
+    fn primary_unit_picks_08_unit_when_bank_has_only_08_records() {
+        let mut bank = RegisterBank::new();
+        let small = UnitId::try_new(0x0_00001).unwrap();
+        let large = UnitId::try_new(0x0_00002).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: large,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: small,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        assert_eq!(primary_unit(&bank, None), (UnitType::new(0x08), small));
+    }
+
+    #[test]
+    fn primary_unit_with_hint_at_08_unit_returns_unit_type_08() {
+        let mut bank = RegisterBank::new();
+        let split = UnitId::try_new(0x0_00042).unwrap();
+        let aircon = UnitId::try_new(0x0_00001).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: split,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: aircon,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        assert_eq!(
+            primary_unit(&bank, Some(split)),
+            (UnitType::new(0x08), split)
+        );
+    }
+
+    /// Raw-hex reg-05 payload (byte-exact passthrough) for write tests.
+    fn write_payload() -> Value {
+        Value::String("01010330000100".to_owned())
+    }
+
+    #[test]
+    fn event_message_shapes_08_unit_record() {
+        // Acceptance (b): an event for an 08-type unit is emitted with
+        // `unit_type: "08"`, the correct `unit_id`, and `zone` for reg 03.
+        let rec = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_0ABCD).unwrap(),
+            reg: RegId::new(0x03),
+            data: [0x02, 0xe4, 0x00, 0x03, 0x00, 0x00, 0x00],
+        };
+        let event = event_message(&rec);
+        let ServerMessage::Event {
+            unit_type,
+            unit_id,
+            register,
+            zone,
+            payload,
+        } = event
+        else {
+            panic!("expected Event message");
+        };
+        assert_eq!(unit_type, "08");
+        assert_eq!(unit_id, "0abcd");
+        assert_eq!(register, "03");
+        assert_eq!(zone, Some(0x02));
+        assert_eq!(payload["open"], true);
+        assert_eq!(payload["damper_pct"], 100);
+
+        // Non-zone 08 record → zone None.
+        let rec = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_0ABCD).unwrap(),
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        };
+        let ServerMessage::Event { zone, .. } = event_message(&rec) else {
+            panic!("expected Event message");
+        };
+        assert_eq!(zone, None);
+    }
+
+    #[test]
+    fn build_write_record_addresses_08_unit() {
+        // Acceptance (c): a write to an 08-type unit produces a setCAN record
+        // with unit type 08.
+        let rec = build_write_record(
+            None,
+            None,
+            Some("08".to_owned()),
+            Some("abcde".to_owned()),
+            "05",
+            None,
+            &write_payload(),
+        )
+        .expect("record");
+        assert_eq!(rec.unit_type, UnitType::new(0x08));
+        assert_eq!(rec.unit_id, UnitId::try_new(0x0_ABCDE).unwrap());
+        assert_eq!(rec.reg, RegId::new(0x05));
+
+        // Omitted unit_type + unit_id present in the bank under type 08 →
+        // resolves type 08.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        let rec = build_write_record(
+            Some(&bank),
+            None,
+            None,
+            Some("abcde".to_owned()),
+            "05",
+            None,
+            &write_payload(),
+        )
+        .expect("record");
+        assert_eq!(rec.unit_type, UnitType::new(0x08));
+        assert_eq!(rec.unit_id, id);
+    }
+
+    #[test]
+    fn build_write_record_defaults_omitted_fields_to_primary() {
+        // Acceptance (d): omitted unit_type/unit_id defaults to the primary
+        // unit on the emitted record.
+        let mut bank = RegisterBank::new();
+        let primary_id = UnitId::try_new(0x0_11111).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: primary_id,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
+
+        // Both omitted → primary (type, id).
+        let rec = build_write_record(Some(&bank), None, None, None, "05", None, &write_payload())
+            .expect("record");
+        assert_eq!(rec.unit_type, UnitType::AIRCON);
+        assert_eq!(rec.unit_id, primary_id);
+
+        // Only unit_id omitted → primary id but explicit type kept.
+        let rec = build_write_record(
+            Some(&bank),
+            None,
+            Some("08".to_owned()),
+            None,
+            "05",
+            None,
+            &write_payload(),
+        )
+        .expect("record");
+        assert_eq!(rec.unit_type, UnitType::new(0x08));
+        assert_eq!(rec.unit_id, primary_id);
+    }
+
+    #[test]
+    fn build_write_record_stamps_zone_for_zone_bearing_register() {
+        let rec = build_write_record(None, None, None, None, "03", Some(2), &write_payload())
+            .expect("record");
+        assert_eq!(rec.reg, RegId::new(0x03));
+        assert_eq!(rec.data[0], 2, "zone must be stamped into wire byte 0");
     }
 }
