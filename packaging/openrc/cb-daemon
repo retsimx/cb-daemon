@@ -13,18 +13,29 @@
 #   #   tmpfs  /var/log  tmpfs  size=128M,mode=0755,nosuid,nodev,noatime  0  0
 #   rc-update add localmount boot
 #   apk add logrotate && cp packaging/logrotate/cb-daemon /etc/logrotate.d/cb-daemon
-#   # Enforce rotation size caps promptly (daily alone lets a debug session
-#   # overrun the tmpfs): run logrotate from the 15-minute periodic too.
-#   cp /etc/periodic/daily/logrotate /etc/periodic/15min/logrotate
+#   # Run logrotate every minute — REQUIRED by the rotation config: copytruncate
+#   # copies the whole log, so the copy must fit in the remaining tmpfs; with
+#   # the 15-minute periodic a debug frame flood (~70 KB/s) grows the log ~60 MB
+#   # between runs, outgrows free space, and deadlocks rotation (ENOSPC)
+#   # permanently. Every minute the worst-case log is ~9 MB.
+#   mkdir -p /etc/periodic/1min
+#   cp /etc/periodic/daily/logrotate /etc/periodic/1min/logrotate
+#   echo '* * * * * run-parts /etc/periodic/1min' >> /etc/crontabs/root
+#   # Remove any earlier copy from /etc/periodic/15min — concurrent runs collide
+#   # on logrotate's state lock (ALERT exit 3 at :00/:15/:30/:45).
+#   rm -f /etc/periodic/15min/logrotate
 #   rc-update add cb-daemon default
 #
 # Control:
 #   rc-service cb-daemon start|stop|restart|status
 #
-# Logs: /var/log/cb-daemon.log (stdout+stderr of the daemon; rotated daily
-# / 5 MB cap with packaging/logrotate/cb-daemon, copytruncate so the running
-# daemon keeps its fd). /var/log is a RAM disk — logs are lost on reboot by
-# design (SD card IOPS / wear reduction).
+# Logs: /var/log/cb-daemon.log (stdout+stderr of the daemon; rotated by
+# packaging/logrotate/cb-daemon — copytruncate keeps the live fd, so rotation
+# never restarts the daemon). /var/log is a RAM disk — logs are lost on reboot
+# by design (SD card IOPS / wear reduction). If /var/log fills anyway (e.g. a
+# trace-level flood), free it with `: > /var/log/cb-daemon.log` — truncation
+# needs no free space — and restart this service so the daemon reopens the log
+# with a fresh offset.
 
 description="Control Box mailbox sync daemon (RS-485 tablet talker)"
 
