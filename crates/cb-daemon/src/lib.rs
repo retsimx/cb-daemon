@@ -10,7 +10,9 @@ mod config;
 mod mock_feeder;
 mod ws;
 
-pub use app::{App, AppHandle, mock_backend_avoids_accessory, run, run_with_listener};
+pub use app::{
+    App, AppHandle, MockLinkCtrl, mock_backend_avoids_accessory, run, run_with_listener,
+};
 pub use config::{
     Backend, CliArgs, Config, EnvOverrides, FileConfig, build_env_filter, init_tracing,
     load_config, load_config_from, resolve_config_path,
