@@ -5,7 +5,7 @@ use aa_link::Link;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::event::{EngineCmd, EngineEvent};
+use crate::event::{EngineCmd, EngineEvent, SessionState};
 use crate::session::Session;
 use crate::wire::is_ping;
 
@@ -34,6 +34,10 @@ impl<L: Link> CbEngine<L> {
         let mut scanner = FrameScanner::new();
         let mut buf = [0u8; 1024];
 
+        let _ = ev_tx
+            .send(EngineEvent::SessionState(SessionState::Negotiating))
+            .await;
+
         loop {
             if session.is_shutdown() {
                 let _ = self.link.close().await;
@@ -42,7 +46,7 @@ impl<L: Link> CbEngine<L> {
 
             tokio::select! {
                 cmd = cmd_rx.recv() => {
-                    if Self::apply_recv_cmd(&mut session, cmd) {
+                    if Self::apply_recv_cmd(&mut session, cmd, &ev_tx).await {
                         let _ = self.link.close().await;
                         return;
                     }
@@ -60,11 +64,21 @@ impl<L: Link> CbEngine<L> {
     }
 
     /// Apply a command from `recv`. Returns `true` when the runner should exit.
-    fn apply_recv_cmd(session: &mut Session, cmd: Option<EngineCmd>) -> bool {
-        cmd.is_none_or(|cmd| {
-            session.apply_cmd(cmd);
-            session.is_shutdown()
-        })
+    async fn apply_recv_cmd(
+        session: &mut Session,
+        cmd: Option<EngineCmd>,
+        ev_tx: &mpsc::Sender<EngineEvent>,
+    ) -> bool {
+        let Some(cmd) = cmd else {
+            return true;
+        };
+        if matches!(cmd, EngineCmd::ResyncMailbox) {
+            let _ = ev_tx
+                .send(EngineEvent::SessionState(SessionState::Resyncing))
+                .await;
+        }
+        session.apply_cmd(cmd);
+        session.is_shutdown()
     }
 
     /// Handle one `link.read` result. Returns `true` when the runner should exit.
@@ -80,6 +94,9 @@ impl<L: Link> CbEngine<L> {
         let n = match result {
             Ok(0) => {
                 let _ = ev_tx
+                    .send(EngineEvent::SessionState(SessionState::LinkDown))
+                    .await;
+                let _ = ev_tx
                     .send(EngineEvent::LinkError(
                         "link EOF (read returned 0); accessory closed or detached".into(),
                     ))
@@ -89,6 +106,9 @@ impl<L: Link> CbEngine<L> {
             }
             Ok(n) => n,
             Err(err) => {
+                let _ = ev_tx
+                    .send(EngineEvent::SessionState(SessionState::LinkDown))
+                    .await;
                 let _ = ev_tx.send(EngineEvent::LinkError(err.to_string())).await;
                 let _ = self.link.close().await;
                 return true;
@@ -130,6 +150,11 @@ impl<L: Link> CbEngine<L> {
         frame: Frame,
     ) -> bool {
         while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, EngineCmd::ResyncMailbox) {
+                let _ = ev_tx
+                    .send(EngineEvent::SessionState(SessionState::Resyncing))
+                    .await;
+            }
             session.apply_cmd(cmd);
         }
         if session.is_shutdown() {
@@ -143,6 +168,9 @@ impl<L: Link> CbEngine<L> {
                 let encoded = Frame { payload }.encode();
                 debug!(frame = %String::from_utf8_lossy(&encoded), "engine TX");
                 if let Err(err) = self.link.write_all(&encoded).await {
+                    let _ = ev_tx
+                        .send(EngineEvent::SessionState(SessionState::LinkDown))
+                        .await;
                     let _ = ev_tx.send(EngineEvent::LinkError(err.to_string())).await;
                     let _ = self.link.close().await;
                     return true;
@@ -159,10 +187,16 @@ impl<L: Link> CbEngine<L> {
         debug!(frame = %String::from_utf8_lossy(&frame.payload), "engine RX");
 
         for event in session.on_frame(&frame.payload) {
+            let is_snapshot = matches!(event, EngineEvent::Snapshot { .. });
             if ev_tx.send(event).await.is_err() {
                 warn!("engine event channel closed; engine exiting");
                 let _ = self.link.close().await;
                 return true;
+            }
+            if is_snapshot {
+                let _ = ev_tx
+                    .send(EngineEvent::SessionState(SessionState::Synced))
+                    .await;
             }
         }
         false
@@ -181,7 +215,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::CbEngine;
-    use crate::event::{EngineCmd, EngineEvent};
+    use crate::event::{EngineCmd, EngineEvent, SessionState};
     use crate::wire::{ACK_CAN, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA};
 
     /// [`MockLink`] shared with tests; `read` waits when inbound is empty (not EOF).
@@ -515,6 +549,144 @@ mod tests {
             }
             other => panic!("expected LinkError, got {other:?}"),
         }
+
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("join")
+            .expect("task");
+    }
+
+    #[tokio::test]
+    async fn session_state_first_event_is_negotiating() {
+        let (link, _mock, _notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        let first = timeout(Duration::from_secs(2), ev_rx.recv())
+            .await
+            .expect("timeout waiting for first event")
+            .expect("event channel closed");
+        assert!(
+            matches!(first, EngineEvent::SessionState(SessionState::Negotiating)),
+            "first event should be SessionState(Negotiating), got {first:?}"
+        );
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    #[tokio::test]
+    async fn session_state_synced_accompanies_snapshot() {
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        negotiate_through_can2(&mock, &notify).await;
+        dump_via_two_phase(&mock, &notify).await;
+        push_frame(&mock, &notify, b"getCAN 1").await;
+        let snap = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
+        assert!(matches!(snap, EngineEvent::Snapshot { .. }));
+        let next = timeout(Duration::from_secs(2), ev_rx.recv())
+            .await
+            .expect("timeout waiting for Synced after Snapshot")
+            .expect("event channel closed");
+        assert!(
+            matches!(next, EngineEvent::SessionState(SessionState::Synced)),
+            "expected SessionState(Synced) right after Snapshot, got {next:?}"
+        );
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    #[tokio::test]
+    async fn session_state_resync_emits_resyncing_before_synced_snapshot() {
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        negotiate_through_can2(&mock, &notify).await;
+        dump_via_two_phase(&mock, &notify).await;
+        push_frame(&mock, &notify, b"getCAN 1").await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
+        let _ = recv_event(&mut ev_rx, |e| {
+            matches!(e, EngineEvent::SessionState(SessionState::Synced))
+        })
+        .await;
+
+        cmd_tx.send(EngineCmd::ResyncMailbox).await.unwrap();
+        let resyncing = recv_event(&mut ev_rx, |e| {
+            matches!(e, EngineEvent::SessionState(SessionState::Resyncing))
+        })
+        .await;
+        assert!(matches!(
+            resyncing,
+            EngineEvent::SessionState(SessionState::Resyncing)
+        ));
+
+        dump_via_two_phase(&mock, &notify).await;
+        push_frame(&mock, &notify, b"getCAN 1").await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
+        let synced = recv_event(&mut ev_rx, |e| {
+            matches!(e, EngineEvent::SessionState(SessionState::Synced))
+        })
+        .await;
+        assert!(matches!(
+            synced,
+            EngineEvent::SessionState(SessionState::Synced)
+        ));
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    #[tokio::test]
+    async fn session_state_link_down_before_link_error() {
+        let mut link = MockLink::new();
+        link.close().await.unwrap();
+
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(1);
+        let (ev_tx, mut ev_rx) = mpsc::channel(4);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        let state = recv_event(&mut ev_rx, |e| {
+            matches!(e, EngineEvent::SessionState(SessionState::LinkDown))
+        })
+        .await;
+        assert!(matches!(
+            state,
+            EngineEvent::SessionState(SessionState::LinkDown)
+        ));
+        let err = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::LinkError(_))).await;
+        assert!(matches!(err, EngineEvent::LinkError(_)));
 
         timeout(Duration::from_secs(2), join)
             .await
