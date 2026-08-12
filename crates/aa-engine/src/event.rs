@@ -7,9 +7,6 @@ use aa_registers::{CanRecord, RegisterBank};
 pub enum EngineCmd {
     /// Enqueue register writes for the next steady-state `setCAN` window.
     WriteRegisters(Vec<CanRecord>),
-    /// Enqueue a raw direct-message write (one-shot poll / command string) for
-    /// the next steady-state ping (aaservice direct-queue parity).
-    WriteDirect(Vec<u8>),
     /// Re-enter the dump path; emits a fresh [`EngineEvent::Snapshot`] when done.
     ResyncMailbox,
     /// Stop the runner and close the link.
@@ -44,8 +41,7 @@ pub enum EngineEvent {
     /// Full mailbox snapshot after dump / resync.
     ///
     /// `can_records` are the CB dump's opaque 25-char hex records for `MyAir5`
-    /// `rawCan` (USB parity). They intentionally exclude daemon-synthesized
-    /// registers such as reg `05` seeded into [`bank`] for typed `system_status`.
+    /// `rawCan` (USB parity).
     Snapshot {
         bank: RegisterBank,
         can_records: Option<Vec<String>>,
@@ -55,8 +51,6 @@ pub enum EngineEvent {
     /// Queued register writes were transmitted in a `setCAN` frame.
     /// Lets the WS bridge defer mailbox acks until the bus actually sent them.
     WriteFlushed,
-    /// Reply to a [`EngineCmd::WriteDirect`] request (non-getCAN CB frame).
-    DirectReply { payload: Vec<u8> },
     /// Session lifecycle state transition; the daemon maps it to a wire
     /// `status` frame (see [`SessionState`]).
     SessionState(SessionState),

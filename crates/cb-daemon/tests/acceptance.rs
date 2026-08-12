@@ -377,7 +377,7 @@ async fn disconnect_isolation() {
 }
 
 #[tokio::test]
-async fn mailbox_update_and_resync_reach_engine() {
+async fn mailbox_write_and_resync_reach_engine() {
     let handle = spawn_daemon().await;
     let mut ws = connect_ws(handle.local_addr()).await;
     let _ = wait_for_type(&mut ws, "snapshot").await;
