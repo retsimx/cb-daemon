@@ -1,0 +1,74 @@
+#!/sbin/openrc-run
+# cb-daemon OpenRC init script — Advantage Air CB mailbox sync daemon.
+#
+# Targets Alpine on the Raspberry Pi Zero W (USB-RS485 TTY backend).
+# The systemd placeholder is retired; this is the Pi service template.
+#
+# Install (as root on the Pi):
+#   cp packaging/openrc/cb-daemon /etc/init.d/cb-daemon
+#   chmod +x /etc/init.d/cb-daemon
+#   cp packaging/cb-daemon.example.toml /etc/cb-daemon/config.toml   # edit backend/device/bind
+#   # RAM-backed logs: /var/log on tmpfs spares the SD card (fstab entry,
+#   # mounted by localmount at boot):
+#   #   tmpfs  /var/log  tmpfs  size=128M,mode=0755,nosuid,nodev,noatime  0  0
+#   rc-update add localmount boot
+#   apk add logrotate && cp packaging/logrotate/cb-daemon /etc/logrotate.d/cb-daemon
+#   # Enforce rotation size caps promptly (daily alone lets a debug session
+#   # overrun the tmpfs): run logrotate from the 15-minute periodic too.
+#   cp /etc/periodic/daily/logrotate /etc/periodic/15min/logrotate
+#   rc-update add cb-daemon default
+#
+# Control:
+#   rc-service cb-daemon start|stop|restart|status
+#
+# Logs: /var/log/cb-daemon.log (stdout+stderr of the daemon; rotated daily
+# / 5 MB cap with packaging/logrotate/cb-daemon, copytruncate so the running
+# daemon keeps its fd). /var/log is a RAM disk — logs are lost on reboot by
+# design (SD card IOPS / wear reduction).
+
+description="Control Box mailbox sync daemon (RS-485 tablet talker)"
+
+CB_DAEMON_BIN="${CB_DAEMON_BIN:-/usr/local/bin/cb-daemon}"
+CB_DAEMON_CONFIG="${CB_DAEMON_CONFIG:-/etc/cb-daemon/config.toml}"
+CB_DAEMON_DEVICE="${CB_DAEMON_DEVICE:-/dev/ttyUSB0}"
+CB_DAEMON_DEVICE_TIMEOUT="${CB_DAEMON_DEVICE_TIMEOUT:-30}"
+CB_DAEMON_LOG="${CB_DAEMON_LOG:-/var/log/cb-daemon.log}"
+
+command="${CB_DAEMON_BIN}"
+command_args="--config ${CB_DAEMON_CONFIG}"
+# supervise-daemon respawns the child if it dies (analogue of systemd
+# Restart=on-failure). Explicit values: respawn_max=0 = unlimited, respawn
+# delay 2s, at most N respawns per respawn_period seconds.
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=0
+respawn_period=1800
+pidfile="/run/${RC_SVCNAME}.pid"
+# Child stdout/stderr → /var/log/cb-daemon.log (rotate with
+# packaging/logrotate/cb-daemon). Without these, supervise-daemon does NOT
+# capture child output on OpenRC 0.63 — logs would be silently lost.
+output_log="${CB_DAEMON_LOG}"
+error_log="${CB_DAEMON_LOG}"
+# NO_COLOR: tracing-subscriber emits ANSI escapes unless told otherwise; the
+# daemon's stderr is a file under supervise-daemon, so strip the codes.
+supervise_daemon_args="--env NO_COLOR=1"
+
+depend() {
+    need net
+    after bootmisc
+}
+
+# The USB-RS485 dongle may enumerate after the network at boot; wait for the
+# device node before starting so the TTY backend can open it.
+start_pre() {
+    local waited=0
+    while [ ! -c "${CB_DAEMON_DEVICE}" ]; do
+        if [ "${waited}" -ge "${CB_DAEMON_DEVICE_TIMEOUT}" ]; then
+            eerror "${CB_DAEMON_DEVICE} not present after ${CB_DAEMON_DEVICE_TIMEOUT}s"
+            return 1
+        fi
+        ewarn "waiting for ${CB_DAEMON_DEVICE}..."
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
