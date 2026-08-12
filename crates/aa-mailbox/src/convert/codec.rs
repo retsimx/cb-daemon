@@ -2,12 +2,16 @@
 //!
 //! Called from the [`super::encode_payload`] / [`super::decode_payload`]
 //! dispatch in the parent module, which owns the shared helpers
-//! (hex / temperature / DTO (de)serialization). Register-specific helpers
-//! (`zone_state_to_wire`, `sensor_uid_to_bytes`, `hex2_to_byte`, the enum byte
-//! mappers) stay here next to their register.
+//! (hex / temperature / DTO (de)serialization). Every register builds/decode
+//! through the [`aa_registers`] typed structs; register-specific helpers
+//! (`zone_state_to_wire`, `sensor_uid_to_bytes`, `hex2_to_byte`, the DTO↔
+//! aa-registers enum mappers) stay here next to their register.
 
 use aa_registers::{
-    Fan, FirmwareStatus, FreshAir, Mode, Power, SensorType, SystemStatus, ZoneConfig, ZoneState,
+    Action, ActivationCode, ActivationStatus as AaActivationStatus, Fan, FirmwareStatus, FreshAir,
+    InfoByte, Mode, Power, RfDeviceCalibration, RfDevicePairing, SensorPairingRead,
+    SensorPairingWrite, SensorType, SystemError, SystemStatus, UnitActivation, UnitAnnouncement,
+    UnitBrand, ZoneConfig, ZoneLimits, ZoneState,
 };
 use serde_json::Value;
 
@@ -48,74 +52,74 @@ pub(super) fn decode_zone_config(data: [u8; 7]) -> Result<Value, EncodeError> {
     })
 }
 
-// --- Reg 02: unit activation (direct codec) ---------------------------------
+// --- Reg 02: unit activation (aa-registers `UnitActivation`) ----------------
 //
 // Wire: [unit_type][activation_status][dict_fw_major][dict_fw_minor][0][0][0].
-// `unit_type` byte mapping is not normative in issue #27; see module docs.
+// `unit_type` wire values are normative from aa_interop (`0x11`/`0x12`/`0x13`/
+// `0x19`, via the `UnitBrand` enum); see module docs.
 
 pub(super) fn encode_unit_activation(payload: &Value) -> Result<[u8; 7], EncodeError> {
     check_enum::<UnitTypeEnum>("unit_type", payload)?;
     check_enum::<ActivationStatus>("activation_status", payload)?;
     let dto: UnitActivationDto = deserialize_payload(payload)?;
-    Ok([
-        unit_type_to_byte(dto.unit_type),
-        activation_status_to_byte(dto.activation_status),
-        dto.dict_fw_major,
-        dto.dict_fw_minor,
-        0,
-        0,
-        0,
-    ])
+    Ok(UnitActivation {
+        unit_type: unit_brand_to_aa(dto.unit_type),
+        activation_status: activation_status_to_aa(dto.activation_status),
+        dict_fw_major: dto.dict_fw_major,
+        dict_fw_minor: dto.dict_fw_minor,
+    }
+    .into())
 }
 
 pub(super) fn decode_unit_activation(data: [u8; 7]) -> Result<Value, EncodeError> {
-    let Some(unit_type) = unit_type_from_byte(data[0]) else {
+    let activation = UnitActivation::from(data);
+    let Some(unit_type) = unit_brand_from_aa(activation.unit_type) else {
         return Ok(Value::String(bytes_to_hex(data)));
     };
-    let Some(activation_status) = activation_status_from_byte(data[1]) else {
+    let Some(activation_status) = activation_status_from_aa(activation.activation_status) else {
         return Ok(Value::String(bytes_to_hex(data)));
     };
     dto_to_value(&UnitActivationDto {
         unit_type,
         activation_status,
-        dict_fw_major: data[2],
-        dict_fw_minor: data[3],
+        dict_fw_major: activation.dict_fw_major,
+        dict_fw_minor: activation.dict_fw_minor,
     })
 }
 
-const fn unit_type_to_byte(unit_type: UnitTypeEnum) -> u8 {
+const fn unit_brand_to_aa(unit_type: UnitTypeEnum) -> UnitBrand {
     match unit_type {
-        UnitTypeEnum::Daikin => 0x00,
-        UnitTypeEnum::Panasonic => 0x01,
-        UnitTypeEnum::Fujitsu => 0x02,
-        UnitTypeEnum::SamsungDvm => 0x03,
+        UnitTypeEnum::Daikin => UnitBrand::Daikin,
+        UnitTypeEnum::Panasonic => UnitBrand::Panasonic,
+        UnitTypeEnum::Fujitsu => UnitBrand::Fujitsu,
+        UnitTypeEnum::SamsungDvm => UnitBrand::SamsungDvm,
     }
 }
 
-const fn unit_type_from_byte(byte: u8) -> Option<UnitTypeEnum> {
-    match byte {
-        0x00 => Some(UnitTypeEnum::Daikin),
-        0x01 => Some(UnitTypeEnum::Panasonic),
-        0x02 => Some(UnitTypeEnum::Fujitsu),
-        0x03 => Some(UnitTypeEnum::SamsungDvm),
-        _ => None,
+const fn unit_brand_from_aa(unit_type: UnitBrand) -> Option<UnitTypeEnum> {
+    match unit_type {
+        UnitBrand::Daikin => Some(UnitTypeEnum::Daikin),
+        UnitBrand::Panasonic => Some(UnitTypeEnum::Panasonic),
+        UnitBrand::Fujitsu => Some(UnitTypeEnum::Fujitsu),
+        UnitBrand::SamsungDvm => Some(UnitTypeEnum::SamsungDvm),
+        UnitBrand::Unknown(_) => None,
     }
 }
 
-const fn activation_status_to_byte(status: ActivationStatus) -> u8 {
+const fn activation_status_to_aa(status: ActivationStatus) -> AaActivationStatus {
     match status {
-        ActivationStatus::NoCode => 0x00,
-        ActivationStatus::CodeEnabled => 0x01,
-        ActivationStatus::Expired => 0x02,
+        ActivationStatus::NoCode => AaActivationStatus::NoCode,
+        ActivationStatus::CodeEnabled => AaActivationStatus::CodeEnabled,
+        ActivationStatus::Expired => AaActivationStatus::Expired,
     }
 }
 
-const fn activation_status_from_byte(byte: u8) -> Option<ActivationStatus> {
-    match byte {
-        0x00 => Some(ActivationStatus::NoCode),
-        0x01 => Some(ActivationStatus::CodeEnabled),
-        0x02 => Some(ActivationStatus::Expired),
-        _ => None,
+const fn activation_status_from_aa(status: AaActivationStatus) -> Option<ActivationStatus> {
+    match status {
+        AaActivationStatus::NoCode => Some(ActivationStatus::NoCode),
+        AaActivationStatus::CodeEnabled => Some(ActivationStatus::CodeEnabled),
+        AaActivationStatus::Expired => Some(ActivationStatus::Expired),
+        AaActivationStatus::Unknown(_) => None,
     }
 }
 
@@ -181,7 +185,7 @@ const fn sensor_type_from_aa(sensor: SensorType) -> Option<SensorTypeEnum> {
     }
 }
 
-// --- Reg 04: zone limits (direct codec) -------------------------------------
+// --- Reg 04: zone limits (aa-registers `ZoneLimits`) ------------------------
 //
 // Wire: [zone][min_damper][max_damper][motion_status][motion_config]
 //       [zone_error][rssi]. Zone byte `0x00` on encode (same address
@@ -189,25 +193,27 @@ const fn sensor_type_from_aa(sensor: SensorType) -> Option<SensorTypeEnum> {
 
 pub(super) fn encode_zone_limits(payload: &Value) -> Result<[u8; 7], EncodeError> {
     let dto: ZoneLimitsDto = deserialize_payload(payload)?;
-    Ok([
-        0x00,
-        dto.min_damper,
-        dto.max_damper,
-        dto.motion_status,
-        dto.motion_config,
-        dto.zone_error,
-        dto.rssi,
-    ])
+    Ok(ZoneLimits {
+        zone: 0x00,
+        min_damper: dto.min_damper,
+        max_damper: dto.max_damper,
+        motion_status: dto.motion_status,
+        motion_config: dto.motion_config,
+        zone_error: dto.zone_error,
+        rssi: dto.rssi,
+    }
+    .into())
 }
 
 pub(super) fn decode_zone_limits(data: [u8; 7]) -> Result<Value, EncodeError> {
+    let limits = ZoneLimits::from(data);
     dto_to_value(&ZoneLimitsDto {
-        min_damper: data[1],
-        max_damper: data[2],
-        motion_status: data[3],
-        motion_config: data[4],
-        zone_error: data[5],
-        rssi: data[6],
+        min_damper: limits.min_damper,
+        max_damper: limits.max_damper,
+        motion_status: limits.motion_status,
+        motion_config: limits.motion_config,
+        zone_error: limits.zone_error,
+        rssi: limits.rssi,
     })
 }
 
@@ -345,10 +351,11 @@ pub(super) fn decode_firmware(data: [u8; 7]) -> Result<Value, EncodeError> {
     })
 }
 
-// --- Reg 08: system error (direct codec) ------------------------------------
+// --- Reg 08: system error (aa-registers `SystemError`) ----------------------
 //
-// Wire: [5 ASCII][00][00]. Encode requires exactly 5 ASCII chars; decode reads
-// 5 chars and trims trailing NULs/spaces.
+// Wire: [5 ASCII][00][00]. The typed struct keeps the raw 5 bytes untrimmed;
+// the codec enforces exactly 5 ASCII chars on encode and trims trailing
+// NULs/spaces for the DTO on decode.
 
 pub(super) fn encode_system_error(payload: &Value) -> Result<[u8; 7], EncodeError> {
     let dto: SystemErrorDto = deserialize_payload(payload)?;
@@ -358,14 +365,15 @@ pub(super) fn encode_system_error(payload: &Value) -> Result<[u8; 7], EncodeErro
             dto.error_code
         )));
     }
-    let mut data = [0u8; 7];
-    data[..5].copy_from_slice(dto.error_code.as_bytes());
-    Ok(data)
+    let mut raw = [0u8; 5];
+    raw.copy_from_slice(dto.error_code.as_bytes());
+    Ok(SystemError { error_code: raw }.into())
 }
 
 pub(super) fn decode_system_error(data: [u8; 7]) -> Result<Value, EncodeError> {
+    let error = SystemError::from(data);
     let mut code = String::with_capacity(5);
-    for &byte in &data[..5] {
+    for &byte in &error.error_code {
         code.push(char::from(byte));
     }
     dto_to_value(&SystemErrorDto {
@@ -373,10 +381,12 @@ pub(super) fn decode_system_error(data: [u8; 7]) -> Result<Value, EncodeError> {
     })
 }
 
-// --- Reg 09: activation code (direct codec) ---------------------------------
+// --- Reg 09: activation code (aa-registers `ActivationCode`) ----------------
 //
 // Wire: [action][code_hi][code_lo][days][0][0][0]. `unlock_code` is a 4-char
-// hex string; `"A1B2"` → bytes `0xA1`, `0xB2`.
+// hex string; `"A1B2"` → bytes `0xA1`, `0xB2`. `action` wire values are
+// normative from aa_interop (`1` = set code, `2` = unlock, via the `Action`
+// enum).
 
 pub(super) fn encode_activation_code(payload: &Value) -> Result<[u8; 7], EncodeError> {
     check_enum::<ActionEnum>("action", payload)?;
@@ -384,22 +394,26 @@ pub(super) fn encode_activation_code(payload: &Value) -> Result<[u8; 7], EncodeE
     if dto.unlock_code.len() != 4 || !dto.unlock_code.is_ascii() {
         return Err(EncodeError::BadHex(dto.unlock_code));
     }
-    let mut data = [0u8; 7];
-    data[0] = action_to_byte(dto.action);
-    data[1] = hex2_to_byte(&dto.unlock_code[..2])?;
-    data[2] = hex2_to_byte(&dto.unlock_code[2..])?;
-    data[3] = dto.activation_days;
-    Ok(data)
+    Ok(ActivationCode {
+        action: action_to_aa(dto.action),
+        unlock_code: [
+            hex2_to_byte(&dto.unlock_code[..2])?,
+            hex2_to_byte(&dto.unlock_code[2..])?,
+        ],
+        activation_days: dto.activation_days,
+    }
+    .into())
 }
 
 pub(super) fn decode_activation_code(data: [u8; 7]) -> Result<Value, EncodeError> {
-    let Some(action) = action_from_byte(data[0]) else {
+    let code = ActivationCode::from(data);
+    let Some(action) = action_from_aa(code.action) else {
         return Ok(Value::String(bytes_to_hex(data)));
     };
     dto_to_value(&ActivationCodeDto {
         action,
-        unlock_code: slice_to_hex(&data[1..3]),
-        activation_days: data[3],
+        unlock_code: slice_to_hex(&code.unlock_code),
+        activation_days: code.activation_days,
     })
 }
 
@@ -415,22 +429,22 @@ fn hex2_to_byte(s: &str) -> Result<u8, EncodeError> {
     Ok((hi << 4) | lo)
 }
 
-const fn action_to_byte(action: ActionEnum) -> u8 {
+const fn action_to_aa(action: ActionEnum) -> Action {
     match action {
-        ActionEnum::SetCode => 0x00,
-        ActionEnum::Unlock => 0x01,
+        ActionEnum::SetCode => Action::SetCode,
+        ActionEnum::Unlock => Action::Unlock,
     }
 }
 
-const fn action_from_byte(byte: u8) -> Option<ActionEnum> {
-    match byte {
-        0x00 => Some(ActionEnum::SetCode),
-        0x01 => Some(ActionEnum::Unlock),
-        _ => None,
+const fn action_from_aa(action: Action) -> Option<ActionEnum> {
+    match action {
+        Action::SetCode => Some(ActionEnum::SetCode),
+        Action::Unlock => Some(ActionEnum::Unlock),
+        Action::Unknown(_) => None,
     }
 }
 
-// --- Reg 0a: unit announcement (direct codec) --------------------------------
+// --- Reg 0a: unit announcement (aa-registers `UnitAnnouncement`) -------------
 //
 // Empty payload: encode → all zeros, decode → `{}`.
 
@@ -438,17 +452,19 @@ pub(super) fn encode_unit_announcement(payload: &Value) -> Result<[u8; 7], Encod
     // Validate the payload is a JSON object (empty DTO — the register carries
     // no fields); the wire bytes are all zero.
     deserialize_payload::<UnitAnnouncementDto>(payload)?;
-    Ok([0; 7])
+    Ok(UnitAnnouncement {}.into())
 }
 
-pub(super) fn decode_unit_announcement(_data: [u8; 7]) -> Result<Value, EncodeError> {
+pub(super) fn decode_unit_announcement(data: [u8; 7]) -> Result<Value, EncodeError> {
+    let _announcement = UnitAnnouncement::from(data);
     dto_to_value(&UnitAnnouncementDto {})
 }
 
-// --- Reg 12: sensor pairing (direct codec) ----------------------------------
+// --- Reg 12: sensor pairing (aa-registers `SensorPairingRead`/`Write`) ------
 //
 // Read wire:  [uid 3B][info][rev][0][0]; write wire: [uid 3B][zone][0][0][0].
-// Read vs write shape disambiguation is documented in the module docs.
+// Pairing is info byte bit 6 (`0x40`) on the read shape. Read vs write shape
+// disambiguation is documented in the module docs.
 
 pub(super) fn encode_sensor_pairing(payload: &Value) -> Result<[u8; 7], EncodeError> {
     // Read shape wins when both shapes could match: the read DTO carries
@@ -462,25 +478,28 @@ pub(super) fn encode_sensor_pairing(payload: &Value) -> Result<[u8; 7], EncodeEr
 }
 
 fn encode_sensor_pairing_read(dto: &SensorPairingDto) -> Result<[u8; 7], EncodeError> {
-    let mut data = [0u8; 7];
-    data[..3].copy_from_slice(&sensor_uid_to_bytes(&dto.sensor_uid)?);
-    data[3] = u8::from(dto.pairing);
-    data[4] = dto.sensor_rev;
-    Ok(data)
+    Ok(SensorPairingRead {
+        sensor_uid: sensor_uid_to_bytes(&dto.sensor_uid)?,
+        info_byte: if dto.pairing { 0x40 } else { 0x00 },
+        sensor_rev: dto.sensor_rev,
+    }
+    .into())
 }
 
 fn encode_sensor_pairing_write(dto: &SensorPairingWriteDto) -> Result<[u8; 7], EncodeError> {
-    let mut data = [0u8; 7];
-    data[..3].copy_from_slice(&sensor_uid_to_bytes(&dto.sensor_uid)?);
-    data[3] = dto.zone;
-    Ok(data)
+    Ok(SensorPairingWrite {
+        sensor_uid: sensor_uid_to_bytes(&dto.sensor_uid)?,
+        zone: dto.zone,
+    }
+    .into())
 }
 
 pub(super) fn decode_sensor_pairing(data: [u8; 7]) -> Result<Value, EncodeError> {
+    let read = SensorPairingRead::from(data);
     dto_to_value(&SensorPairingDto {
-        sensor_uid: slice_to_hex(&data[..3]),
-        pairing: data[3] != 0,
-        sensor_rev: data[4],
+        sensor_uid: slice_to_hex(&read.sensor_uid),
+        pairing: (read.info_byte & 0x40) != 0,
+        sensor_rev: read.sensor_rev,
     })
 }
 
@@ -504,64 +523,69 @@ fn sensor_uid_to_bytes(uid: &str) -> Result<[u8; 3], EncodeError> {
     Ok(out)
 }
 
-// --- Reg 13: info byte (direct codec) ---------------------------------------
+// --- Reg 13: info byte (aa-registers `InfoByte`) ----------------------------
+//
+// The DTO exposes only `info_byte`; the typed struct preserves the 6 trailing
+// bytes byte-exact (encode stamps them `0x00` — the DTO carries no values for
+// them).
 
 pub(super) fn encode_info_byte(payload: &Value) -> Result<[u8; 7], EncodeError> {
     let dto: InfoByteDto = deserialize_payload(payload)?;
-    let mut data = [0u8; 7];
-    data[0] = dto.info_byte;
-    Ok(data)
+    Ok(InfoByte {
+        info_byte: dto.info_byte,
+        rest: [0; 6],
+    }
+    .into())
 }
 
 pub(super) fn decode_info_byte(data: [u8; 7]) -> Result<Value, EncodeError> {
-    dto_to_value(&InfoByteDto { info_byte: data[0] })
-}
-
-// --- Reg 26: RF device pairing (direct codec) --------------------------------
-
-pub(super) fn encode_rf_device_pairing(payload: &Value) -> Result<[u8; 7], EncodeError> {
-    let dto: RfDevicePairingDto = deserialize_payload(payload)?;
-    Ok([
-        dto.pairing_control,
-        dto.rf_device_type,
-        dto.zone_channel,
-        0,
-        0,
-        0,
-        0,
-    ])
-}
-
-pub(super) fn decode_rf_device_pairing(data: [u8; 7]) -> Result<Value, EncodeError> {
-    dto_to_value(&RfDevicePairingDto {
-        pairing_control: data[0],
-        rf_device_type: data[1],
-        zone_channel: data[2],
+    let info = InfoByte::from(data);
+    dto_to_value(&InfoByteDto {
+        info_byte: info.info_byte,
     })
 }
 
-// --- Reg 27: RF device calibration (direct codec) ----------------------------
+// --- Reg 26: RF device pairing (aa-registers `RfDevicePairing`) --------------
+
+pub(super) fn encode_rf_device_pairing(payload: &Value) -> Result<[u8; 7], EncodeError> {
+    let dto: RfDevicePairingDto = deserialize_payload(payload)?;
+    Ok(RfDevicePairing {
+        pairing_control: dto.pairing_control,
+        rf_device_type: dto.rf_device_type,
+        zone_channel: dto.zone_channel,
+    }
+    .into())
+}
+
+pub(super) fn decode_rf_device_pairing(data: [u8; 7]) -> Result<Value, EncodeError> {
+    let pairing = RfDevicePairing::from(data);
+    dto_to_value(&RfDevicePairingDto {
+        pairing_control: pairing.pairing_control,
+        rf_device_type: pairing.rf_device_type,
+        zone_channel: pairing.zone_channel,
+    })
+}
+
+// --- Reg 27: RF device calibration (aa-registers `RfDeviceCalibration`) ------
 //
 // Wire order is channel BEFORE position: [calibration_control][channel]
 // [up_down_position][0][0][0][0].
 
 pub(super) fn encode_rf_device_calibration(payload: &Value) -> Result<[u8; 7], EncodeError> {
     let dto: RfDeviceCalibrationDto = deserialize_payload(payload)?;
-    Ok([
-        dto.calibration_control,
-        dto.channel,
-        dto.up_down_position,
-        0,
-        0,
-        0,
-        0,
-    ])
+    Ok(RfDeviceCalibration {
+        calibration_control: dto.calibration_control,
+        channel: dto.channel,
+        up_down_position: dto.up_down_position,
+    }
+    .into())
 }
 
 pub(super) fn decode_rf_device_calibration(data: [u8; 7]) -> Result<Value, EncodeError> {
+    let calibration = RfDeviceCalibration::from(data);
     dto_to_value(&RfDeviceCalibrationDto {
-        calibration_control: data[0],
-        channel: data[1],
-        up_down_position: data[2],
+        calibration_control: calibration.calibration_control,
+        channel: calibration.channel,
+        up_down_position: calibration.up_down_position,
     })
 }
