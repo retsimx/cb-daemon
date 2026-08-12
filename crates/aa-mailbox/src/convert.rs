@@ -15,11 +15,12 @@
 //!
 //! The codec is hybrid by design (design D-1):
 //!
-//! - Regs `01`/`03`/`05`/`06` reuse the [`aa_registers`] typed structs
-//!   (`ZoneConfig` / `ZoneState` / `SystemStatus` / `FirmwareStatus`) and their
-//!   existing `From<[u8; 7]>` / `Into<[u8; 7]>` impls.
-//! - Regs `02`/`04`/`08`/`09`/`0a`/`12`/`13`/`26`/`27` use direct byte codecs
-//!   per the normative wire layouts.
+//! - Every catalogued register (`01`–`06`, `08`–`0a`, `12`, `13`, `26`, `27`)
+//!   routes through the [`aa_registers`] typed structs (`ZoneConfig` /
+//!   `UnitActivation` / `ZoneState` / `ZoneLimits` / `SystemStatus` /
+//!   `FirmwareStatus` / `SystemError` / `ActivationCode` / `UnitAnnouncement` /
+//!   `SensorPairingRead`/`SensorPairingWrite` / `InfoByte` / `RfDevicePairing` /
+//!   `RfDeviceCalibration`) and their `From<[u8; 7]>` / `Into<[u8; 7]>` impls.
 //! - Unknown registers have no DTO and only support raw-hex passthrough.
 //!
 //! # Zone bytes (`03`, `04`)
@@ -39,14 +40,17 @@
 //! `03` sensor type, `05` power/mode/fan/fresh-air, `09` action) — falls back
 //! to the raw 14-char lowercase hex string instead of a lossy typed object.
 //!
-//! # Documented wire enum mappings (not normative in issue #27)
+//! # Documented wire enum mappings (normative from `aa_interop`)
 //!
-//! - Reg `02` `unit_type`: `daikin`=0, `panasonic`=1, `fujitsu`=2,
-//!   `samsung_dvm`=3. This register is read-only per the epic write policy, but
-//!   the codec still supports decode.
+//! - Reg `02` `unit_type`: `daikin`=0x11, `panasonic`=0x12, `fujitsu`=0x13,
+//!   `samsung_dvm`=0x19 (via the [`aa_registers::UnitBrand`] enum). This
+//!   register is read-only per the epic write policy, but the codec still
+//!   supports decode.
 //! - Reg `02` `activation_status`: `no_code`=0, `code_enabled`=1, `expired`=2.
-//! - Reg `09` `action`: `set_code`=0, `unlock`=1.
-//! - Reg `12` pairing byte: `true`=1, `false`=0 (read shape byte 3).
+//! - Reg `09` `action`: `set_code`=1, `unlock`=2 (via the
+//!   [`aa_registers::Action`] enum).
+//! - Reg `12` pairing: bit 6 (`0x40`) of byte 3 (the read shape's info byte);
+//!   any byte with bit 6 unset decodes to `pairing: false`.
 //! - Reg `05` `fresh_air`: DTO `true` → `FreshAir::On` (`0x02`), `false` →
 //!   `FreshAir::Off` (`0x01`). Decode maps `On` → `true` and `Off`/`None`
 //!   (`0x00`, "no fresh-air hardware") → `false` — `None` cannot be represented
@@ -55,11 +59,13 @@
 //! # Reg `12` read vs write shape
 //!
 //! The wire layouts differ only in byte 3 semantics (`info` vs `zone`) and byte
-//! 4 (`rev` vs `0`), which are not distinguishable from the bytes alone. Encode
-//! tries the read shape ([`SensorPairingDto`], carries `pairing`/`sensor_rev`)
-//! first and falls back to the write shape ([`SensorPairingWriteDto`], carries
-//! `zone`); a payload that matches both is treated as a read. Decode always
-//! returns the read shape — a write echo's zone is not recoverable.
+//! 4 (`rev` vs `0`), which are not distinguishable from the bytes alone. On the
+//! read shape byte 3 is the raw info byte with bit 6 (`0x40`) meaning
+//! "pairing requested" (see the wire enum mappings above). Encode tries the
+//! read shape ([`SensorPairingDto`], carries `pairing`/`sensor_rev`) first and
+//! falls back to the write shape ([`SensorPairingWriteDto`], carries `zone`);
+//! a payload that matches both is treated as a read. Decode always returns the
+//! read shape — a write echo's zone is not recoverable.
 
 mod codec;
 

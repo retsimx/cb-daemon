@@ -29,6 +29,7 @@ pub mod convert;
 pub mod dto;
 pub mod error;
 pub mod message;
+pub mod policy;
 
 pub use convert::{decode_payload, encode_payload, event_body, snapshot_units};
 pub use dto::{
@@ -39,3 +40,4 @@ pub use dto::{
 };
 pub use error::EncodeError;
 pub use message::{ClientMessage, ServerMessage};
+pub use policy::{PolicyMode, WritePolicy, write_policy};

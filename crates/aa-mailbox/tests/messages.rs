@@ -49,7 +49,7 @@ fn reg02_unit_activation_round_trip() {
             "dict_fw_major": 2,
             "dict_fw_minor": 3,
         }),
-        [0x01, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00],
+        [0x12, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00],
     );
 }
 
@@ -140,7 +140,7 @@ fn reg09_activation_code_round_trip() {
             "unlock_code": "a1b2",
             "activation_days": 30,
         }),
-        [0x00, 0xa1, 0xb2, 0x1e, 0x00, 0x00, 0x00],
+        [0x01, 0xa1, 0xb2, 0x1e, 0x00, 0x00, 0x00],
     );
 }
 
@@ -151,7 +151,7 @@ fn reg09_activation_code_uppercase_normalized() {
         &json!({ "action": "unlock", "unlock_code": "A1B2", "activation_days": 7 }),
     )
     .unwrap();
-    assert_eq!(bytes, [0x01, 0xa1, 0xb2, 0x07, 0x00, 0x00, 0x00]);
+    assert_eq!(bytes, [0x02, 0xa1, 0xb2, 0x07, 0x00, 0x00, 0x00]);
     let decoded = decode_payload(RegId::new(0x09), bytes).unwrap();
     assert_eq!(
         decoded,
@@ -166,6 +166,7 @@ fn reg0a_unit_announcement_round_trip() {
 
 #[test]
 fn reg12_sensor_pairing_read_round_trip() {
+    // Pairing is info byte bit 6 (0x40) on the read shape.
     assert_wire_round_trip(
         RegId::new(0x12),
         &json!({
@@ -173,7 +174,7 @@ fn reg12_sensor_pairing_read_round_trip() {
             "pairing": true,
             "sensor_rev": 5,
         }),
-        [0x01, 0x61, 0x3d, 0x01, 0x05, 0x00, 0x00],
+        [0x01, 0x61, 0x3d, 0x40, 0x05, 0x00, 0x00],
     );
 }
 
@@ -186,11 +187,12 @@ fn reg12_sensor_pairing_write_encode_path() {
     .unwrap();
     assert_eq!(bytes, [0x01, 0x61, 0x3d, 0x02, 0x00, 0x00, 0x00]);
     // Decode always returns the read shape; a write echo's zone is not
-    // recoverable from the bytes (documented codec behaviour).
+    // recoverable from the bytes (documented codec behaviour). The echo byte
+    // `0x02` has bit 6 unset, so pairing decodes to false.
     let decoded = decode_payload(RegId::new(0x12), bytes).unwrap();
     assert_eq!(
         decoded,
-        json!({ "sensor_uid": "01613d", "pairing": true, "sensor_rev": 0 })
+        json!({ "sensor_uid": "01613d", "pairing": false, "sensor_rev": 0 })
     );
 }
 
@@ -471,7 +473,8 @@ fn enum_activation_status_bytes() {
 
 #[test]
 fn enum_action_bytes() {
-    let cases = [("set_code", 0x00), ("unlock", 0x01)];
+    // Normative from aa_interop: set_code=1, unlock=2.
+    let cases = [("set_code", 0x01), ("unlock", 0x02)];
     for (wire, byte) in cases {
         let payload = json!({
             "action": wire,
@@ -487,12 +490,13 @@ fn enum_action_bytes() {
 
 #[test]
 fn enum_unit_type_bytes() {
-    // Documented mapping (non-normative in issue #27, but codec-supported).
+    // Normative from aa_interop: daikin=0x11, panasonic=0x12, fujitsu=0x13,
+    // samsung_dvm=0x19.
     let cases = [
-        ("daikin", 0x00),
-        ("panasonic", 0x01),
-        ("fujitsu", 0x02),
-        ("samsung_dvm", 0x03),
+        ("daikin", 0x11),
+        ("panasonic", 0x12),
+        ("fujitsu", 0x13),
+        ("samsung_dvm", 0x19),
     ];
     for (wire, byte) in cases {
         let payload = json!({
@@ -506,6 +510,104 @@ fn enum_unit_type_bytes() {
         let decoded = decode_payload(RegId::new(0x02), bytes).unwrap();
         assert_eq!(decoded["unit_type"], wire, "unit_type={wire} decode");
     }
+}
+
+// --- 3b. Typed-struct routing + corrected wire semantics --------------------
+
+#[test]
+fn reg02_unknown_unit_type_falls_back_to_raw_hex() {
+    // Unit type byte 0x7f is outside the aa-registers UnitBrand enum: decode
+    // falls back to the raw lowercase hex string instead of a lossy typed DTO.
+    let decoded =
+        decode_payload(RegId::new(0x02), [0x7f, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00]).unwrap();
+    assert_eq!(decoded, json!("7f010203000000"));
+}
+
+#[test]
+fn reg02_unknown_activation_status_falls_back_to_raw_hex() {
+    let decoded =
+        decode_payload(RegId::new(0x02), [0x11, 0x7f, 0x02, 0x03, 0x00, 0x00, 0x00]).unwrap();
+    assert_eq!(decoded, json!("117f0203000000"));
+}
+
+#[test]
+fn reg09_unknown_action_falls_back_to_raw_hex() {
+    let decoded =
+        decode_payload(RegId::new(0x09), [0x7f, 0xab, 0xcd, 0x00, 0x00, 0x00, 0x00]).unwrap();
+    assert_eq!(decoded, json!("7fabcd00000000"));
+}
+
+#[test]
+fn reg12_pairing_bit6_semantics() {
+    // pairing: true -> info byte 0x40 (bit 6), decode back to true.
+    let bytes = encode_payload(
+        RegId::new(0x12),
+        &json!({ "sensor_uid": "01613d", "pairing": true, "sensor_rev": 5 }),
+    )
+    .unwrap();
+    assert_eq!(bytes, [0x01, 0x61, 0x3d, 0x40, 0x05, 0x00, 0x00]);
+    assert_eq!(
+        decode_payload(RegId::new(0x12), bytes).unwrap(),
+        json!({ "sensor_uid": "01613d", "pairing": true, "sensor_rev": 5 })
+    );
+
+    // pairing: false -> info byte 0x00, decode back to false.
+    let bytes = encode_payload(
+        RegId::new(0x12),
+        &json!({ "sensor_uid": "01613d", "pairing": false, "sensor_rev": 5 }),
+    )
+    .unwrap();
+    assert_eq!(bytes, [0x01, 0x61, 0x3d, 0x00, 0x05, 0x00, 0x00]);
+    assert_eq!(
+        decode_payload(RegId::new(0x12), bytes).unwrap(),
+        json!({ "sensor_uid": "01613d", "pairing": false, "sensor_rev": 5 })
+    );
+
+    // A non-zero info byte with bit 6 unset (0x04) still decodes to
+    // pairing: false — pairing is bit 6, not "byte != 0".
+    assert_eq!(
+        decode_payload(RegId::new(0x12), [0x01, 0x61, 0x3d, 0x04, 0x05, 0x00, 0x00]).unwrap(),
+        json!({ "sensor_uid": "01613d", "pairing": false, "sensor_rev": 5 })
+    );
+    // 0x41 has bit 6 (0x40) set among other info flags -> pairing: true.
+    assert_eq!(
+        decode_payload(RegId::new(0x12), [0x01, 0x61, 0x3d, 0x41, 0x05, 0x00, 0x00]).unwrap(),
+        json!({ "sensor_uid": "01613d", "pairing": true, "sensor_rev": 5 })
+    );
+}
+
+#[test]
+fn reg08_error_code_trims_trailing_nul_and_space() {
+    // Wire NUL/space padding decodes to a trimmed error code; the typed struct
+    // keeps the raw 5 bytes on the way in, the DTO layer trims.
+    assert_eq!(
+        decode_payload(RegId::new(0x08), [b'A', b'A', b'1', 0x00, 0x00, 0x00, 0x00]).unwrap(),
+        json!({ "error_code": "AA1" })
+    );
+    assert_eq!(
+        decode_payload(RegId::new(0x08), [b'A', b'A', b'1', b' ', b' ', 0x00, 0x00]).unwrap(),
+        json!({ "error_code": "AA1" })
+    );
+    // A padded 5-char code round-trips through encode (5 ASCII chars required).
+    let bytes = encode_payload(RegId::new(0x08), &json!({ "error_code": "AA1  " })).unwrap();
+    assert_eq!(bytes, [b'A', b'A', b'1', b' ', b' ', 0x00, 0x00]);
+    assert_eq!(
+        decode_payload(RegId::new(0x08), bytes).unwrap(),
+        json!({ "error_code": "AA1" })
+    );
+}
+
+#[test]
+fn reg13_decode_preserves_trailing_bytes() {
+    // The typed struct preserves the 6 trailing bytes byte-exact on decode;
+    // the DTO only exposes info_byte, so re-encoding stamps the rest as zeros.
+    let decoded =
+        decode_payload(RegId::new(0x13), [0x07, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).unwrap();
+    assert_eq!(decoded, json!({ "info_byte": 7 }));
+    assert_eq!(
+        encode_payload(RegId::new(0x13), &decoded).unwrap(),
+        [0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
 }
 
 // --- 4. Golden JSON message shapes ------------------------------------------
