@@ -1,28 +1,28 @@
-//! Northbound mailbox JSON schemas and `RegisterBank` ↔ JSON converters.
+//! Northbound protocol message types and typed register DTOs.
 //!
-//! This crate owns serde message enums and pure conversion helpers used by the
-//! WebSocket adapter layer. It does **not** bind TCP/WS.
+//! This crate owns serde message enums and the typed DTOs for every register in
+//! the catalog. It does **not** bind TCP/WS.
 //!
 //! # Message shapes
 //!
 //! Server → client examples:
 //!
 //! ```json
-#![doc = include_str!("../tests/fixtures/mailbox_snapshot.json")]
+//! {"type":"snapshot","units":[{"unit_type":"07","unit_id":"11111","registers":{}}]}
 //! ```
 //!
 //! ```json
-#![doc = include_str!("../tests/fixtures/mailbox_event.json")]
+//! {"type":"event","unit_type":"07","unit_id":"11111","register":"05","payload":{...}}
 //! ```
 //!
 //! Client → server examples:
 //!
 //! ```json
-#![doc = include_str!("../tests/fixtures/mailbox_update.json")]
+//! {"type":"write","msg_id":"1","register":"05","payload":{...}}
 //! ```
 //!
 //! ```json
-#![doc = include_str!("../tests/fixtures/command.json")]
+//! {"type":"command","msg_id":"1","action":"resync"}
 //! ```
 
 pub mod convert;
@@ -30,12 +30,12 @@ pub mod dto;
 pub mod error;
 pub mod message;
 
-pub use convert::{
-    apply_records_to_bank, apply_snapshot_body_to_bank, records_from_update,
-    records_from_update_with_bank, snapshot_body_from_bank, snapshot_from_bank,
-    snapshot_from_bank_with_can_records, system_status_from_dto, system_status_to_dto,
-    zone_config_from_dto, zone_config_to_dto, zone_dto_from_state, zone_state_from_dto,
+pub use convert::{decode_payload, encode_payload};
+pub use dto::{
+    AckStatus, ActionEnum, ActivationStatus, FanEnum, FirmwareDto, InfoByteDto, ModeEnum,
+    PowerEnum, RfDeviceCalibrationDto, RfDevicePairingDto, SensorPairingDto, SensorPairingWriteDto,
+    SensorTypeEnum, StatusState, SystemErrorDto, SystemStatusDto, UnitActivationDto,
+    UnitAnnouncementDto, UnitSnapshot, UnitTypeEnum, ZoneConfigDto, ZoneLimitsDto, ZoneStateDto,
 };
-pub use dto::{AckStatus, SnapshotBody, SystemStatusDto, ZoneConfigDto, ZoneDto};
 pub use error::EncodeError;
 pub use message::{ClientMessage, ServerMessage};
