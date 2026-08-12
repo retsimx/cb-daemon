@@ -83,6 +83,16 @@ async fn recv_json_or_close(
     }
 }
 
+/// D-5: a `read` request; `msg_id` and `register` are the only varying fields
+/// across the read tests.
+fn reg_read(msg_id: &str, register: &str) -> Value {
+    json!({
+        "type": "read",
+        "msg_id": msg_id,
+        "register": register
+    })
+}
+
 /// Reg-05 (aircon) write request; the `msg_id` is the only varying field
 /// across the write tests.
 fn reg05_write(msg_id: &str) -> Value {
@@ -170,6 +180,31 @@ async fn wait_for_event(
     })
     .await
     .expect("event timeout")
+}
+
+/// Wait until the `read_result` for `msg_id` arrives; panics on close/timeout.
+///
+/// Tolerates interleaved `status`, `event`, and other `read_result` frames
+/// (D-5): the flush's `getCAN` may also fan out `RegistersChanged` events
+/// before the correlated `read_result`.
+async fn wait_for_read_result(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    msg_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(ws)
+                .await
+                .expect("closed before read_result arrived");
+            if msg["type"] == "read_result" && msg["msg_id"] == msg_id {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("read_result timeout")
 }
 
 #[tokio::test]
@@ -726,5 +761,224 @@ async fn status_late_client_receives_current_synced() {
 
     let _ = a.close(None).await;
     let _ = b.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-5: a read of a known register (05) resolves on the flush's `getCAN` to
+/// a typed `read_result` correlated by the client's `msg_id`. The mock feeder
+/// answers the reg-06 flush with the full sample set, so the bank serves reg
+/// 05's current value ([0x01,0x01,0x03,0x30,0x00,0x01,0x00] → on/cool/high/
+/// 24.0/off). Interleaved status/event frames are tolerated by the wait loop.
+#[tokio::test]
+async fn read_known_register_returns_typed_read_result() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg_read("req-read-01", "05").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let result = wait_for_read_result(&mut ws, "req-read-01").await;
+    assert_eq!(result["unit_type"], "07");
+    assert_eq!(result["unit_id"], "abcde");
+    assert_eq!(result["register"], "05");
+    let payload = &result["payload"];
+    assert!(
+        payload.is_object(),
+        "known register payload must be typed: {result}"
+    );
+    assert_eq!(payload["power"], "on");
+    assert_eq!(payload["mode"], "cool");
+    assert_eq!(payload["fan"], "high");
+    assert_eq!(payload["target_temp_c"], 24.0);
+    assert_eq!(payload["fresh_air"], false);
+    assert_eq!(payload["rf_sys_id"], 0);
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-5: a read of an unknown register (16) returns a raw 14-char lowercase hex
+/// payload — the flush's `getCAN` carries the mock's reg-16 record, and the
+/// unknown-register codec falls back to the raw hex string (no DTO exists).
+#[tokio::test]
+async fn read_unknown_register_returns_raw_hex() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg_read("req-read-02", "16").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let result = wait_for_read_result(&mut ws, "req-read-02").await;
+    assert_eq!(result["register"], "16");
+    assert_eq!(result["unit_type"], "07");
+    assert_eq!(result["unit_id"], "abcde");
+    assert_eq!(
+        result["payload"], "deadbeef010203",
+        "unknown register must decode to raw hex: {result}"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-5: a read of the write-only register (09) is rejected up front by the
+/// read policy — no flush, no `getCAN` round-trip.
+#[tokio::test]
+async fn read_write_only_register_rejected() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg_read("req-read-03", "09").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-read-03").await;
+    assert_eq!(ack["status"], "error", "reg-09 read ack: {ack}");
+    assert_eq!(ack["reason"], "register 09 is write-only");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-5: a read of the internal register (07) is rejected up front by the read
+/// policy — no flush, no `getCAN` round-trip.
+#[tokio::test]
+async fn read_internal_register_rejected() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg_read("req-read-04", "07").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-read-04").await;
+    assert_eq!(ack["status"], "error", "reg-07 read ack: {ack}");
+    assert_eq!(ack["reason"], "register 07 is handled internally");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-5: a zone-bearing read (03) with an explicit `zone` resolves that zone's
+/// bank slot. The mock flush reply carries no reg 03, so a reg-03 write for
+/// zone 2 first populates the bank's zone-2 slot (CB echo); the wait for the
+/// write's `RegistersChanged` event guarantees the echo has landed before the
+/// read's flush resolves against the bank.
+#[tokio::test]
+async fn read_zone_bearing_register_with_zone_returns_zone_value() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-read-zone-write",
+        "register": "03",
+        "zone": 2,
+        "payload": {
+            "open": true,
+            "damper_pct": 100,
+            "sensor_type": "wired",
+            "target_temp_c": 24.0,
+            "measured_temp_c": 23.1
+        }
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-read-zone-write").await;
+    assert_eq!(ack["status"], "success", "zone write ack: {ack}");
+    let _ = wait_for_event(&mut ws, "03", "abcde").await;
+
+    let read = json!({
+        "type": "read",
+        "msg_id": "req-read-05",
+        "register": "03",
+        "zone": 2
+    });
+    ws.send(Message::Text(read.to_string().into()))
+        .await
+        .unwrap();
+    let result = wait_for_read_result(&mut ws, "req-read-05").await;
+    assert_eq!(result["unit_type"], "07");
+    assert_eq!(result["unit_id"], "abcde");
+    assert_eq!(result["register"], "03");
+    assert_eq!(result["zone"], 2, "zone read result: {result}");
+    let payload = &result["payload"];
+    assert!(payload.is_object(), "zone payload must be typed: {result}");
+    assert_eq!(payload["open"], true);
+    assert_eq!(payload["damper_pct"], 100);
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-5: a zone-bearing read (03) without a `zone` is rejected up front — the
+/// bank keys zone-bearing registers by zone byte, so no zone means no lookup.
+#[tokio::test]
+async fn read_zone_bearing_register_without_zone_rejected() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg_read("req-read-06", "03").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-read-06").await;
+    assert_eq!(ack["status"], "error", "zone-less reg-03 read ack: {ack}");
+    assert_eq!(ack["reason"], "zone required for register 03");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-5: a read of a register the mock CB never reports (02) resolves on the
+/// flush's `getCAN` with `data: None` — the engine acks "register 02 has no
+/// value" rather than the 5s deadline ("read timeout"). The read's own flush
+/// never carries reg 02, so this is deterministic (~sub-second). The 5s
+/// timeout path itself is unit-tested (`pending_reads_drain_expired_returns_
+/// only_dead_entries`); the mock feeder always answers a flush, so it cannot
+/// be exercised end-to-end.
+#[tokio::test]
+async fn read_unreported_register_acks_has_no_value() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg_read("req-read-07", "02").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    // Own timeout loop: the read deadline (5s) is only the upper bound — the
+    // mock resolves the flush well within it, so the ack should land fast.
+    let ack = timeout(Duration::from_secs(8), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before read ack");
+            if msg["type"] == "ack" && msg["msg_id"] == "req-read-07" {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("read ack timeout");
+    assert_eq!(ack["status"], "error", "reg-02 read ack: {ack}");
+    assert_eq!(ack["reason"], "register 02 has no value");
+
+    let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
 }

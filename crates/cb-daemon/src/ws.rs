@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
-    AckStatus, ClientMessage, ServerMessage, StatusState, encode_payload, event_body,
-    snapshot_units,
+    AckStatus, ClientMessage, PolicyMode, ServerMessage, StatusState, decode_payload,
+    encode_payload, event_body, snapshot_units, write_policy,
 };
 use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
 use axum::Router;
@@ -248,12 +248,109 @@ impl PendingAcks {
     }
 }
 
+/// Read correlation key: one engine [`EngineEvent::RegisterRead`] resolves
+/// every pending read that targeted the same unit/register/zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ReadKey {
+    unit_type: UnitType,
+    unit_id: UnitId,
+    reg: RegId,
+    zone: Option<u8>,
+}
+
+// `aa_registers` ids do not implement `Ord`, so the BTreeMap ordering is
+// defined here on the raw wire bytes.
+impl Ord for ReadKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.unit_type.get(),
+            self.unit_id.get(),
+            self.reg.get(),
+            self.zone,
+        )
+            .cmp(&(
+                other.unit_type.get(),
+                other.unit_id.get(),
+                other.reg.get(),
+                other.zone,
+            ))
+    }
+}
+
+impl PartialOrd for ReadKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Per-session read state: reads are correlated by [`ReadKey`] and resolved
+/// when the flush's `getCAN` emits [`EngineEvent::RegisterRead`]. Multiple
+/// `msg_id`s may share one key (each gets its own correlated `read_result`),
+/// and each entry carries its own 5s deadline so a register the bus never
+/// reports times out with an error ack.
+struct PendingReads {
+    deadlines: BTreeMap<ReadKey, Vec<(String, tokio::time::Instant)>>,
+    timeout: std::time::Duration,
+}
+
+impl PendingReads {
+    const fn new() -> Self {
+        Self {
+            deadlines: BTreeMap::new(),
+            timeout: std::time::Duration::from_secs(5),
+        }
+    }
+
+    /// Test hook: override the read timeout for fast expiry tests.
+    #[cfg(test)]
+    const fn with_timeout(timeout: std::time::Duration) -> Self {
+        Self {
+            deadlines: BTreeMap::new(),
+            timeout,
+        }
+    }
+
+    /// Track `msg_id` for `key` with a 5s deadline; resolved on the next
+    /// [`EngineEvent::RegisterRead`] for `key`.
+    fn push(&mut self, key: ReadKey, msg_id: String) {
+        self.deadlines
+            .entry(key)
+            .or_default()
+            .push((msg_id, tokio::time::Instant::now() + self.timeout));
+    }
+
+    /// Remove and return every pending `msg_id` for `key`.
+    fn resolve(&mut self, key: ReadKey) -> Vec<String> {
+        self.deadlines
+            .remove(&key)
+            .map(|entries| entries.into_iter().map(|(msg_id, _)| msg_id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove and return every `(key, msg_id)` whose deadline has passed.
+    fn drain_expired(&mut self) -> Vec<(ReadKey, String)> {
+        let now = tokio::time::Instant::now();
+        let mut expired = Vec::new();
+        self.deadlines.retain(|key, entries| {
+            let (kept, done): (Vec<_>, Vec<_>) =
+                entries.drain(..).partition(|(_, deadline)| now < *deadline);
+            for (msg_id, _) in done {
+                expired.push((*key, msg_id));
+            }
+            *entries = kept;
+            !entries.is_empty()
+        });
+        expired
+    }
+}
+
 async fn bridge_until_disconnect(
     socket: &mut WebSocket,
     state: &WsState,
     mut ev_rx: broadcast::Receiver<WsEvent>,
 ) -> anyhow::Result<()> {
     let mut pending = PendingAcks::new();
+    let mut pending_reads = PendingReads::new();
     loop {
         // Expire stale write acks so a dead bus surfaces as an error ack.
         for msg_id in pending.drain_expired() {
@@ -265,14 +362,25 @@ async fn bridge_until_disconnect(
             )
             .await?;
         }
+        // Expire stale read deadlines so a register the bus never reports
+        // surfaces as an error ack.
+        for (_, msg_id) in pending_reads.drain_expired() {
+            send_ack(
+                socket,
+                &msg_id,
+                AckStatus::Error,
+                Some("read timeout".into()),
+            )
+            .await?;
+        }
         tokio::select! {
             msg = socket.next() => {
-                if !handle_ws_message(socket, state, msg, &mut pending).await? {
+                if !handle_ws_message(socket, state, msg, &mut pending, &mut pending_reads).await? {
                     break;
                 }
             }
             ev = ev_rx.recv() => {
-                if !forward_engine_event(socket, state, ev, &mut pending).await? {
+                if !forward_engine_event(socket, state, ev, &mut pending, &mut pending_reads).await? {
                     break;
                 }
             }
@@ -287,10 +395,11 @@ async fn handle_ws_message(
     state: &WsState,
     msg: Option<Result<Message, axum::Error>>,
     pending: &mut PendingAcks,
+    pending_reads: &mut PendingReads,
 ) -> anyhow::Result<bool> {
     match msg {
         Some(Ok(Message::Text(text))) => {
-            handle_client_text(socket, state, &text, pending).await?;
+            handle_client_text(socket, state, &text, pending, pending_reads).await?;
             Ok(true)
         }
         Some(Ok(Message::Ping(payload))) => {
@@ -333,12 +442,41 @@ fn event_message(record: &CanRecord) -> ServerMessage {
     }
 }
 
+/// Shape a resolved [`EngineEvent::RegisterRead`] into its wire reply for one
+/// `msg_id`: a `read_result` with the typed (or raw hex) payload, or an error
+/// ack when the register has no value.
+fn read_result_message(
+    msg_id: String,
+    unit_type: UnitType,
+    unit_id: UnitId,
+    reg: RegId,
+    zone: Option<u8>,
+    data: Option<[u8; 7]>,
+) -> ServerMessage {
+    match data.and_then(|bytes| decode_payload(reg, bytes).ok()) {
+        Some(payload) => ServerMessage::ReadResult {
+            msg_id,
+            unit_type: unit_type.to_string(),
+            unit_id: unit_id.to_string(),
+            register: format!("{:02x}", reg.get()),
+            zone,
+            payload,
+        },
+        None => ServerMessage::Ack {
+            msg_id,
+            status: AckStatus::Error,
+            reason: Some(format!("register {:02x} has no value", reg.get())),
+        },
+    }
+}
+
 /// Returns `false` when the session should end.
 async fn forward_engine_event(
     socket: &mut WebSocket,
     _state: &WsState,
     ev: Result<WsEvent, broadcast::error::RecvError>,
     pending: &mut PendingAcks,
+    pending_reads: &mut PendingReads,
 ) -> anyhow::Result<bool> {
     match ev {
         Ok(WsEvent::Engine(EngineEvent::RegistersChanged { records })) => {
@@ -357,6 +495,28 @@ async fn forward_engine_event(
         Ok(WsEvent::Engine(EngineEvent::WriteFlushed)) => {
             for msg_id in pending.drain_all() {
                 send_ack(socket, &msg_id, AckStatus::Success, None).await?;
+            }
+            Ok(true)
+        }
+        Ok(WsEvent::Engine(EngineEvent::RegisterRead {
+            unit_type,
+            unit_id,
+            reg,
+            zone,
+            data,
+        })) => {
+            let key = ReadKey {
+                unit_type,
+                unit_id,
+                reg,
+                zone,
+            };
+            for msg_id in pending_reads.resolve(key) {
+                send_json(
+                    socket,
+                    &read_result_message(msg_id, unit_type, unit_id, reg, zone, data),
+                )
+                .await?;
             }
             Ok(true)
         }
@@ -390,6 +550,7 @@ async fn handle_client_text(
     state: &WsState,
     text: &str,
     pending: &mut PendingAcks,
+    pending_reads: &mut PendingReads,
 ) -> anyhow::Result<()> {
     let parsed: Result<ClientMessage, _> = serde_json::from_str(text);
     match parsed {
@@ -411,14 +572,21 @@ async fn handle_client_text(
             };
             handle_write(socket, state, pending, req).await?;
         }
-        Ok(ClientMessage::Read { msg_id, .. }) => {
-            send_ack(
-                socket,
-                &msg_id,
-                AckStatus::Error,
-                Some("read not implemented yet".into()),
-            )
-            .await?;
+        Ok(ClientMessage::Read {
+            msg_id,
+            unit_type,
+            unit_id,
+            register,
+            zone,
+        }) => {
+            let req = ReadRequest {
+                msg_id,
+                unit_type,
+                unit_id,
+                register,
+                zone,
+            };
+            handle_read(socket, state, pending_reads, req).await?;
         }
         Ok(ClientMessage::Command { msg_id, action }) => match action.as_str() {
             "resync" => {
@@ -460,39 +628,25 @@ async fn handle_client_text(
     Ok(())
 }
 
-/// Decoded `write` fields for [`handle_write`].
-struct WriteRequest {
-    msg_id: String,
-    unit_type: Option<String>,
-    unit_id: Option<String>,
-    register: String,
-    /// Zone id for zone-bearing registers (`03`/`04`); part of the CAN address.
-    zone: Option<u8>,
-    payload: Value,
-}
-
-/// Resolve and encode a `write` into a single-register [`CanRecord`].
+/// Resolve the addressed unit from optional client fields, the bank, and the
+/// hint.
 ///
-/// Omitted `unit_type` / `unit_id` default to the bank's primary unit when a
-/// snapshot exists; a `unit_id` present under exactly one unit type resolves
-/// that type when `unit_type` is omitted. Without a snapshot the hint supplies
-/// the id (type AIRCON) and fails when no hint is configured. Zone-bearing
-/// registers (`03`/`04`) stamp the client's zone into wire byte 0.
+/// Shared by the write and read paths. Omitted `unit_type` / `unit_id` default
+/// to the bank's primary unit when a snapshot exists; a `unit_id` present under
+/// exactly one unit type resolves that type when `unit_type` is omitted.
+/// Without a snapshot the hint supplies the id (type AIRCON) and fails when no
+/// hint is configured.
 ///
 /// # Errors
 ///
-/// Returns a human-readable reason for invalid identifiers/register, an
-/// unencodable payload (mirrors the ack `reason` field), or no primary unit
+/// Returns a human-readable reason for invalid identifiers or no primary unit
 /// when neither a bank nor a hint is available.
-fn build_write_record(
+fn resolve_unit(
     bank: Option<&RegisterBank>,
     hint: Option<UnitId>,
     unit_type: Option<String>,
     unit_id: Option<String>,
-    register: &str,
-    zone: Option<u8>,
-    payload: &Value,
-) -> Result<CanRecord, String> {
+) -> Result<(UnitType, UnitId), String> {
     let (primary_type, primary_id) = bank
         .map_or_else(
             || hint.map(|id| (UnitType::AIRCON, id)),
@@ -518,7 +672,129 @@ fn build_write_record(
             .unwrap_or(primary_type),
         (None, None) => primary_type,
     };
-    let unit_id = parsed_id.unwrap_or(primary_id);
+    Ok((unit_type, parsed_id.unwrap_or(primary_id)))
+}
+
+/// Decoded `write` fields for [`handle_write`].
+struct WriteRequest {
+    msg_id: String,
+    unit_type: Option<String>,
+    unit_id: Option<String>,
+    register: String,
+    /// Zone id for zone-bearing registers (`03`/`04`); part of the CAN address.
+    zone: Option<u8>,
+    payload: Value,
+}
+
+/// Decoded `read` fields for [`handle_read`].
+struct ReadRequest {
+    msg_id: String,
+    unit_type: Option<String>,
+    unit_id: Option<String>,
+    register: String,
+    /// Zone id for zone-bearing registers (`03`/`04`); required for those.
+    zone: Option<u8>,
+}
+
+/// Validate the register/zone of a `read` before it touches the bus.
+///
+/// Mirrors the write path's parse-error style, then rejects registers the read
+/// path cannot serve: write-only (`09`), internal (`07`), and zone-bearing
+/// registers (`03`/`04`) addressed without a zone.
+fn validate_read_register(register: &str, zone: Option<u8>) -> Result<RegId, String> {
+    let reg = RegId::from_hex(register).map_err(|err| format!("invalid register: {err:?}"))?;
+    match write_policy(reg).mode {
+        PolicyMode::WriteOnly => {
+            return Err(format!("register {:02x} is write-only", reg.get()));
+        }
+        PolicyMode::Internal => {
+            return Err(format!("register {:02x} is handled internally", reg.get()));
+        }
+        PolicyMode::ReadWrite | PolicyMode::ReadOnly | PolicyMode::Unverified => {}
+    }
+    if is_zone_bearing(reg) && zone.is_none() {
+        return Err(format!("zone required for register {:02x}", reg.get()));
+    }
+    Ok(reg)
+}
+
+/// `read`: validate the register, resolve the unit, and queue an
+/// [`EngineCmd::ReadRegister`]. The reply arrives later as a correlated
+/// `read_result` from the flush's [`EngineEvent::RegisterRead`] (or a `read
+/// timeout` error ack after 5s when the bus never reports the register).
+async fn handle_read(
+    socket: &mut WebSocket,
+    state: &WsState,
+    pending: &mut PendingReads,
+    msg: ReadRequest,
+) -> anyhow::Result<()> {
+    let reg = match validate_read_register(&msg.register, msg.zone) {
+        Ok(reg) => reg,
+        Err(reason) => {
+            send_ack(socket, &msg.msg_id, AckStatus::Error, Some(reason)).await?;
+            return Ok(());
+        }
+    };
+    // Clone the held snapshot: `watch::Ref` is not `Send`, so the borrow guard
+    // must not span the awaits below.
+    let bank = state.snapshot.borrow().as_ref().cloned();
+    let (unit_type, unit_id) = match resolve_unit(
+        bank.as_ref().map(|held| &held.bank),
+        state.unit_id_hint,
+        msg.unit_type,
+        msg.unit_id,
+    ) {
+        Ok(unit) => unit,
+        Err(reason) => {
+            send_ack(socket, &msg.msg_id, AckStatus::Error, Some(reason)).await?;
+            return Ok(());
+        }
+    };
+    // Zone is part of the CAN address for zone-bearing registers only; on a
+    // non-zone register the client's zone is ignored (never echoed on the
+    // read_result, matching the write path's ignore behavior).
+    let zone = if is_zone_bearing(reg) { msg.zone } else { None };
+    let cmd = EngineCmd::ReadRegister {
+        unit_type,
+        unit_id,
+        reg,
+        zone,
+    };
+    record_spy(state, &cmd).await;
+    if let Err(err) = state.cmd_tx.send(cmd).await {
+        send_ack(socket, &msg.msg_id, AckStatus::Error, Some(err.to_string())).await?;
+    } else {
+        let key = ReadKey {
+            unit_type,
+            unit_id,
+            reg,
+            zone,
+        };
+        pending.push(key, msg.msg_id);
+    }
+    Ok(())
+}
+
+/// Resolve and encode a `write` into a single-register [`CanRecord`].
+///
+/// Unit addressing defers to [`resolve_unit`]; zone-bearing registers
+/// (`03`/`04`) stamp the client's zone into wire byte 0.
+///
+/// # Errors
+///
+/// Returns a human-readable reason for invalid identifiers/register, an
+/// unencodable payload (mirrors the ack `reason` field), or no primary unit
+/// when neither a bank nor a hint is available.
+fn build_write_record(
+    bank: Option<&RegisterBank>,
+    hint: Option<UnitId>,
+    unit_type: Option<String>,
+    unit_id: Option<String>,
+    register: &str,
+    zone: Option<u8>,
+    payload: &Value,
+) -> Result<CanRecord, String> {
+    let (unit_type, unit_id) = resolve_unit(bank, hint, unit_type, unit_id)?;
     let reg = RegId::from_hex(register).map_err(|err| format!("invalid register: {err:?}"))?;
     let mut data = encode_payload(reg, payload).map_err(|err| err.to_string())?;
     // The zone id is part of the CAN address, not the payload: the codec stamps
@@ -839,5 +1115,157 @@ mod tests {
         .expect("record");
         assert_eq!(rec.reg, RegId::new(0x03));
         assert_eq!(rec.data[0], 2, "zone must be stamped into wire byte 0");
+    }
+
+    #[test]
+    fn validate_read_register_rejects_write_only() {
+        // Acceptance (3): a read of reg 09 (write-only) is rejected up front
+        // with the exact reason string.
+        let err = validate_read_register("09", None).expect_err("write-only read");
+        assert_eq!(err, "register 09 is write-only");
+    }
+
+    #[test]
+    fn validate_read_register_rejects_internal() {
+        // Acceptance (4): a read of reg 07 (internal) is rejected up front.
+        let err = validate_read_register("07", None).expect_err("internal read");
+        assert_eq!(err, "register 07 is handled internally");
+    }
+
+    #[test]
+    fn validate_read_register_requires_zone_for_zone_bearing_register() {
+        // Acceptance (6): a zone-less read of reg 03 is rejected with the
+        // exact reason string; a zone fixes it. Zone on a non-zone register
+        // is ignored (consistent with the write path).
+        let err = validate_read_register("03", None).expect_err("zone-less read");
+        assert_eq!(err, "zone required for register 03");
+        assert_eq!(validate_read_register("03", Some(2)), Ok(RegId::new(0x03)));
+        assert_eq!(validate_read_register("05", Some(2)), Ok(RegId::new(0x05)));
+    }
+
+    #[test]
+    fn validate_read_register_parses_register_like_write_path() {
+        let err = validate_read_register("xyz", None).expect_err("bad register");
+        assert!(err.starts_with("invalid register: "), "got {err:?}");
+    }
+
+    #[test]
+    fn pending_reads_resolve_returns_all_msg_ids_for_key() {
+        let mut pending = PendingReads::new();
+        let key = ReadKey {
+            unit_type: UnitType::AIRCON,
+            unit_id: UnitId::try_new(0x0_11111).unwrap(),
+            reg: RegId::new(0x05),
+            zone: None,
+        };
+        assert_eq!(pending.resolve(key), Vec::<String>::new(), "absent key");
+
+        pending.push(key, "r1".to_owned());
+        pending.push(key, "r2".to_owned());
+        assert_eq!(pending.resolve(key), vec!["r1", "r2"]);
+        assert_eq!(
+            pending.resolve(key),
+            Vec::<String>::new(),
+            "resolved key is removed"
+        );
+
+        // Keys differ by any of the four fields (zone here).
+        let zoned = ReadKey {
+            reg: RegId::new(0x03),
+            zone: Some(2),
+            ..key
+        };
+        pending.push(zoned, "r3".to_owned());
+        assert_eq!(pending.resolve(zoned), vec!["r3"]);
+    }
+
+    #[tokio::test]
+    async fn pending_reads_drain_expired_returns_only_dead_entries() {
+        // Real-time (no paused clock available): 200ms timeout with generous
+        // sleep margins so the first entry's deadline passes while the
+        // second's has not (sleeps only overshoot, never undershoot).
+        let mut pending = PendingReads::with_timeout(std::time::Duration::from_millis(200));
+        let key = ReadKey {
+            unit_type: UnitType::AIRCON,
+            unit_id: UnitId::try_new(0x0_11111).unwrap(),
+            reg: RegId::new(0x02),
+            zone: None,
+        };
+        pending.push(key, "early".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        pending.push(key, "late".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(pending.drain_expired(), vec![(key, "early".to_owned())]);
+        assert_eq!(pending.resolve(key), vec!["late".to_owned()]);
+    }
+
+    #[test]
+    fn read_result_shapes_zone_read_as_read_result() {
+        // Acceptance (5): a resolved zone read of reg 03 carries the zone id
+        // on the read_result with the typed payload.
+        let msg = read_result_message(
+            "m1".to_owned(),
+            UnitType::new(0x08),
+            UnitId::try_new(0x0_ABCDE).unwrap(),
+            RegId::new(0x03),
+            Some(2),
+            Some([0x02, 0xe4, 0x00, 0x03, 0x00, 0x00, 0x00]),
+        );
+        let ServerMessage::ReadResult {
+            msg_id,
+            unit_type,
+            unit_id,
+            register,
+            zone,
+            payload,
+        } = msg
+        else {
+            panic!("expected ReadResult message");
+        };
+        assert_eq!(msg_id, "m1");
+        assert_eq!(unit_type, "08");
+        assert_eq!(unit_id, "abcde");
+        assert_eq!(register, "03");
+        assert_eq!(zone, Some(2));
+        assert_eq!(payload["open"], true);
+        assert_eq!(payload["damper_pct"], 100);
+    }
+
+    #[test]
+    fn read_result_unknown_register_falls_back_to_raw_hex() {
+        // Acceptance (2): an unknown register (16) yields the raw 14-char hex
+        // payload on the read_result.
+        let msg = read_result_message(
+            "m2".to_owned(),
+            UnitType::AIRCON,
+            UnitId::try_new(0x0_11111).unwrap(),
+            RegId::new(0x16),
+            None,
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11]),
+        );
+        let ServerMessage::ReadResult { payload, .. } = msg else {
+            panic!("expected ReadResult message");
+        };
+        assert_eq!(payload, Value::String("aabbccddeeff11".to_owned()));
+    }
+
+    #[test]
+    fn read_result_missing_value_acks_error() {
+        // Acceptance (7): a resolved read whose register has no value acks an
+        // error instead of a read_result.
+        let msg = read_result_message(
+            "m3".to_owned(),
+            UnitType::AIRCON,
+            UnitId::try_new(0x0_11111).unwrap(),
+            RegId::new(0x02),
+            None,
+            None,
+        );
+        let ServerMessage::Ack { status, reason, .. } = msg else {
+            panic!("expected Ack message");
+        };
+        assert_eq!(status, AckStatus::Error);
+        assert_eq!(reason.as_deref(), Some("register 02 has no value"));
     }
 }
