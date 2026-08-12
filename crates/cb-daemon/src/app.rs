@@ -395,7 +395,7 @@ async fn fanout_events(
                 }
                 let _ = broadcast_tx.send(WsEvent::Engine(ev));
             }
-            EngineEvent::WriteFlushed | EngineEvent::DirectReply { .. } => {
+            EngineEvent::WriteFlushed => {
                 let _ = broadcast_tx.send(WsEvent::Engine(ev));
             }
             EngineEvent::SessionState(state) => {
