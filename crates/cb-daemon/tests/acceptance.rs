@@ -94,21 +94,15 @@ fn reg_read(msg_id: &str, register: &str) -> Value {
 }
 
 /// Reg-05 (aircon) write request; the `msg_id` is the only varying field
-/// across the write tests.
+/// across the write tests. The payload is raw hex (byte-exact passthrough):
+/// D-6 rejects typed reg-05 writes carrying the read-only `rf_sys_id` field,
+/// so these plumbing tests write the wire bytes directly.
 fn reg05_write(msg_id: &str) -> Value {
     json!({
         "type": "write",
         "msg_id": msg_id,
         "register": "05",
-        "payload": {
-            "power": "on",
-            "mode": "cool",
-            "fan": "high",
-            "target_temp_c": 23.0,
-            "myzone_id": 0,
-            "fresh_air": false,
-            "rf_sys_id": 0
-        }
+        "payload": "0101032e000100"
     })
 }
 
@@ -483,13 +477,7 @@ async fn write_zone_bearing_register_stamps_wire_zone() {
         "msg_id": "req-301",
         "register": "03",
         "zone": 2,
-        "payload": {
-            "open": true,
-            "damper_pct": 100,
-            "sensor_type": "wired",
-            "target_temp_c": 24.0,
-            "measured_temp_c": 23.1
-        }
+        "payload": "00e40230170100"
     });
     ws.send(Message::Text(update.to_string().into()))
         .await
@@ -542,15 +530,7 @@ async fn write_non_zone_register_ignores_zone() {
         "msg_id": "req-302",
         "register": "05",
         "zone": 9,
-        "payload": {
-            "power": "on",
-            "mode": "cool",
-            "fan": "high",
-            "target_temp_c": 24.0,
-            "myzone_id": 0,
-            "fresh_air": false,
-            "rf_sys_id": 0
-        }
+        "payload": "01010330000100"
     });
     ws.send(Message::Text(update.to_string().into()))
         .await
@@ -885,13 +865,7 @@ async fn read_zone_bearing_register_with_zone_returns_zone_value() {
         "msg_id": "req-read-zone-write",
         "register": "03",
         "zone": 2,
-        "payload": {
-            "open": true,
-            "damper_pct": 100,
-            "sensor_type": "wired",
-            "target_temp_c": 24.0,
-            "measured_temp_c": 23.1
-        }
+        "payload": "00e40230170100"
     });
     ws.send(Message::Text(update.to_string().into()))
         .await
