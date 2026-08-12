@@ -11,16 +11,10 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 
 /// Wire payloads mirrored from `aa-engine` (crate-private there).
-const GET_SYSTEM_DATA: &[u8] = b"getSystemData";
 const DIRTY_RESET_SET_CAN: &[u8] = b"setCAN 0701000000600000000000000";
 const DUMP_SET_CAN: &[u8] = b"setCAN 0801000000600000000000000 0801000000236000000000000";
 const EMPTY_SET_CAN: &[u8] = b"setCAN ";
 const ACK_CAN: &[u8] = b"ackCAN 1";
-
-/// Stock-shaped getSystemData XML so negotiate can leave CAN2-in-use and dump.
-const SAMPLE_SYSTEM_XML: &[u8] = b"<request>getSystemData</request>
-<aircon><info><state>on</state><mode>cool</mode><fan>high</fan>
-<setTemp>24.0</setTemp><myZone>1</myZone><freshAir>none</freshAir></info></aircon>";
 
 /// Unit id used by the scripted dump sample (`abcde`).
 pub(crate) const FEEDER_UNIT_ID: UnitId = match UnitId::try_new(0x0_ABCDE) {
@@ -179,7 +173,7 @@ pub(crate) async fn run_negotiate_dump_feeder(mock: Arc<Mutex<MockLink>>, notify
 
 async fn feeder_negotiate(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
     push_frame(mock, notify, b"Ping").await;
-    if !wait_written_contains(mock, &encoded(GET_SYSTEM_DATA)).await {
+    if !wait_written_contains(mock, &encoded(b"getSystemData")).await {
         warn!("mock feeder: timed out waiting for getSystemData");
         return false;
     }
@@ -227,8 +221,6 @@ async fn reply_to_poll(
 ) {
     if written_has_frame(&written, DUMP_SET_CAN) {
         push_frame(mock, notify, &get_can_with_sample()).await;
-    } else if written_has_frame(&written, GET_SYSTEM_DATA) {
-        push_frame(mock, notify, SAMPLE_SYSTEM_XML).await;
     } else if written_has_frame(&written, ACK_CAN) {
         // Ack consumed; wait for next Ping cycle.
     } else if written_has_frame(&written, EMPTY_SET_CAN) {
@@ -273,7 +265,6 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
                     written_has_frame(&written, DUMP_SET_CAN)
                         || written_has_frame(&written, EMPTY_SET_CAN)
                         || written_has_frame(&written, ACK_CAN)
-                        || written_has_frame(&written, GET_SYSTEM_DATA)
                         || written
                             .windows(b"<U>setCAN".len())
                             .any(|x| x == b"<U>setCAN")

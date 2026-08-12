@@ -1,9 +1,6 @@
 //! Sync CB session state machine (no I/O).
 
-use aa_registers::{
-    CanRecord, DecodedRegister, Dest, Fan, FreshAir, Mode, Power, RegId, RegisterBank,
-    SystemStatus, UnitId, UnitType,
-};
+use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType};
 
 use crate::event::{EngineCmd, EngineEvent};
 use crate::wire::{
@@ -39,25 +36,13 @@ pub(crate) struct Session {
     /// NACKs on the dirty-reset setCAN; bounded so an uncooperative CB cannot
     /// livelock the dump (mirrors aaservice's ≤3 CAN retries).
     reset_nacks: u8,
-    /// True once the bus delivered a real reg 05 (system status) in a getCAN.
-    /// The snapshot rawCan includes reg 05 only then; a bank slot synthesized
-    /// from zones/XML must stay out of `MyAir5` rawCan (USB parity).
-    system_status_real: bool,
-    /// Raw direct-message queue (one-shot polls / `setAllZoneSensorData` etc.).
-    direct_queue: Vec<Vec<u8>>,
-    /// Most recent direct payload written; the next non-getCAN frame is its reply.
-    last_direct_sent: Vec<u8>,
     /// Set when `steady_tx` drained the write queue; consumed by the runner to
     /// emit [`EngineEvent::WriteFlushed`] after the frame is transmitted.
     write_flushed: bool,
     /// Last inbound frame CRC outcome; feeds the outbound `ackCAN 0|1` polarity.
     crc_ok: bool,
-    /// System status parsed from getSystemData XML before the dump reveals unit id.
-    pending_system: Option<SystemStatus>,
     /// Mirrors stock `canInUse`: after `CAN2 in use`, skip empty `setCAN`.
     can_in_use: bool,
-    /// Ping counter while hunting getSystemData XML (aaservice poll path).
-    system_xml_ticks: u32,
     shutdown: bool,
 }
 
@@ -74,14 +59,9 @@ impl Session {
             dump_needs_resend: false,
             dirty_reset_sent: false,
             reset_nacks: 0,
-            system_status_real: false,
-            direct_queue: Vec::new(),
-            last_direct_sent: Vec::new(),
             write_flushed: false,
             crc_ok: true,
-            pending_system: None,
             can_in_use: false,
-            system_xml_ticks: 0,
             shutdown: false,
         }
     }
@@ -109,11 +89,6 @@ impl Session {
         match cmd {
             EngineCmd::WriteRegisters(records) => {
                 self.write_queue.extend(records);
-            }
-            EngineCmd::WriteDirect(payload) => {
-                if !self.direct_queue.contains(&payload) {
-                    self.direct_queue.push(payload);
-                }
             }
             EngineCmd::ResyncMailbox => {
                 self.state = State::RequestDump;
@@ -177,23 +152,10 @@ impl Session {
             }
             State::Steady => {
                 // Match aaservice UartDispatchEngine.onPing:
-                // ack → queued writes → direct queue → (while missing system
-                // status) getSystemData poll → else empty setCAN. Never send
-                // empty setCAN while can_in_use, and never send empty setCAN
-                // while still hunting getSystemData XML — aaservice skips empty
-                // setCAN because it leaves the CB returning "CAN2 in use" for
-                // getSystemData forever (starves :2025 / MyAir5).
+                // ack → queued writes → else empty setCAN. Never send empty
+                // setCAN while can_in_use.
                 if self.ack_armed || !self.write_queue.is_empty() {
                     return Some(self.steady_tx());
-                }
-                if !self.direct_queue.is_empty() {
-                    self.last_direct_sent = self.direct_queue.remove(0);
-                    self.write_flushed = true;
-                    return Some(self.last_direct_sent.clone());
-                }
-                if self.needs_system_status_poll() {
-                    self.system_xml_ticks = self.system_xml_ticks.saturating_add(1);
-                    return Some(GET_SYSTEM_DATA.to_vec());
                 }
                 if self.can_in_use {
                     return None;
@@ -243,14 +205,6 @@ impl Session {
             self.can_in_use = true;
             self.state = State::RequestDump;
             vec![EngineEvent::Negotiated { detail }]
-        } else if let Some(status) = parse_system_data_xml_status(payload) {
-            // Rare: XML before dump (bus already free). Hold until dump reveals unit id.
-            self.can_in_use = false;
-            self.pending_system = Some(status);
-            self.state = State::RequestDump;
-            vec![EngineEvent::Negotiated {
-                detail: "getSystemData xml (pending apply after dump)".into(),
-            }]
         } else {
             let detail = format!("negotiate mismatch: {}", String::from_utf8_lossy(payload));
             vec![EngineEvent::ProtocolWarn(detail)]
@@ -280,9 +234,6 @@ impl Session {
             Ok(records) => {
                 for record in &records {
                     self.bank.apply(record);
-                    if record.reg == RegId::new(0x05) {
-                        self.system_status_real = true;
-                    }
                     if record.reg == RegId::new(0x06) {
                         // JZ18 handshake (aa_interop §7.3): every reg-06 announcement gets
                         // an all-zero reg-07 reply echoing unit type + id.
@@ -297,40 +248,19 @@ impl Session {
                     return Vec::new();
                 }
                 let mut events = Vec::new();
-                // Reg-05 synthesis is AIRCON-scoped: skip on banks without an
-                // AIRCON unit rather than applying a 07-typed record to the
-                // cross-type fallback id (phantom unit on 08-only banks).
-                if let Some(status) = self.pending_system.take()
-                    && let Some(unit) = self.aircon_primary_unit_id()
-                {
-                    let record = system_status_record(unit, status);
-                    self.bank.apply(&record);
-                    events.push(EngineEvent::RegistersChanged {
-                        records: vec![record],
-                    });
-                }
                 self.state = State::Steady;
                 // Stock arms ackCAN after every successful getCAN, including the dump reply.
                 // Skipping the ack leaves the CB in canInUse so later polls misbehave.
                 self.ack_armed = true;
                 self.can_in_use = false;
-                // Capture CB dump hex *before* synthesizing reg 05 into the bank:
-                // full bank across all unit types (dirty-reset + 08-flush dumps
-                // and any steady-state deltas), excluding a synthesized reg 05
-                // that never came from the bus (synthesis is AIRCON-primary only,
-                // so retaining only real reg-05s stays safe). MyAir5 rawCan must
-                // match USB; typed system_status still comes from the bank slot
-                // via mailbox DTOs.
+                // Snapshot records come straight from the bus: nothing is ever
+                // fabricated, and reg 05 is included when the dump delivered it.
                 let mut bank_records: Vec<CanRecord> = Vec::new();
                 for unit_type in self.bank.unit_types() {
                     bank_records.extend(self.bank.records_for_any_unit(unit_type));
                 }
-                if !self.system_status_real {
-                    bank_records.retain(|r| r.reg != RegId::new(0x05));
-                }
                 let can_records: Vec<String> =
                     bank_records.iter().map(CanRecord::to_wire).collect();
-                self.maybe_synthesize_system_status_from_zones();
                 self.maybe_queue_unit_flush_for_missing_system_status();
                 events.push(EngineEvent::Snapshot {
                     bank: self.bank.clone(),
@@ -353,29 +283,7 @@ impl Session {
             self.can_in_use = true;
             return Vec::new();
         }
-        if let Some(status) = parse_system_data_xml_status(payload) {
-            self.can_in_use = false;
-            // Reg-05 synthesis is AIRCON-scoped: skip on banks without an
-            // AIRCON unit rather than applying a 07-typed record to the
-            // cross-type fallback id (phantom unit on 08-only banks).
-            let Some(unit) = self.aircon_primary_unit_id() else {
-                return Vec::new();
-            };
-            let record = system_status_record(unit, status);
-            self.bank.apply(&record);
-            return vec![EngineEvent::RegistersChanged {
-                records: vec![record],
-            }];
-        }
         if !is_get_can(payload) {
-            // A non-getCAN frame while a direct request is outstanding is its
-            // reply (e.g. XML for setAllZoneSensorData / a one-shot poll tag).
-            if !self.last_direct_sent.is_empty() {
-                self.last_direct_sent.clear();
-                return vec![EngineEvent::DirectReply {
-                    payload: payload.to_vec(),
-                }];
-            }
             return vec![EngineEvent::ProtocolWarn(format!(
                 "unexpected steady frame: {}",
                 String::from_utf8_lossy(payload)
@@ -386,9 +294,6 @@ impl Session {
             Ok(records) => {
                 for record in &records {
                     self.bank.apply(record);
-                    if record.reg == RegId::new(0x05) {
-                        self.system_status_real = true;
-                    }
                     if record.reg == RegId::new(0x06) {
                         // JZ18 handshake (aa_interop §7.3): every reg-06 announcement gets
                         // an all-zero reg-07 reply echoing unit type + id.
@@ -405,28 +310,16 @@ impl Session {
         }
     }
 
-    /// Primary AIRCON unit for reg-05 synthesis/poll machinery.
+    /// Primary AIRCON unit for the missing-reg-05 unit flush.
     ///
-    /// Reg-05 synthesis and getSystemData polling are AIRCON-scoped by design:
-    /// they must never run against a cross-type id (an 08-only bank would
-    /// otherwise get a phantom AIRCON-typed record addressed to an 08 id).
+    /// The flush is AIRCON-scoped by design: it must never run against a
+    /// cross-type id (an 08-only bank would otherwise get a phantom
+    /// AIRCON-typed record addressed to an 08 id).
     fn aircon_primary_unit_id(&self) -> Option<UnitId> {
         if self.bank.unit_ids(UnitType::AIRCON).is_empty() {
             return None;
         }
         Some(self.bank.preferred_unit_id(UnitType::AIRCON, None))
-    }
-
-    fn needs_system_status_poll(&self) -> bool {
-        if self.pending_system.is_some() {
-            return false;
-        }
-        let Some(unit) = self.aircon_primary_unit_id() else {
-            return false;
-        };
-        self.bank
-            .get(UnitType::AIRCON, unit, RegId::new(0x05))
-            .is_none()
     }
 
     /// If the zero-uid flush dump omitted reg 05, queue one unit-scoped flush.
@@ -449,131 +342,6 @@ impl Session {
             data: [0; 7],
         });
     }
-
-    /// Seed reg 05 from zone setpoints when the dump omitted it.
-    ///
-    /// Without this, mailbox snapshots have zones but no `system_status`, so aaservice
-    /// never emits `getSystemData` and `MyAir5` `:2025` keeps `aircons: {}`.
-    fn maybe_synthesize_system_status_from_zones(&mut self) {
-        let Some(unit) = self.aircon_primary_unit_id() else {
-            return;
-        };
-        if self
-            .bank
-            .get(UnitType::AIRCON, unit, RegId::new(0x05))
-            .is_some()
-        {
-            return;
-        }
-        // Fallback when the dump never delivered reg 05: synthesize from zones,
-        // choosing the zone with the largest |measured − set| differential (the
-        // room that most needs conditioning — MyTemp semantics). Hardcoding
-        // zone 1 here told MyAir5 "myzone=1" on every dump lacking reg 05,
-        // which can suppress its own auto-move decision.
-        let mut set_temp_x2 = 48; // 24°C fallback
-        let mut myzone_id = 1u8;
-        let mut max_diff_x2 = -1.0f64;
-        for z in 1u8..=10 {
-            if let Some(DecodedRegister::ZoneState(state)) =
-                self.bank
-                    .get_zone_decoded(UnitType::AIRCON, unit, RegId::new(0x03), z)
-            {
-                let meas_x2 = (f64::from(state.meas_int) + f64::from(state.meas_dec) / 10.0) * 2.0;
-                let diff = (meas_x2 - f64::from(state.set_temp_x2)).abs();
-                if diff > max_diff_x2 {
-                    max_diff_x2 = diff;
-                    set_temp_x2 = state.set_temp_x2;
-                    myzone_id = state.zone;
-                }
-            }
-        }
-        let status = SystemStatus {
-            power: Power::On,
-            mode: Mode::Cool,
-            fan: Fan::Auto,
-            set_temp_x2,
-            myzone_id,
-            fresh_air: FreshAir::None,
-            rf_sys_id: 0,
-        };
-        self.bank.apply(&system_status_record(unit, status));
-    }
-}
-
-/// Pull `<tag>…</tag>` inner text from a CB XML-ish payload.
-fn xml_tag<'a>(payload: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = payload.find(&open)? + open.len();
-    let end = payload[start..].find(&close)? + start;
-    Some(payload[start..end].trim())
-}
-
-fn system_status_record(unit_id: UnitId, status: SystemStatus) -> CanRecord {
-    CanRecord {
-        unit_type: UnitType::AIRCON,
-        dest: Dest::Tablet,
-        unit_id,
-        reg: RegId::new(0x05),
-        data: status.into(),
-    }
-}
-
-/// Map stock `getSystemData` XML into a [`SystemStatus`].
-fn parse_system_data_xml_status(payload: &[u8]) -> Option<SystemStatus> {
-    let text = std::str::from_utf8(payload).ok()?;
-    if !text.contains("<request>getSystemData</request>") {
-        return None;
-    }
-    let power_s = xml_tag(text, "state")?.to_ascii_lowercase();
-    let power = match power_s.as_str() {
-        "on" => Power::On,
-        "off" => Power::Off,
-        _ => return None,
-    };
-    let mode_s = xml_tag(text, "mode")?.to_ascii_lowercase();
-    let mode = match mode_s.as_str() {
-        "cool" => Mode::Cool,
-        "heat" => Mode::Heat,
-        "vent" => Mode::Vent,
-        "auto" => Mode::Auto,
-        "dry" => Mode::Dry,
-        "myauto" => Mode::MyAuto,
-        _ => return None,
-    };
-    let fan_s = xml_tag(text, "fan")?.to_ascii_lowercase();
-    let fan = match fan_s.as_str() {
-        "off" => Fan::Off,
-        "low" => Fan::Low,
-        "medium" | "med" => Fan::Medium,
-        "high" => Fan::High,
-        "auto" => Fan::Auto,
-        "autoaa" => Fan::AutoAa,
-        _ => return None,
-    };
-    let set_temp_c: f32 = xml_tag(text, "setTemp")?.parse().ok()?;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let set_temp_x2 = (set_temp_c * 2.0).round().clamp(0.0, 255.0) as u8;
-    let myzone_id: u8 = xml_tag(text, "myZone")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let fresh_s = xml_tag(text, "freshAir")
-        .unwrap_or("none")
-        .to_ascii_lowercase();
-    let fresh_air = match fresh_s.as_str() {
-        "on" => FreshAir::On,
-        "off" => FreshAir::Off,
-        _ => FreshAir::None,
-    };
-    Some(SystemStatus {
-        power,
-        mode,
-        fan,
-        set_temp_x2,
-        myzone_id,
-        fresh_air,
-        rf_sys_id: 0,
-    })
 }
 
 #[cfg(test)]
@@ -586,16 +354,13 @@ mod tests {
     use super::*;
     use aa_registers::{Dest, RegId, UnitId, UnitType};
 
-    /// Minimal stock-shaped getSystemData XML (tags the parser requires).
-    const SAMPLE_SYSTEM_XML: &[u8] = b"<request>getSystemData</request>
-<aircon><info><state>on</state><mode>cool</mode><fan>high</fan>
-<setTemp>24.0</setTemp><myZone>1</myZone><freshAir>none</freshAir></info></aircon>";
-
     fn sample_record() -> CanRecord {
+        // Reg 05 delivered by the bus for the live unit (same id that
+        // announces reg 06), so no unit-scoped flush gets queued after the dump.
         CanRecord {
             unit_type: UnitType::new(0x07),
             dest: Dest::Tablet,
-            unit_id: UnitId::try_new(0x0_ABCDE).unwrap(),
+            unit_id: UnitId::try_new(0x0_11111).unwrap(),
             reg: RegId::new(0x05),
             data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
         }
@@ -670,7 +435,7 @@ mod tests {
 
     #[test]
     fn can2_then_dump_like_stock_seeded_flush() {
-        // Regression: waiting for XML before dump loops forever (live CB only returns CAN2).
+        // Regression: negotiation only via CAN2 in use (live CB never sends XML).
         let mut s = Session::new();
         advance_to_dump(&mut s);
         assert_eq!(s.on_ping().expect("dump"), DUMP_SET_CAN);
@@ -702,21 +467,47 @@ mod tests {
     }
 
     #[test]
-    fn dump_can_records_exclude_synthesized_system_status() {
-        // Regression: USB rawCan has no reg 05; synthesized 05 must stay in the
-        // typed bank/DTO only, not in snapshot can_records for MyAir5.
+    fn dump_can_records_include_real_system_status() {
+        // D-9: a dump carrying a real reg 05 keeps it in the Snapshot
+        // can_records (nothing is fabricated or filtered out).
         let mut s = Session::new();
         advance_to_dump(&mut s);
         assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
-        let zone = CanRecord {
-            unit_type: UnitType::AIRCON,
-            dest: Dest::Unknown(0x03),
-            unit_id: UnitId::try_new(0x0_11111).unwrap(),
+        let rec = sample_record();
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
+        let Some(EngineEvent::Snapshot {
+            can_records: Some(recs),
+            ..
+        }) = ev
+            .into_iter()
+            .find(|e| matches!(e, EngineEvent::Snapshot { .. }))
+        else {
+            panic!("expected Snapshot with can_records");
+        };
+        assert!(
+            recs.iter().any(|r| &r[9..11] == "05"),
+            "can_records must include the real reg 05: {recs:?}"
+        );
+    }
+
+    #[test]
+    fn reg05_machinery_skipped_on_08_only_bank() {
+        // F-1: the reg-05 machinery is AIRCON-scoped. On an 08-only bank no
+        // AIRCON-typed record may be fabricated/queued for the 08 id (phantom
+        // 07 unit, setCAN addressed as type 07 to an 08 unit). No reg 05 may
+        // appear anywhere: not in the bank, not in can_records, and no
+        // unit-scoped flush queued.
+        let mut s = Session::new();
+        s.state = State::RequestDump;
+        s.dump_sent = true;
+        let rf = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_0ABCD).unwrap(),
             reg: RegId::new(0x03),
             data: [0x01, 0xe4, 0x01, 0x2c, 0x14, 0x05, 0x00],
         };
-        let live = live_unit_reg06();
-        let ev = s.on_frame(&get_can_payload(&[live.clone(), zone]));
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rf)));
         let Some(EngineEvent::Snapshot {
             bank,
             can_records: Some(recs),
@@ -726,83 +517,27 @@ mod tests {
         else {
             panic!("expected Snapshot with can_records");
         };
+        assert_eq!(s.state, State::Steady);
         assert!(
-            bank.get(UnitType::AIRCON, live.unit_id, RegId::new(0x05))
-                .is_some(),
-            "bank still has synthesized reg 05"
-        );
-        assert!(
-            recs.iter().all(|r| &r[9..11] != "05"),
-            "can_records must not include synthesized 05: {recs:?}"
-        );
-        assert!(recs.iter().any(|r| &r[9..11] == "03"));
-        assert!(recs.iter().any(|r| &r[9..11] == "06"));
-    }
-
-    #[test]
-    fn reg05_machinery_skipped_on_08_only_bank() {
-        // F-1: the reg-05 machinery is AIRCON-scoped. On an 08-only bank no
-        // AIRCON-typed record may be synthesized/queued for the 08 id (phantom
-        // 07 unit, setCAN addressed as type 07 to an 08 unit).
-        let mut s = Session::new();
-        let rf = CanRecord {
-            unit_type: UnitType::new(0x08),
-            dest: Dest::Tablet,
-            unit_id: UnitId::try_new(0x0_0ABCD).unwrap(),
-            reg: RegId::new(0x03),
-            data: [0x01, 0xe4, 0x01, 0x2c, 0x14, 0x05, 0x00],
-        };
-        s.bank.apply(&rf);
-
-        s.maybe_synthesize_system_status_from_zones();
-        assert!(
-            s.bank
-                .get(UnitType::AIRCON, rf.unit_id, RegId::new(0x05))
+            bank.get(UnitType::AIRCON, rf.unit_id, RegId::new(0x05))
                 .is_none(),
-            "no AIRCON-typed reg 05 may be synthesized for an 08 id"
+            "no AIRCON-typed reg 05 may be fabricated for an 08 id"
         );
         assert!(
-            !s.bank.has_unit(UnitType::AIRCON, rf.unit_id),
+            !bank.has_unit(UnitType::AIRCON, rf.unit_id),
             "no phantom AIRCON unit may appear"
         );
         assert!(
-            !s.needs_system_status_poll(),
-            "no getSystemData poll on an 08-only bank"
+            recs.iter().all(|r| &r[9..11] != "05"),
+            "can_records must not include reg 05 on an 08-only bank: {recs:?}"
         );
-        s.maybe_queue_unit_flush_for_missing_system_status();
         assert!(
             s.write_queue.is_empty(),
             "no AIRCON-typed setCAN may be queued for an 08 id"
         );
-    }
-
-    #[test]
-    fn steady_system_xml_skipped_on_08_only_bank() {
-        // F-1: steady-state getSystemData XML must not synthesize an
-        // AIRCON-typed reg 05 for the cross-type fallback id on an 08-only
-        // bank (phantom 07 unit).
-        let mut s = Session::new();
-        s.state = State::Steady;
-        let rf = CanRecord {
-            unit_type: UnitType::new(0x08),
-            dest: Dest::Tablet,
-            unit_id: UnitId::try_new(0x0_0ABCD).unwrap(),
-            reg: RegId::new(0x06),
-            data: [0; 7],
-        };
-        s.bank.apply(&rf);
-        let ev = s.on_frame(SAMPLE_SYSTEM_XML);
-        assert!(ev.is_empty(), "no reg-05 event on an 08-only bank: {ev:?}");
-        assert!(
-            s.bank
-                .get(UnitType::AIRCON, rf.unit_id, RegId::new(0x05))
-                .is_none(),
-            "no AIRCON-typed reg 05 may be synthesized for an 08 id"
-        );
-        assert!(
-            s.bank.unit_ids(UnitType::AIRCON).is_empty(),
-            "no phantom AIRCON unit may appear"
-        );
+        // Steady stays quiet: ack, then empty polls only.
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
     }
 
     #[test]
@@ -837,9 +572,11 @@ mod tests {
     }
 
     #[test]
-    fn dump_without_reg05_synthesizes_system_status_from_zones() {
-        // Regression: live dump has zones but never reg 05; UART getSystemData stays
-        // CAN2. Mailbox needs system_status so MyAir5 :2025 gets a non-empty aircons.
+    fn dump_without_reg05_fabricates_nothing_and_queues_unit_flush() {
+        // D-9: a dump without reg 05 (AIRCON unit + zones present) yields a bank
+        // with NO reg 05 slot and a Snapshot without a fabricated system_status;
+        // instead a unit-scoped reg-06 flush is queued to pull the missing reg 05
+        // from the bus.
         let mut s = Session::new();
         advance_to_dump(&mut s);
         assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
@@ -852,65 +589,42 @@ mod tests {
         };
         let live = live_unit_reg06();
         let ev = s.on_frame(&get_can_payload(&[live.clone(), zone]));
-        assert!(ev.iter().any(|e| matches!(e, EngineEvent::Snapshot { .. })));
-        let data = s
-            .bank
-            .get(
-                UnitType::AIRCON,
-                UnitId::try_new(0x0_11111).unwrap(),
-                RegId::new(0x05),
-            )
-            .expect("synthesized reg 05");
-        let status = SystemStatus::from(data);
-        assert_eq!(status.set_temp_x2, 0x2c);
-        assert_eq!(status.myzone_id, 1);
-        assert_eq!(status.power, Power::On);
-        // No unit flush / getSystemData hunt once system_status exists.
+        let Some(EngineEvent::Snapshot {
+            bank,
+            can_records: Some(recs),
+        }) = ev
+            .into_iter()
+            .find(|e| matches!(e, EngineEvent::Snapshot { .. }))
+        else {
+            panic!("expected Snapshot with can_records");
+        };
+        assert!(
+            bank.get(UnitType::AIRCON, live.unit_id, RegId::new(0x05))
+                .is_none(),
+            "no reg 05 may be fabricated when the dump omitted it"
+        );
+        assert!(
+            recs.iter().all(|r| &r[9..11] != "05"),
+            "can_records must not fabricate reg 05: {recs:?}"
+        );
+        assert!(recs.iter().any(|r| &r[9..11] == "03"));
+        assert!(recs.iter().any(|r| &r[9..11] == "06"));
+        // Ack first, then the queued TX rides the JZ18 replies + the unit-scoped
+        // reg-06 flush (two reg-06 announcements → two JZ18s).
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         let jz18 = build_jz18(UnitType::AIRCON, live.unit_id);
-        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
-        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
-    }
-
-    #[test]
-    fn dump_without_reg05_synthesizes_fallback_without_zones() {
-        // Even with no zone records, seed a default system_status so :2025 can create
-        // an aircon shell (zone events may arrive later).
-        let mut s = Session::new();
-        advance_to_steady(&mut s, &[live_unit_reg06()]);
-        let data = s
-            .bank
-            .get(
-                UnitType::AIRCON,
-                UnitId::try_new(0x0_11111).unwrap(),
-                RegId::new(0x05),
-            )
-            .expect("fallback reg 05");
-        assert_eq!(SystemStatus::from(data).set_temp_x2, 48);
-        // The dump feeds reg-06 twice (reset response + dump getCAN), so two
-        // JZ18 replies ride the first steady TX; empty poll follows.
-        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
-        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
-        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
-    }
-
-    #[test]
-    fn dump_without_reg05_skips_unit_flush_after_synthesis() {
-        // With synthesis seeding reg 05, unit-scoped flush is skipped (reg present).
-        let mut s = Session::new();
-        advance_to_dump(&mut s);
-        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
-        let live = live_unit_reg06();
-        let _ = s.on_frame(&get_can_payload(std::slice::from_ref(&live)));
-        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
-        let jz18 = build_jz18(live.unit_type, live.unit_id);
-        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
-        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
-        assert!(
-            s.bank
-                .get(UnitType::AIRCON, live.unit_id, RegId::new(0x05))
-                .is_some()
+        let flush = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: live.unit_id,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(&[jz18.clone(), jz18, flush])
         );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
     }
 
     #[test]
@@ -945,36 +659,6 @@ mod tests {
     }
 
     #[test]
-    fn steady_applies_system_xml_if_cb_ever_sends_it() {
-        // aaservice USB path: getSystemData poll eventually returns XML for MyAir5/:2025.
-        // After dump we synthesize reg 05; XML still overwrites when the bus ever returns it.
-        let mut s = Session::new();
-        advance_to_steady(&mut s, &[live_unit_reg06()]);
-        // Two reg-06 announcements (reset response + dump getCAN) → two JZ18s.
-        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
-        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
-        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
-
-        let ev = s.on_frame(SAMPLE_SYSTEM_XML);
-        assert!(matches!(
-            ev.as_slice(),
-            [EngineEvent::RegistersChanged { .. }]
-        ));
-        let live = UnitId::try_new(0x0_11111).unwrap();
-        let data = s
-            .bank
-            .get(UnitType::AIRCON, live, RegId::new(0x05))
-            .expect("reg 05 from XML");
-        let status = SystemStatus::from(data);
-        assert_eq!(status.power, Power::On);
-        assert_eq!(status.mode, Mode::Cool);
-        assert_eq!(status.set_temp_x2, 48);
-        assert_eq!(status.fan, Fan::High);
-        // Once system status exists, fall back to empty setCAN sync.
-        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
-    }
-
-    #[test]
     fn dump_with_reg05_skips_unit_scoped_flush() {
         let mut s = Session::new();
         advance_to_steady(&mut s, &[sample_record()]);
@@ -1004,48 +688,6 @@ mod tests {
             s.on_ping().is_none(),
             "must not send empty setCAN while can_in_use"
         );
-    }
-
-    #[test]
-    fn xml_before_dump_still_applies_to_live_unit_after_dump() {
-        // Optional path: bus free enough to return XML before the flush dump.
-        let mut s = Session::new();
-        assert_eq!(s.on_ping().unwrap(), GET_SYSTEM_DATA);
-        let _ = s.on_frame(SAMPLE_SYSTEM_XML);
-        assert!(s.pending_system.is_some());
-        assert_eq!(s.state, State::RequestDump);
-        assert_eq!(s.on_ping().unwrap(), DIRTY_RESET_SET_CAN);
-        let _ = s.on_frame(&get_can_payload(std::slice::from_ref(&live_unit_reg06())));
-        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
-        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
-
-        let live = live_unit_reg06();
-        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&live)));
-        assert!(
-            ev.iter()
-                .any(|e| matches!(e, EngineEvent::RegistersChanged { .. }))
-        );
-        assert!(ev.iter().any(|e| matches!(e, EngineEvent::Snapshot { .. })));
-        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
-
-        let data = s
-            .bank
-            .get(UnitType::AIRCON, live.unit_id, RegId::new(0x05))
-            .expect("reg 05 applied to live unit");
-        assert_eq!(SystemStatus::from(data).fan, Fan::High);
-    }
-
-    #[test]
-    fn parse_system_data_xml_status_round_trip_fields() {
-        let status = parse_system_data_xml_status(SAMPLE_SYSTEM_XML).expect("parse");
-        assert_eq!(status.power, Power::On);
-        assert_eq!(status.mode, Mode::Cool);
-        assert_eq!(status.fan, Fan::High);
-        assert_eq!(status.set_temp_x2, 48);
-        assert_eq!(status.myzone_id, 1);
-        assert_eq!(status.fresh_air, FreshAir::None);
-        assert!(parse_system_data_xml_status(b"CAN2 in use").is_none());
-        assert!(parse_system_data_xml_status(b"<request>other</request>").is_none());
     }
 
     #[test]
@@ -1166,51 +808,24 @@ mod tests {
     }
 
     #[test]
-    fn dump_without_reg05_synthesizes_worst_off_zone_as_myzone() {
-        // Regression: synthesis hardcoded zone 1; MyAir5 was told myzone=1 on
-        // every dump lacking reg 05, suppressing its auto-move. The synthesized
-        // myzone must be the zone with the largest |measured - set| diff.
-        let mut s = Session::new();
-        advance_to_dump(&mut s);
-        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
-        let zone1 = CanRecord {
-            unit_type: UnitType::AIRCON,
-            dest: Dest::Unknown(0x03),
-            unit_id: UnitId::try_new(0x0_11111).unwrap(),
-            reg: RegId::new(0x03),
-            data: [0x01, 0xe4, 0x01, 0x2c, 0x14, 0x05, 0x00], // zone 1, meas 20.5C -> diff 3 (small)
-        };
-        let zone3 = CanRecord {
-            unit_type: UnitType::AIRCON,
-            dest: Dest::Unknown(0x03),
-            unit_id: UnitId::try_new(0x0_11111).unwrap(),
-            reg: RegId::new(0x03),
-            data: [0x03, 0x64, 0x01, 0x2c, 0x14, 0x00, 0x00], // zone 3, meas 20.0C -> diff 4 (large)
-        };
-        let live = live_unit_reg06();
-        let _ = s.on_frame(&get_can_payload(&[live, zone1, zone3]));
-        let data = s
-            .bank
-            .get(
-                UnitType::AIRCON,
-                UnitId::try_new(0x0_11111).unwrap(),
-                RegId::new(0x05),
-            )
-            .expect("synthesized reg 05");
-        let status = SystemStatus::from(data);
-        assert_eq!(status.myzone_id, 3);
-    }
-
-    #[test]
     fn reg06_announcement_queues_jz18() {
         // aa_interop §7.3: every reg-06 announcement gets an all-zero reg-07
         // reply on the next TX after ack, echoing unit type + id. The dump
         // feeds reg-06 twice (reset response + dump getCAN), so two replies
-        // ride the first steady TX.
+        // ride the first steady TX, alongside the unit-scoped reg-06 flush
+        // queued because the dump carried no reg 05.
         let mut s = Session::new();
         advance_to_steady(&mut s, &[live_unit_reg06()]);
-        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
-        let expected = build_set_can(&[jz18.clone(), jz18]);
+        let live = live_unit_reg06();
+        let jz18 = build_jz18(UnitType::AIRCON, live.unit_id);
+        let flush = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: live.unit_id,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        let expected = build_set_can(&[jz18.clone(), jz18, flush]);
         assert_eq!(s.on_ping().unwrap(), expected);
     }
 
@@ -1231,10 +846,19 @@ mod tests {
         assert!(ev.iter().any(|e| matches!(e, EngineEvent::Snapshot { .. })));
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         // Reset-response getCAN already queued the AIRCON (07) reply; the dump
-        // adds the type-08 reply echoing the announcement's unit type.
+        // adds the type-08 reply echoing the announcement's unit type. The
+        // reg-05-less dump also queues a unit-scoped flush for the AIRCON unit.
+        let flush = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: live_unit_reg06().unit_id,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
         let expected = build_set_can(&[
             build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id),
             build_jz18(rf.unit_type, rf.unit_id),
+            flush,
         ]);
         assert_eq!(s.on_ping().unwrap(), expected);
     }

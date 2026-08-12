@@ -19,8 +19,6 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::mock_feeder::FEEDER_UNIT_ID;
-
 /// Held engine snapshot for late WebSocket clients (bank).
 #[derive(Debug, Clone)]
 pub(crate) struct HeldSnapshot {
@@ -70,9 +68,9 @@ pub(crate) const fn map_session_state(state: aa_engine::SessionState) -> StatusS
 ///
 /// A hint present in the bank wins (preferring AIRCON when the id exists under
 /// multiple types); else the smallest unit id across all unit types (tie-break
-/// by unit type byte); empty bank falls back to `(AIRCON, hint |
-/// FEEDER_UNIT_ID)` for the mock feeder.
-fn primary_unit(bank: &RegisterBank, hint: Option<UnitId>) -> (UnitType, UnitId) {
+/// by unit type byte); an empty bank with a hint set reports `(AIRCON, hint)`;
+/// an empty bank with no hint returns `None` (no primary unit available).
+fn primary_unit(bank: &RegisterBank, hint: Option<UnitId>) -> Option<(UnitType, UnitId)> {
     if let Some(hint) = hint {
         let found = if bank.unit_ids(UnitType::AIRCON).contains(&hint) {
             Some(UnitType::AIRCON)
@@ -82,7 +80,7 @@ fn primary_unit(bank: &RegisterBank, hint: Option<UnitId>) -> (UnitType, UnitId)
                 .find(|t| bank.unit_ids(*t).contains(&hint))
         };
         if let Some(unit_type) = found {
-            return (unit_type, hint);
+            return Some((unit_type, hint));
         }
     }
     let mut best: Option<(UnitType, UnitId)> = None;
@@ -102,7 +100,10 @@ fn primary_unit(bank: &RegisterBank, hint: Option<UnitId>) -> (UnitType, UnitId)
             Some(cur) => cur,
         });
     }
-    best.unwrap_or_else(|| (UnitType::AIRCON, hint.unwrap_or(FEEDER_UNIT_ID)))
+    match best {
+        Some((unit_type, unit_id)) => Some((unit_type, unit_id)),
+        None => hint.map(|hint| (UnitType::AIRCON, hint)),
+    }
 }
 
 /// Build the axum router with `GET /v1/mailbox-stream`.
@@ -153,8 +154,9 @@ async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Resul
         };
         send_json(&mut socket, &status).await?;
     }
-    let (_, unit_id) = primary_unit(&held.bank, state.unit_id_hint);
-    info!(%unit_id, "mailbox snapshot unit_id");
+    if let Some((_, unit_id)) = primary_unit(&held.bank, state.unit_id_hint) {
+        info!(%unit_id, "mailbox snapshot unit_id");
+    }
     let snap = ServerMessage::Snapshot {
         units: snapshot_units(&held.bank),
     };
@@ -471,15 +473,17 @@ struct WriteRequest {
 
 /// Resolve and encode a `write` into a single-register [`CanRecord`].
 ///
-/// Omitted `unit_type` / `unit_id` default to the bank's primary unit (or the
-/// hint / feeder id when no snapshot exists); a `unit_id` present under exactly
-/// one unit type resolves that type when `unit_type` is omitted. Zone-bearing
+/// Omitted `unit_type` / `unit_id` default to the bank's primary unit when a
+/// snapshot exists; a `unit_id` present under exactly one unit type resolves
+/// that type when `unit_type` is omitted. Without a snapshot the hint supplies
+/// the id (type AIRCON) and fails when no hint is configured. Zone-bearing
 /// registers (`03`/`04`) stamp the client's zone into wire byte 0.
 ///
 /// # Errors
 ///
-/// Returns a human-readable reason for invalid identifiers/register or an
-/// unencodable payload (mirrors the ack `reason` field).
+/// Returns a human-readable reason for invalid identifiers/register, an
+/// unencodable payload (mirrors the ack `reason` field), or no primary unit
+/// when neither a bank nor a hint is available.
 fn build_write_record(
     bank: Option<&RegisterBank>,
     hint: Option<UnitId>,
@@ -489,10 +493,12 @@ fn build_write_record(
     zone: Option<u8>,
     payload: &Value,
 ) -> Result<CanRecord, String> {
-    let (primary_type, primary_id) = bank.map_or_else(
-        || (UnitType::AIRCON, hint.unwrap_or(FEEDER_UNIT_ID)),
-        |bank| primary_unit(bank, hint),
-    );
+    let (primary_type, primary_id) = bank
+        .map_or_else(
+            || hint.map(|id| (UnitType::AIRCON, id)),
+            |bank| primary_unit(bank, hint),
+        )
+        .ok_or_else(|| "no primary unit available".to_owned())?;
     let parsed_type = unit_type
         .map(|s| UnitType::from_hex(&s))
         .transpose()
@@ -605,7 +611,7 @@ mod tests {
     use aa_registers::{CanRecord, Dest, RegId, UnitType};
 
     #[test]
-    fn primary_unit_prefers_live_dump_over_feeder_default() {
+    fn primary_unit_prefers_live_dump_over_hint_default() {
         // Regression: mailbox snapshot used hardcoded abcde while AOA dump was 11111.
         let mut bank = RegisterBank::new();
         let live = UnitId::try_new(0x0_11111).unwrap();
@@ -616,15 +622,18 @@ mod tests {
             reg: RegId::new(0x06),
             data: [0; 7],
         });
-        assert_eq!(primary_unit(&bank, Some(live)), (UnitType::AIRCON, live));
-        assert_eq!(primary_unit(&bank, None), (UnitType::AIRCON, live));
-        // Empty bank still falls back to feeder id (or hint).
-        let empty = RegisterBank::new();
         assert_eq!(
-            primary_unit(&empty, None),
-            (UnitType::AIRCON, FEEDER_UNIT_ID)
+            primary_unit(&bank, Some(live)),
+            Some((UnitType::AIRCON, live))
         );
-        assert_eq!(primary_unit(&empty, Some(live)), (UnitType::AIRCON, live));
+        assert_eq!(primary_unit(&bank, None), Some((UnitType::AIRCON, live)));
+        // Empty bank: no primary; hint alone supplies (AIRCON, hint).
+        let empty = RegisterBank::new();
+        assert_eq!(primary_unit(&empty, None), None);
+        assert_eq!(
+            primary_unit(&empty, Some(live)),
+            Some((UnitType::AIRCON, live))
+        );
     }
 
     #[test]
@@ -646,7 +655,10 @@ mod tests {
             reg: RegId::new(0x06),
             data: [0; 7],
         });
-        assert_eq!(primary_unit(&bank, None), (UnitType::new(0x08), small));
+        assert_eq!(
+            primary_unit(&bank, None),
+            Some((UnitType::new(0x08), small))
+        );
     }
 
     #[test]
@@ -670,7 +682,7 @@ mod tests {
         });
         assert_eq!(
             primary_unit(&bank, Some(split)),
-            (UnitType::new(0x08), split)
+            Some((UnitType::new(0x08), split))
         );
     }
 
@@ -728,7 +740,7 @@ mod tests {
         // with unit type 08.
         let rec = build_write_record(
             None,
-            None,
+            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
             Some("08".to_owned()),
             Some("abcde".to_owned()),
             "05",
@@ -801,9 +813,30 @@ mod tests {
     }
 
     #[test]
+    fn build_write_record_errors_without_primary_when_bank_empty_and_no_hint() {
+        // D-9: no FEEDER_UNIT_ID fallback — omitted addressing with no bank
+        // and no hint must error instead of silently targeting the mock id.
+        let err = build_write_record(None, None, None, None, "05", None, &write_payload())
+            .expect_err("no primary unit available");
+        assert_eq!(err, "no primary unit available");
+        let empty = RegisterBank::new();
+        let err = build_write_record(Some(&empty), None, None, None, "05", None, &write_payload())
+            .expect_err("no primary unit available");
+        assert_eq!(err, "no primary unit available");
+    }
+
+    #[test]
     fn build_write_record_stamps_zone_for_zone_bearing_register() {
-        let rec = build_write_record(None, None, None, None, "03", Some(2), &write_payload())
-            .expect("record");
+        let rec = build_write_record(
+            None,
+            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            None,
+            None,
+            "03",
+            Some(2),
+            &write_payload(),
+        )
+        .expect("record");
         assert_eq!(rec.reg, RegId::new(0x03));
         assert_eq!(rec.data[0], 2, "zone must be stamped into wire byte 0");
     }
