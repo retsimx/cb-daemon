@@ -11,7 +11,9 @@ pub mod wire;
 pub use bank::{BankKey, RegisterBank, ZONE_BEARING_REGS, is_zone_bearing};
 pub use ids::{IdError, RegId, UNIT_ID_MAX, UnitId, UnitType};
 pub use typed::{
-    DecodedRegister, Fan, FirmwareStatus, FreshAir, Mode, Power, SensorType, SystemStatus,
-    ZoneConfig, ZoneState,
+    Action, ActivationCode, ActivationStatus, DecodedRegister, Fan, FirmwareStatus, FreshAir,
+    InfoByte, Mode, Power, RfDeviceCalibration, RfDevicePairing, SensorPairingRead,
+    SensorPairingWrite, SensorType, SystemError, SystemStatus, UnitActivation, UnitAnnouncement,
+    UnitBrand, ZoneConfig, ZoneLimits, ZoneState,
 };
 pub use wire::{CanRecord, Dest, RECORD_HEX_LEN, WireError};
