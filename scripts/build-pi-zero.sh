@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 TARGET="arm-unknown-linux-musleabihf"
-CRATES=(aa-crc aa-frame aa-registers aa-link)
+BIN="cb-daemon"
 
 if ! command -v cross >/dev/null 2>&1; then
   cat >&2 <<'MSG'
@@ -22,6 +22,6 @@ MSG
   exit 1
 fi
 
-for crate in "${CRATES[@]}"; do
-  cross build -p "$crate" --target "$TARGET" --release
-done
+cross build -p "$BIN" --target "$TARGET" --release
+
+echo "built target/$TARGET/release/$BIN"
