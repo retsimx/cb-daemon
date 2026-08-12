@@ -2,7 +2,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use aa_engine::{CbEngine, EngineCmd, EngineEvent};
@@ -228,7 +227,6 @@ async fn run_with_link<L: Link + 'static>(
         cmd_tx: cmd_tx.clone(),
         snapshot: snapshot_rx,
         events: broadcast_tx,
-        session_held: Arc::new(AtomicBool::new(false)),
         cmd_spy,
         unit_id_hint,
     };

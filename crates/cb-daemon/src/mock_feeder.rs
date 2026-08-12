@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aa_frame::Frame;
+use aa_frame::{Frame, FrameScanner};
 use aa_link::{Link, MockLink};
 use aa_registers::{CanRecord, Dest, RegId, UnitId, UnitType};
 use tokio::sync::{Mutex, Notify};
@@ -102,9 +102,28 @@ const fn sample_record() -> CanRecord {
 }
 
 fn get_can_with_sample() -> Vec<u8> {
-    let rec = sample_record();
+    get_can_from_records(&[sample_record()])
+}
+
+/// Parse the records carried by the first `setCAN …` frame in `written`.
+fn parse_set_can_records(written: &[u8]) -> Option<Vec<CanRecord>> {
+    let frames = FrameScanner::new().push(written).ok()?;
+    for frame in frames {
+        if let Some(body) = frame.payload.strip_prefix(b"setCAN ") {
+            return CanRecord::parse_many(std::str::from_utf8(body).ok()?).ok();
+        }
+    }
+    None
+}
+
+/// Build `getCAN 1 …` carrying `records` (empty when there are none).
+fn get_can_from_records(records: &[CanRecord]) -> Vec<u8> {
     let mut body = b"getCAN 1 ".to_vec();
-    body.extend_from_slice(rec.to_wire().as_bytes());
+    for rec in records {
+        body.extend_from_slice(rec.to_wire().as_bytes());
+        body.push(b' ');
+    }
+    body.pop();
     body
 }
 
@@ -187,7 +206,44 @@ async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
     true
 }
 
+/// Reply to one polled `written` batch. Dispatch order matters: engine-internal
+/// setCAN payloads (dump/resync, empty poll) are matched before generic
+/// record parsing so they are never treated as write echoes.
+async fn reply_to_poll(
+    mock: &Arc<Mutex<MockLink>>,
+    notify: &Notify,
+    written: Vec<u8>,
+    pending_echo: &mut Vec<CanRecord>,
+) {
+    if written_has_frame(&written, DUMP_SET_CAN) {
+        push_frame(mock, notify, &get_can_with_sample()).await;
+    } else if written_has_frame(&written, GET_SYSTEM_DATA) {
+        push_frame(mock, notify, SAMPLE_SYSTEM_XML).await;
+    } else if written_has_frame(&written, ACK_CAN) {
+        // Ack consumed; wait for next Ping cycle.
+    } else if written_has_frame(&written, EMPTY_SET_CAN) {
+        // Empty poll: report applied-but-unreported registers (write echo),
+        // else a bare getCAN request.
+        if pending_echo.is_empty() {
+            push_frame(mock, notify, b"getCAN 1").await;
+        } else {
+            push_frame(mock, notify, &get_can_from_records(pending_echo)).await;
+            pending_echo.clear();
+        }
+    } else if let Some(records) = parse_set_can_records(&written) {
+        // setCAN carrying write records → the CB applies the write and
+        // reports the updated registers back in its next getCAN
+        // (aaservice parity); queue the echo so RegistersChanged fan-out
+        // events reach WebSocket sessions after the write's ack.
+        pending_echo.extend(records);
+    }
+}
+
 async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
+    // Register records the CB has applied but not yet reported (write echo,
+    // deferred until the next empty poll so the WriteFlushed ack — sent on
+    // TX — always precedes the RegistersChanged fan-out event).
+    let mut pending_echo: Vec<CanRecord> = Vec::new();
     loop {
         // Detect closed link without reading inbound (would corrupt queued frames).
         {
@@ -226,17 +282,7 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
             continue;
         }
 
-        let written = take_written(&mock).await;
-        if written_has_frame(&written, DUMP_SET_CAN) {
-            push_frame(&mock, &notify, &get_can_with_sample()).await;
-        } else if written_has_frame(&written, GET_SYSTEM_DATA) {
-            push_frame(&mock, &notify, SAMPLE_SYSTEM_XML).await;
-        } else if written_has_frame(&written, ACK_CAN) {
-            // Ack consumed; wait for next Ping cycle.
-        } else {
-            // EMPTY_SET_CAN or setCAN with write records → reply getCAN.
-            push_frame(&mock, &notify, b"getCAN 1").await;
-        }
+        reply_to_poll(&mock, &notify, take_written(&mock).await, &mut pending_echo).await;
         sleep(Duration::from_millis(10)).await;
     }
 }
