@@ -6,7 +6,7 @@ use std::sync::Arc;
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
     AckStatus, ClientMessage, PolicyMode, ServerMessage, StatusState, decode_payload,
-    encode_payload, event_body, snapshot_units, write_policy,
+    encode_payload, event_body, snapshot_units, validate_write, write_policy,
 };
 use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
 use axum::Router;
@@ -796,6 +796,7 @@ fn build_write_record(
 ) -> Result<CanRecord, String> {
     let (unit_type, unit_id) = resolve_unit(bank, hint, unit_type, unit_id)?;
     let reg = RegId::from_hex(register).map_err(|err| format!("invalid register: {err:?}"))?;
+    validate_write(reg, payload).map_err(|e| e.to_string())?;
     let mut data = encode_payload(reg, payload).map_err(|err| err.to_string())?;
     // The zone id is part of the CAN address, not the payload: the codec stamps
     // wire byte 0 as 0x00, so a zone-bearing write (regs 03/04) addressed by
@@ -1267,5 +1268,22 @@ mod tests {
         };
         assert_eq!(status, AckStatus::Error);
         assert_eq!(reason.as_deref(), Some("register 02 has no value"));
+    }
+
+    #[test]
+    fn build_write_record_rejects_read_only_register() {
+        // D-6: a write to a read-only register is rejected with the exact
+        // WriteError reason before any encoding / bus traffic.
+        let err = build_write_record(
+            None,
+            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            None,
+            None,
+            "08",
+            None,
+            &serde_json::json!({}),
+        )
+        .expect_err("read-only register write must be rejected");
+        assert_eq!(err, "register 08 is read-only");
     }
 }

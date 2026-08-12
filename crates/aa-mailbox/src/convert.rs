@@ -76,7 +76,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::error::EncodeError;
+use crate::error::{EncodeError, WriteError};
+use crate::policy::{PolicyMode, write_policy};
 
 use self::codec::{
     decode_activation_code, decode_firmware, decode_info_byte, decode_rf_device_calibration,
@@ -161,6 +162,184 @@ pub fn decode_payload(reg: RegId, data: [u8; 7]) -> Result<Value, EncodeError> {
 
 /// Maximum zone id scanned for zone-bearing registers in a snapshot.
 const MAX_ZONE: u8 = 10;
+
+/// A single wire-range bound for a register (issue #32).
+struct WireRange {
+    /// Wire byte index per the register layout.
+    index: usize,
+    /// Display field name (issue #32).
+    field: &'static str,
+    /// Inclusive maximum wire value.
+    max: u8,
+    /// Bit mask applied to the wire byte before the comparison.
+    mask: u8,
+}
+
+/// Per-register wire-range table (issue #32). Only regs `01`/`03`/`04`/`05`
+/// carry ranges; all other registers skip the range check.
+const WIRE_RANGES: &[(u8, &[WireRange])] = &[
+    (
+        0x01,
+        &[
+            WireRange {
+                index: 1,
+                field: "numZones",
+                max: 10,
+                mask: 0xff,
+            },
+            WireRange {
+                index: 2,
+                field: "numConstants",
+                max: 3,
+                mask: 0xff,
+            },
+        ],
+    ),
+    (
+        0x03,
+        &[
+            WireRange {
+                index: 1,
+                field: "damper",
+                max: 100,
+                mask: 0x7f,
+            },
+            WireRange {
+                index: 3,
+                field: "setTemp×2",
+                max: 80,
+                mask: 0xff,
+            },
+            WireRange {
+                index: 5,
+                field: "measDec",
+                max: 9,
+                mask: 0xff,
+            },
+        ],
+    ),
+    (
+        0x04,
+        &[
+            WireRange {
+                index: 3,
+                field: "motion",
+                max: 22,
+                mask: 0xff,
+            },
+            WireRange {
+                index: 4,
+                field: "motionConfig",
+                max: 2,
+                mask: 0xff,
+            },
+        ],
+    ),
+    (
+        0x05,
+        &[
+            WireRange {
+                index: 1,
+                field: "mode",
+                max: 6,
+                mask: 0xff,
+            },
+            WireRange {
+                index: 3,
+                field: "setTemp×2",
+                max: 80,
+                mask: 0xff,
+            },
+            WireRange {
+                index: 5,
+                field: "freshAir",
+                max: 2,
+                mask: 0xff,
+            },
+            WireRange {
+                index: 6,
+                field: "rfSysId",
+                max: 16,
+                mask: 0xff,
+            },
+            WireRange {
+                index: 4,
+                field: "myzone",
+                max: 10,
+                mask: 0xff,
+            },
+        ],
+    ),
+];
+
+/// Wire ranges for a register id (empty when the register has none).
+fn wire_ranges(reg: u8) -> &'static [WireRange] {
+    match WIRE_RANGES.iter().find(|(r, _)| *r == reg) {
+        Some((_, ranges)) => ranges,
+        None => &[],
+    }
+}
+
+/// Check wire bytes against the register's range table; first violation wins.
+fn check_ranges(reg: u8, data: [u8; 7]) -> Result<(), WriteError> {
+    for range in wire_ranges(reg) {
+        let value = data[range.index] & range.mask;
+        if value > range.max {
+            return Err(WriteError::OutOfRange {
+                field: range.field,
+                value,
+                max: range.max,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a register write against the D-4 write policy and the wire ranges
+/// (issue #32).
+///
+/// Precedence: mode → field → range. Raw-hex payloads bypass the field and
+/// range checks (client responsibility) but still fail the mode check. A typed
+/// payload that fails to encode skips the range check — the outer write path
+/// surfaces the real [`EncodeError`].
+///
+/// # Errors
+///
+/// Returns [`WriteError::ReadOnlyRegister`] / [`WriteError::InternalRegister`]
+/// / [`WriteError::UnverifiedRegister`] for non-writable registers,
+/// [`WriteError::ReadOnlyField`] for a typed payload carrying a read-only
+/// field, and [`WriteError::OutOfRange`] for a wire value above its bound.
+pub fn validate_write(reg: RegId, payload: &Value) -> Result<(), WriteError> {
+    let policy = write_policy(reg);
+    match policy.mode {
+        PolicyMode::ReadOnly => return Err(WriteError::ReadOnlyRegister { reg: reg.get() }),
+        PolicyMode::Internal => return Err(WriteError::InternalRegister { reg: reg.get() }),
+        PolicyMode::Unverified => return Err(WriteError::UnverifiedRegister { reg: reg.get() }),
+        PolicyMode::WriteOnly | PolicyMode::ReadWrite => {}
+    }
+    if payload.as_str().is_some() {
+        return Ok(());
+    }
+    if let Some(obj) = payload.as_object() {
+        for key in obj.keys() {
+            if let Some(field) = policy
+                .read_only_fields
+                .iter()
+                .copied()
+                .find(|f| *f == key.as_str())
+            {
+                return Err(WriteError::ReadOnlyField {
+                    reg: reg.get(),
+                    field,
+                });
+            }
+        }
+    }
+    let Ok(data) = encode_payload(reg, payload) else {
+        return Ok(());
+    };
+    check_ranges(reg.get(), data)
+}
 
 /// Build the multi-unit snapshot body from a register bank.
 ///
@@ -354,4 +533,250 @@ fn measured_from_c(temp_c: f64) -> (u8, u8) {
         }
     };
     (meas_int, meas_dec)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{check_ranges, validate_write};
+    use crate::error::WriteError;
+    use aa_registers::RegId;
+    use serde_json::{Value, json};
+
+    fn raw_hex(hex: &str) -> Value {
+        Value::String(hex.to_owned())
+    }
+
+    #[test]
+    fn typed_write_to_read_only_register_rejected() {
+        let err = validate_write(RegId::new(0x08), &json!({})).unwrap_err();
+        assert_eq!(err, WriteError::ReadOnlyRegister { reg: 0x08 });
+    }
+
+    #[test]
+    fn raw_hex_write_to_read_only_register_rejected() {
+        let err = validate_write(RegId::new(0x08), &raw_hex("41413100000000")).unwrap_err();
+        assert_eq!(err, WriteError::ReadOnlyRegister { reg: 0x08 });
+    }
+
+    #[test]
+    fn typed_write_with_read_only_field_rejected() {
+        let err = validate_write(
+            RegId::new(0x03),
+            &json!({ "open": true, "damper_pct": 50, "measured_temp_c": 23.1 }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            WriteError::ReadOnlyField {
+                reg: 0x03,
+                field: "measured_temp_c",
+            }
+        );
+    }
+
+    #[test]
+    fn typed_write_with_only_writable_fields_accepted() {
+        let result = validate_write(
+            RegId::new(0x03),
+            &json!({ "open": true, "damper_pct": 50, "target_temp_c": 24.0 }),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn raw_hex_write_to_writable_register_accepted() {
+        let result = validate_write(RegId::new(0x05), &raw_hex("01010330000100"));
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn write_to_internal_register_rejected() {
+        let err = validate_write(RegId::new(0x07), &json!({})).unwrap_err();
+        assert_eq!(err, WriteError::InternalRegister { reg: 0x07 });
+    }
+
+    #[test]
+    fn write_to_unverified_register_rejected() {
+        let err = validate_write(RegId::new(0x1e), &json!({})).unwrap_err();
+        assert_eq!(err, WriteError::UnverifiedRegister { reg: 0x1e });
+    }
+
+    #[test]
+    fn typed_write_to_write_only_register_accepted() {
+        let result = validate_write(
+            RegId::new(0x09),
+            &json!({ "action": "set_code", "unlock_code": "abcd", "activation_days": 30 }),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn reg01_typed_write_range_via_validate_write() {
+        let payload = |zones: u8| {
+            json!({
+                "header": 0x20,
+                "total_zones": zones,
+                "constant_zones": 1,
+                "constant_zone_ids": [1, 0, 0],
+                "filter_clean_required": false,
+            })
+        };
+        assert_eq!(
+            validate_write(RegId::new(0x01), &payload(10)),
+            Ok(()),
+            "numZones at bound accepted"
+        );
+        let err = validate_write(RegId::new(0x01), &payload(11)).unwrap_err();
+        assert_eq!(
+            err,
+            WriteError::OutOfRange {
+                field: "numZones",
+                value: 11,
+                max: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn raw_hex_write_bypasses_range_checks() {
+        // Mode byte 7 is out of range but raw-hex writes skip the range check.
+        let result = validate_write(RegId::new(0x05), &raw_hex("01070000000000"));
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn range_boundaries_reg01() {
+        assert_eq!(check_ranges(0x01, [0, 10, 3, 0, 0, 0, 0]), Ok(()));
+        assert_eq!(
+            check_ranges(0x01, [0, 11, 3, 0, 0, 0, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "numZones",
+                value: 11,
+                max: 10
+            }
+        );
+        assert_eq!(
+            check_ranges(0x01, [0, 10, 4, 0, 0, 0, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "numConstants",
+                value: 4,
+                max: 3
+            }
+        );
+    }
+
+    #[test]
+    fn range_boundaries_reg03() {
+        assert_eq!(check_ranges(0x03, [0, 100, 0, 80, 0, 9, 0]), Ok(()));
+        assert_eq!(
+            check_ranges(0x03, [0, 101, 0, 80, 0, 9, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "damper",
+                value: 101,
+                max: 100
+            }
+        );
+        assert_eq!(
+            check_ranges(0x03, [0, 0xe4, 0, 80, 0, 9, 0]),
+            Ok(()),
+            "damper 100 with the open flag (bit 7) set is accepted"
+        );
+        assert_eq!(
+            check_ranges(0x03, [0, 0xe5, 0, 80, 0, 9, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "damper",
+                value: 101,
+                max: 100
+            }
+        );
+        assert_eq!(
+            check_ranges(0x03, [0, 100, 0, 81, 0, 9, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "setTemp×2",
+                value: 81,
+                max: 80
+            }
+        );
+        assert_eq!(
+            check_ranges(0x03, [0, 100, 0, 80, 0, 10, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "measDec",
+                value: 10,
+                max: 9
+            }
+        );
+    }
+
+    #[test]
+    fn range_boundaries_reg04() {
+        assert_eq!(check_ranges(0x04, [0, 0, 0, 22, 2, 0, 0]), Ok(()));
+        assert_eq!(
+            check_ranges(0x04, [0, 0, 0, 23, 2, 0, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "motion",
+                value: 23,
+                max: 22
+            }
+        );
+        assert_eq!(
+            check_ranges(0x04, [0, 0, 0, 22, 3, 0, 0]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "motionConfig",
+                value: 3,
+                max: 2
+            }
+        );
+    }
+
+    #[test]
+    fn range_boundaries_reg05() {
+        assert_eq!(check_ranges(0x05, [0, 6, 0, 80, 10, 2, 16]), Ok(()));
+        assert_eq!(
+            check_ranges(0x05, [0, 7, 0, 80, 10, 2, 16]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "mode",
+                value: 7,
+                max: 6
+            }
+        );
+        assert_eq!(
+            check_ranges(0x05, [0, 6, 0, 81, 10, 2, 16]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "setTemp×2",
+                value: 81,
+                max: 80
+            }
+        );
+        assert_eq!(
+            check_ranges(0x05, [0, 6, 0, 80, 10, 3, 16]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "freshAir",
+                value: 3,
+                max: 2
+            }
+        );
+        assert_eq!(
+            check_ranges(0x05, [0, 6, 0, 80, 10, 2, 17]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "rfSysId",
+                value: 17,
+                max: 16
+            }
+        );
+        assert_eq!(
+            check_ranges(0x05, [0, 6, 0, 80, 11, 2, 16]).unwrap_err(),
+            WriteError::OutOfRange {
+                field: "myzone",
+                value: 11,
+                max: 10
+            }
+        );
+    }
+
+    #[test]
+    fn ranges_skipped_for_registers_without_table() {
+        assert_eq!(check_ranges(0x09, [0xff; 7]), Ok(()));
+        assert_eq!(check_ranges(0x1e, [0xff; 7]), Ok(()));
+    }
 }
