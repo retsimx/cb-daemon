@@ -12,7 +12,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 async fn spawn_daemon() -> cb_daemon::AppHandle {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -61,6 +60,93 @@ async fn recv_json(
     .expect("recv timeout")
 }
 
+/// Read one JSON text message; `None` on close / EOF / error (pings ponged).
+///
+/// For watcher loops that must distinguish "closed" from "no message yet" —
+/// callers wrap with their own `timeout`.
+async fn recv_json_or_close(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<Value> {
+    loop {
+        let Some(Ok(msg)) = ws.next().await else {
+            return None;
+        };
+        match msg {
+            Message::Text(text) => return serde_json::from_str(&text).ok(),
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await.ok();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Reg-05 (aircon) write request; the `msg_id` is the only varying field
+/// across the write tests.
+fn reg05_write(msg_id: &str) -> Value {
+    json!({
+        "type": "write",
+        "msg_id": msg_id,
+        "register": "05",
+        "payload": {
+            "power": "on",
+            "mode": "cool",
+            "fan": "high",
+            "target_temp_c": 23.0,
+            "myzone_id": 0,
+            "fresh_air": false,
+            "rf_sys_id": 0
+        }
+    })
+}
+
+/// Wait until the ack for `msg_id` arrives; panics on close/timeout.
+async fn wait_for_ack(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    msg_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(ws)
+                .await
+                .expect("closed before ack arrived");
+            if msg["type"] == "ack" && msg["msg_id"] == msg_id {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("ack timeout")
+}
+
+/// Wait until the reg-`register` event from `unit_id` arrives; panics on
+/// close/timeout.
+async fn wait_for_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    register: &str,
+    unit_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(ws)
+                .await
+                .expect("closed before event arrived");
+            if msg["type"] == "event" && msg["register"] == register {
+                assert_eq!(msg["unit_id"], unit_id);
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("event timeout")
+}
+
 #[tokio::test]
 async fn mock_backend_ws_receives_mailbox_snapshot() {
     let handle = spawn_daemon().await;
@@ -84,42 +170,10 @@ async fn mock_backend_ws_receives_mailbox_snapshot() {
     handle.shutdown().await.expect("shutdown");
 }
 
+/// Holder disconnects before Snapshot → no registry/gate: a second client
+/// must connect and stay connected (no close frame at all).
 #[tokio::test]
-async fn second_client_gets_close_4009() {
-    let handle = spawn_daemon().await;
-    let addr = handle.local_addr();
-    let mut first = connect_ws(addr).await;
-    let _ = recv_json(&mut first).await; // snapshot — session held
-
-    let url = format!("ws://{addr}/v1/mailbox-stream");
-    let (mut second, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("second connect");
-
-    let close = timeout(Duration::from_secs(3), async {
-        loop {
-            match second.next().await {
-                Some(Ok(Message::Close(Some(frame)))) => return frame,
-                Some(Ok(Message::Close(None))) => panic!("close without frame"),
-                Some(Ok(_)) => {}
-                Some(Err(err)) => panic!("ws error: {err}"),
-                None => panic!("stream ended without close"),
-            }
-        }
-    })
-    .await
-    .expect("close timeout");
-
-    assert_eq!(close.code, CloseCode::Library(4009));
-    assert_eq!(close.reason, "Single client limit enforced");
-
-    let _ = first.close(None).await;
-    handle.shutdown().await.expect("shutdown");
-}
-
-/// Holder disconnects before Snapshot → session gate must release (QA MEDIUM).
-#[tokio::test]
-async fn disconnect_before_snapshot_releases_session_gate() {
+async fn disconnect_before_snapshot_second_client_stays_connected() {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let handle = App::spawn_mock_without_feeder(bind)
         .await
@@ -136,7 +190,9 @@ async fn disconnect_before_snapshot_releases_session_gate() {
     })
     .await;
 
-    // Gate must be free: a second client must not receive 4009.
+    // No gate: a second client connects and stays connected. There is no
+    // feeder, so no Snapshot ever arrives — the assertion is that the session
+    // is simply never rejected with a close.
     let url = format!("ws://{addr}/v1/mailbox-stream");
     let (mut second, _) = timeout(
         Duration::from_secs(3),
@@ -146,13 +202,10 @@ async fn disconnect_before_snapshot_releases_session_gate() {
     .expect("connect timeout")
     .expect("second connect");
 
-    let rejected = timeout(Duration::from_millis(500), async {
+    let closed = timeout(Duration::from_secs(1), async {
         loop {
             match second.next().await {
-                Some(Ok(Message::Close(Some(frame)))) if frame.code == CloseCode::Library(4009) => {
-                    return true;
-                }
-                Some(Ok(Message::Close(_)) | Err(_)) | None => return false,
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return true,
                 Some(Ok(_)) => {}
             }
         }
@@ -160,11 +213,139 @@ async fn disconnect_before_snapshot_releases_session_gate() {
     .await;
 
     assert!(
-        !matches!(rejected, Ok(true)),
-        "second client got 4009 — session gate stuck after disconnect before Snapshot"
+        !matches!(closed, Ok(true)),
+        "second client was closed — session must not gate/reject without a Snapshot"
     );
 
     let _ = second.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Two clients connect concurrently: each gets its own full snapshot, and
+/// neither is closed (a close would panic inside `recv_json`).
+#[tokio::test]
+async fn two_clients_both_receive_snapshot() {
+    let handle = spawn_daemon().await;
+    let addr = handle.local_addr();
+    let mut a = connect_ws(addr).await;
+    let mut b = connect_ws(addr).await;
+
+    let snap_a = recv_json(&mut a).await;
+    assert_eq!(snap_a["type"], "snapshot");
+    assert_eq!(snap_a["units"][0]["unit_id"], "abcde");
+
+    let snap_b = recv_json(&mut b).await;
+    assert_eq!(snap_b["type"], "snapshot");
+    assert_eq!(snap_b["units"][0]["unit_id"], "abcde");
+
+    let _ = a.close(None).await;
+    let _ = b.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A write from client A must be seen by both sessions: A gets its success
+/// ack and the reg-05 event, B gets the reg-05 event (CB echo via mock
+/// feeder → `RegistersChanged` fan-out). Ack and event may arrive in any order.
+#[tokio::test]
+async fn event_fanout_to_all_clients() {
+    let handle = spawn_daemon().await;
+    let addr = handle.local_addr();
+    let mut a = connect_ws(addr).await;
+    let mut b = connect_ws(addr).await;
+    let _ = recv_json(&mut a).await;
+    let _ = recv_json(&mut b).await;
+
+    let update = reg05_write("req-fanout");
+    a.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+
+    let ack = wait_for_ack(&mut a, "req-fanout").await;
+    assert_eq!(ack["status"], "success", "A write ack: {ack}");
+    // Both sessions must see the reg-05 event (CB echo → RegistersChanged
+    // fan-out). Each session has its own broadcast receiver, so A's event is
+    // buffered while B's is awaited below.
+    let ev_a = wait_for_event(&mut a, "05", "abcde").await;
+    let ev_b = wait_for_event(&mut b, "05", "abcde").await;
+    assert_eq!(ev_a["unit_id"], ev_b["unit_id"]);
+
+    let _ = a.close(None).await;
+    let _ = b.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Two back-to-back writes (distinct `msg_ids`) must BOTH be acked success —
+/// whether the mock ping cadence batches them into one setCAN TX or two —
+/// with no timeout/error ack for either within a generous window.
+#[tokio::test]
+async fn batch_ack_two_writes() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = recv_json(&mut ws).await;
+
+    ws.send(Message::Text(reg05_write("req-b1").to_string().into()))
+        .await
+        .unwrap();
+    ws.send(Message::Text(reg05_write("req-b2").to_string().into()))
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(6), async {
+        let mut b1_ok = false;
+        let mut b2_ok = false;
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before batch acks");
+            match (msg["type"].as_str(), msg["msg_id"].as_str()) {
+                (Some("ack"), Some("req-b1")) if msg["status"] == "success" => b1_ok = true,
+                (Some("ack"), Some("req-b2")) if msg["status"] == "success" => b2_ok = true,
+                (Some("ack"), Some(id @ ("req-b1" | "req-b2"))) => {
+                    panic!("batch write {id} acked non-success: {msg}");
+                }
+                _ => {}
+            }
+            if b1_ok && b2_ok {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("batch ack timeout (both writes must be acked success)");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Closing client A must end only A's session: B keeps receiving acks and
+/// events and is never closed or errored.
+#[tokio::test]
+async fn disconnect_isolation() {
+    let handle = spawn_daemon().await;
+    let addr = handle.local_addr();
+    let mut a = connect_ws(addr).await;
+    let mut b = connect_ws(addr).await;
+    let _ = recv_json(&mut a).await;
+    let _ = recv_json(&mut b).await;
+
+    let _ = a.close(None).await;
+    // Drain until the server observes A's close / stream ends.
+    let _ = timeout(Duration::from_secs(2), async {
+        while a.next().await.is_some() {}
+    })
+    .await;
+
+    // B must still work end-to-end: write → success ack + reg-05 event.
+    let update = reg05_write("req-iso");
+    b.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+
+    let ack = wait_for_ack(&mut b, "req-iso").await;
+    assert_eq!(ack["status"], "success", "B write ack: {ack}");
+    let _ = wait_for_event(&mut b, "05", "abcde").await;
+
+    let _ = b.close(None).await;
     handle.shutdown().await.expect("shutdown");
 }
 
@@ -174,20 +355,7 @@ async fn mailbox_update_and_resync_reach_engine() {
     let mut ws = connect_ws(handle.local_addr()).await;
     let _ = recv_json(&mut ws).await;
 
-    let update = json!({
-        "type": "write",
-        "msg_id": "req-101",
-        "register": "05",
-        "payload": {
-            "power": "on",
-            "mode": "cool",
-            "fan": "high",
-            "target_temp_c": 23.0,
-            "myzone_id": 0,
-            "fresh_air": false,
-            "rf_sys_id": 0
-        }
-    });
+    let update = reg05_write("req-101");
     ws.send(Message::Text(update.to_string().into()))
         .await
         .unwrap();
