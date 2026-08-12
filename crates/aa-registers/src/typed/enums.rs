@@ -274,3 +274,150 @@ impl From<SensorType> for u8 {
         value.to_u8()
     }
 }
+
+/// Aircon unit brand (reg `02` byte 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnitBrand {
+    /// Daikin (`0x11`).
+    Daikin,
+    /// Panasonic (`0x12`).
+    Panasonic,
+    /// Fujitsu (`0x13`).
+    Fujitsu,
+    /// Samsung DVM (`0x19`).
+    SamsungDvm,
+    /// Unrecognised wire value (round-trips unchanged).
+    Unknown(u8),
+}
+
+impl UnitBrand {
+    /// Map a raw byte to a typed variant.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0x11 => Self::Daikin,
+            0x12 => Self::Panasonic,
+            0x13 => Self::Fujitsu,
+            0x19 => Self::SamsungDvm,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Raw wire byte.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Daikin => 0x11,
+            Self::Panasonic => 0x12,
+            Self::Fujitsu => 0x13,
+            Self::SamsungDvm => 0x19,
+            Self::Unknown(v) => v,
+        }
+    }
+}
+
+impl From<u8> for UnitBrand {
+    fn from(value: u8) -> Self {
+        Self::from_u8(value)
+    }
+}
+
+impl From<UnitBrand> for u8 {
+    fn from(value: UnitBrand) -> Self {
+        value.to_u8()
+    }
+}
+
+/// Activation-code status (reg `02` byte 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActivationStatus {
+    /// No code (`0x00`).
+    NoCode,
+    /// Code enabled (`0x01`).
+    CodeEnabled,
+    /// Expired (`0x02`).
+    Expired,
+    /// Unrecognised wire value (round-trips unchanged).
+    Unknown(u8),
+}
+
+impl ActivationStatus {
+    /// Map a raw byte to a typed variant.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0x00 => Self::NoCode,
+            0x01 => Self::CodeEnabled,
+            0x02 => Self::Expired,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Raw wire byte.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::NoCode => 0x00,
+            Self::CodeEnabled => 0x01,
+            Self::Expired => 0x02,
+            Self::Unknown(v) => v,
+        }
+    }
+}
+
+impl From<u8> for ActivationStatus {
+    fn from(value: u8) -> Self {
+        Self::from_u8(value)
+    }
+}
+
+impl From<ActivationStatus> for u8 {
+    fn from(value: ActivationStatus) -> Self {
+        value.to_u8()
+    }
+}
+
+/// Activation-code action (reg `09` byte 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Action {
+    /// Set code (`0x01`).
+    SetCode,
+    /// Unlock (`0x02`).
+    Unlock,
+    /// Unrecognised wire value (round-trips unchanged).
+    Unknown(u8),
+}
+
+impl Action {
+    /// Map a raw byte to a typed variant.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0x01 => Self::SetCode,
+            0x02 => Self::Unlock,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Raw wire byte.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::SetCode => 0x01,
+            Self::Unlock => 0x02,
+            Self::Unknown(v) => v,
+        }
+    }
+}
+
+impl From<u8> for Action {
+    fn from(value: u8) -> Self {
+        Self::from_u8(value)
+    }
+}
+
+impl From<Action> for u8 {
+    fn from(value: Action) -> Self {
+        value.to_u8()
+    }
+}

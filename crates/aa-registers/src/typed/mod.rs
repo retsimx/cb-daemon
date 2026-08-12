@@ -1,14 +1,20 @@
-//! Typed decode/encode for known CAN2 registers (`01` / `03` / `05` / `06`).
+//! Typed decode/encode for known CAN2 registers (`01` / `02` / `03` / `04` /
+//! `05` / `06` / `08` / `09` / `0a` / `12` / `13` / `26` / `27`).
 //!
 //! Reg `06` always decodes as [`FirmwareStatus`] (mailbox bytes). Flush is a
 //! wire command via [`CanRecord::flush_all`], never a [`DecodedRegister`] variant.
+//! Reg `12` carries no direction on the wire; decoding defaults to the read shape.
 //! Fresh-air mapping follows the `aa_interop` README table (`00`/`01`/`02`).
 
 mod enums;
 mod payloads;
 
-pub use enums::{Fan, FreshAir, Mode, Power, SensorType};
-pub use payloads::{FirmwareStatus, SystemStatus, ZoneConfig, ZoneState};
+pub use enums::{Action, ActivationStatus, Fan, FreshAir, Mode, Power, SensorType, UnitBrand};
+pub use payloads::{
+    ActivationCode, FirmwareStatus, InfoByte, RfDeviceCalibration, RfDevicePairing,
+    SensorPairingRead, SensorPairingWrite, SystemError, SystemStatus, UnitActivation,
+    UnitAnnouncement, ZoneConfig, ZoneLimits, ZoneState,
+};
 
 use crate::ids::{RegId, UnitId, UnitType};
 use crate::wire::{CanRecord, Dest};
@@ -24,6 +30,26 @@ pub enum DecodedRegister {
     SystemStatus(SystemStatus),
     /// Reg `06` firmware status (never a flush command).
     FirmwareStatus(FirmwareStatus),
+    /// Reg `02` unit activation.
+    UnitActivation(UnitActivation),
+    /// Reg `04` per-zone damper limits.
+    ZoneLimits(ZoneLimits),
+    /// Reg `08` system error code.
+    SystemError(SystemError),
+    /// Reg `09` activation-code command.
+    ActivationCode(ActivationCode),
+    /// Reg `0a` unit announcement.
+    UnitAnnouncement(UnitAnnouncement),
+    /// Reg `12` RF sensor pairing status (read shape).
+    SensorPairingRead(SensorPairingRead),
+    /// Reg `12` RF sensor pairing command (write shape).
+    SensorPairingWrite(SensorPairingWrite),
+    /// Reg `13` info byte payload.
+    InfoByte(InfoByte),
+    /// Reg `26` RF device pairing command.
+    RfDevicePairing(RfDevicePairing),
+    /// Reg `27` RF device calibration command.
+    RfDeviceCalibration(RfDeviceCalibration),
     /// Any other register id: opaque 7-byte payload.
     Unknown {
         /// Register identifier.
@@ -36,14 +62,25 @@ pub enum DecodedRegister {
 impl DecodedRegister {
     /// Decode `(reg, data)` without wire destination.
     ///
-    /// Reg `06` always yields [`Self::FirmwareStatus`].
+    /// Reg `06` always yields [`Self::FirmwareStatus`]. Reg `12` has no
+    /// direction on the wire, so it always yields the read shape
+    /// [`Self::SensorPairingRead`].
     #[must_use]
     pub fn from_reg_data(reg: RegId, data: [u8; 7]) -> Self {
         match reg.get() {
             0x01 => Self::ZoneConfig(ZoneConfig::from(data)),
+            0x02 => Self::UnitActivation(UnitActivation::from(data)),
             0x03 => Self::ZoneState(ZoneState::from(data)),
+            0x04 => Self::ZoneLimits(ZoneLimits::from(data)),
             0x05 => Self::SystemStatus(SystemStatus::from(data)),
             0x06 => Self::FirmwareStatus(FirmwareStatus::from(data)),
+            0x08 => Self::SystemError(SystemError::from(data)),
+            0x09 => Self::ActivationCode(ActivationCode::from(data)),
+            0x0a => Self::UnitAnnouncement(UnitAnnouncement::from(data)),
+            0x12 => Self::SensorPairingRead(SensorPairingRead::from(data)),
+            0x13 => Self::InfoByte(InfoByte::from(data)),
+            0x26 => Self::RfDevicePairing(RfDevicePairing::from(data)),
+            0x27 => Self::RfDeviceCalibration(RfDeviceCalibration::from(data)),
             _ => Self::Unknown { reg, data },
         }
     }
@@ -53,9 +90,18 @@ impl DecodedRegister {
     pub const fn reg_id(self) -> RegId {
         match self {
             Self::ZoneConfig(_) => RegId::new(0x01),
+            Self::UnitActivation(_) => RegId::new(0x02),
             Self::ZoneState(_) => RegId::new(0x03),
+            Self::ZoneLimits(_) => RegId::new(0x04),
             Self::SystemStatus(_) => RegId::new(0x05),
             Self::FirmwareStatus(_) => RegId::new(0x06),
+            Self::SystemError(_) => RegId::new(0x08),
+            Self::ActivationCode(_) => RegId::new(0x09),
+            Self::UnitAnnouncement(_) => RegId::new(0x0a),
+            Self::SensorPairingRead(_) | Self::SensorPairingWrite(_) => RegId::new(0x12),
+            Self::InfoByte(_) => RegId::new(0x13),
+            Self::RfDevicePairing(_) => RegId::new(0x26),
+            Self::RfDeviceCalibration(_) => RegId::new(0x27),
             Self::Unknown { reg, .. } => reg,
         }
     }
@@ -65,9 +111,19 @@ impl DecodedRegister {
     pub fn to_bytes(self) -> [u8; 7] {
         match self {
             Self::ZoneConfig(v) => v.into(),
+            Self::UnitActivation(v) => v.into(),
             Self::ZoneState(v) => v.into(),
+            Self::ZoneLimits(v) => v.into(),
             Self::SystemStatus(v) => v.into(),
             Self::FirmwareStatus(v) => v.into(),
+            Self::SystemError(v) => v.into(),
+            Self::ActivationCode(v) => v.into(),
+            Self::UnitAnnouncement(v) => v.into(),
+            Self::SensorPairingRead(v) => v.into(),
+            Self::SensorPairingWrite(v) => v.into(),
+            Self::InfoByte(v) => v.into(),
+            Self::RfDevicePairing(v) => v.into(),
+            Self::RfDeviceCalibration(v) => v.into(),
             Self::Unknown { data, .. } => data,
         }
     }
@@ -232,6 +288,151 @@ mod tests {
     }
 
     #[test]
+    fn unit_activation_round_trip() {
+        let original = UnitActivation {
+            unit_type: UnitBrand::Daikin,
+            activation_status: ActivationStatus::CodeEnabled,
+            dict_fw_major: 0x02,
+            dict_fw_minor: 0x03,
+        };
+        let bytes: [u8; 7] = original.into();
+        assert_eq!(bytes, [0x11, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00]);
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x02), bytes);
+        assert_eq!(decoded, DecodedRegister::UnitActivation(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x02));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn zone_limits_round_trip() {
+        let original = ZoneLimits {
+            zone: 0x01,
+            min_damper: 20,
+            max_damper: 80,
+            motion_status: 2,
+            motion_config: 1,
+            zone_error: 0x03,
+            rssi: 0x2a,
+        };
+        let bytes: [u8; 7] = original.into();
+        assert_eq!(bytes, [0x01, 20, 80, 2, 1, 0x03, 0x2a]);
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x04), bytes);
+        assert_eq!(decoded, DecodedRegister::ZoneLimits(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x04));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn system_error_round_trip() {
+        let original = SystemError {
+            error_code: [b'A', b'A', b'1', 0x00, b'X'],
+        };
+        let bytes: [u8; 7] = original.into();
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x08), bytes);
+        assert_eq!(decoded, DecodedRegister::SystemError(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x08));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn activation_code_round_trip() {
+        let original = ActivationCode {
+            action: Action::Unlock,
+            unlock_code: [0xab, 0xcd],
+            activation_days: 30,
+        };
+        let bytes: [u8; 7] = original.into();
+        assert_eq!(bytes, [0x02, 0xab, 0xcd, 30, 0x00, 0x00, 0x00]);
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x09), bytes);
+        assert_eq!(decoded, DecodedRegister::ActivationCode(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x09));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn unit_announcement_round_trip() {
+        let original = UnitAnnouncement {};
+        let bytes: [u8; 7] = original.into();
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x0a), bytes);
+        assert_eq!(decoded, DecodedRegister::UnitAnnouncement(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x0a));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn sensor_pairing_read_default_for_reg_12() {
+        let bytes = [0xaa, 0xbb, 0xcc, 0x40, 0x03, 0x00, 0x00];
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x12), bytes);
+        let expected = DecodedRegister::SensorPairingRead(SensorPairingRead {
+            sensor_uid: [0xaa, 0xbb, 0xcc],
+            info_byte: 0x40,
+            sensor_rev: 0x03,
+        });
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.reg_id(), RegId::new(0x12));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn sensor_pairing_write_round_trip_via_variant() {
+        let original = SensorPairingWrite {
+            sensor_uid: [0xaa, 0xbb, 0xcc],
+            zone: 0x05,
+        };
+        let bytes: [u8; 7] = original.into();
+        assert_eq!(bytes, [0xaa, 0xbb, 0xcc, 0x05, 0x00, 0x00, 0x00]);
+        // From bytes alone, reg 12 defaults to the read shape.
+        assert!(matches!(
+            DecodedRegister::from_reg_data(RegId::new(0x12), bytes),
+            DecodedRegister::SensorPairingRead(_)
+        ));
+        let write = DecodedRegister::SensorPairingWrite(original);
+        assert_eq!(write.reg_id(), RegId::new(0x12));
+        assert_eq!(write.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn info_byte_round_trip() {
+        let original = InfoByte {
+            info_byte: 0x7f,
+            rest: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        };
+        let bytes: [u8; 7] = original.into();
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x13), bytes);
+        assert_eq!(decoded, DecodedRegister::InfoByte(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x13));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn rf_device_pairing_round_trip() {
+        let original = RfDevicePairing {
+            pairing_control: 0x01,
+            rf_device_type: 129,
+            zone_channel: 0x03,
+        };
+        let bytes: [u8; 7] = original.into();
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x26), bytes);
+        assert_eq!(decoded, DecodedRegister::RfDevicePairing(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x26));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn rf_device_calibration_round_trip() {
+        let original = RfDeviceCalibration {
+            calibration_control: 0x02,
+            channel: 0x0a,
+            up_down_position: 0x05,
+        };
+        let bytes: [u8; 7] = original.into();
+        let decoded = DecodedRegister::from_reg_data(RegId::new(0x27), bytes);
+        assert_eq!(decoded, DecodedRegister::RfDeviceCalibration(original));
+        assert_eq!(decoded.reg_id(), RegId::new(0x27));
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
     fn unknown_enum_passthrough() {
         assert_eq!(Power::from_u8(0xfe), Power::Unknown(0xfe));
         assert_eq!(Power::Unknown(0xfe).to_u8(), 0xfe);
@@ -290,17 +491,20 @@ mod tests {
 
     #[test]
     fn unknown_register_passthrough() {
-        let record = CanRecord::parse_one("0703abcde0a00000000000000").unwrap();
-        let decoded = record.decode();
-        assert_eq!(
-            decoded,
-            DecodedRegister::Unknown {
-                reg: RegId::new(0x0a),
-                data: [0; 7],
-            }
-        );
-        assert_eq!(decoded.reg_id(), RegId::new(0x0a));
-        assert_eq!(decoded.to_bytes(), [0; 7]);
+        // 07, 16/17, 1d/1e have no typed variant: opaque with raw passthrough.
+        for reg in [0x07, 0x16, 0x17, 0x1d, 0x1e] {
+            let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+            let decoded = DecodedRegister::from_reg_data(RegId::new(reg), data);
+            assert_eq!(
+                decoded,
+                DecodedRegister::Unknown {
+                    reg: RegId::new(reg),
+                    data,
+                }
+            );
+            assert_eq!(decoded.reg_id(), RegId::new(reg));
+            assert_eq!(decoded.to_bytes(), data);
+        }
     }
 
     #[test]
