@@ -1,0 +1,21 @@
+# cb-daemon log rotation (Alpine: /etc/logrotate.d/cb-daemon).
+# Installed with: apk add logrotate
+# Alpine runs logrotate via /etc/periodic/daily/logrotate.
+#
+# /var/log is a RAM-backed tmpfs (fstab entry, see openrc template header)
+# to spare SD card IOPS, so rotation must bound memory usage: this config
+# caps cb-daemon at ~100 MB (5 MB x 19 copies) within the 128 MB tmpfs.
+# copytruncate keeps the running daemon's fd valid (no service restart).
+# Logs are intentionally volatile (lost on reboot) — SD durability wins.
+
+/var/log/cb-daemon.log {
+    daily
+    maxsize 5M
+    rotate 19
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root wheel
+}

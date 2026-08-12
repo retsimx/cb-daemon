@@ -5,6 +5,11 @@
 # Link backend: "mock" | "aoa" | "tty"
 backend = "aoa"
 
+# Pi Zero W (Alpine, OpenRC) deployment — tty backend:
+#   backend = "tty"
+#   device = "/dev/ttyUSB0"
+#   bind = "0.0.0.0:2026"
+
 # Device path (required absolute path for aoa/tty when set; defaults to
 # /dev/usb_accessory or /dev/ttyUSB0 when omitted).
 device = "/dev/usb_accessory"
