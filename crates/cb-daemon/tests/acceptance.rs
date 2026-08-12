@@ -236,11 +236,11 @@ async fn two_clients_both_receive_snapshot() {
 
     let snap_a = recv_json(&mut a).await;
     assert_eq!(snap_a["type"], "snapshot");
-    assert_eq!(snap_a["units"][0]["unit_id"], "abcde");
+    assert!(snap_a["units"]["07:abcde"].is_object());
 
     let snap_b = recv_json(&mut b).await;
     assert_eq!(snap_b["type"], "snapshot");
-    assert_eq!(snap_b["units"][0]["unit_id"], "abcde");
+    assert!(snap_b["units"]["07:abcde"].is_object());
 
     let _ = a.close(None).await;
     let _ = b.close(None).await;
