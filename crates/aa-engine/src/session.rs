@@ -26,6 +26,8 @@ pub(crate) struct Session {
     state: State,
     bank: RegisterBank,
     write_queue: Vec<CanRecord>,
+    /// Reads awaiting resolution by their flush's `getCAN` (see [`PendingRead`]).
+    pending_reads: Vec<PendingRead>,
     ack_armed: bool,
     dump_sent: bool,
     /// After a dump `getCAN` NACK, resend dump once the ack has been flushed.
@@ -46,6 +48,19 @@ pub(crate) struct Session {
     shutdown: bool,
 }
 
+/// A register read awaiting its flush's `getCAN`.
+#[derive(Debug)]
+pub(crate) struct PendingRead {
+    unit_type: UnitType,
+    unit_id: UnitId,
+    reg: RegId,
+    zone: Option<u8>,
+    /// Set when `steady_tx` drained the write queue carrying the flush; only
+    /// then may a `getCAN` resolve this read (a spontaneous pre-flush `getCAN`
+    /// must not answer a read with stale pre-flush data).
+    flush_sent: bool,
+}
+
 impl Session {
     /// Create a session in [`State::Init`].
     #[must_use]
@@ -54,6 +69,7 @@ impl Session {
             state: State::Init,
             bank: RegisterBank::new(),
             write_queue: Vec::new(),
+            pending_reads: Vec::new(),
             ack_armed: false,
             dump_sent: false,
             dump_needs_resend: false,
@@ -89,6 +105,41 @@ impl Session {
         match cmd {
             EngineCmd::WriteRegisters(records) => {
                 self.write_queue.extend(records);
+            }
+            EngineCmd::ReadRegister {
+                unit_type,
+                unit_id,
+                reg,
+                zone,
+            } => {
+                // Unit-scoped reg-06 flush pulls the register set from the CB
+                // (same pattern as the missing-reg-05 unit flush); the flush's
+                // getCAN is what the read is resolved against. Dedupe an
+                // identical flush already queued (same target + reg 06 + zero
+                // data) so concurrent reads of one unit cost one flush.
+                let flush = CanRecord {
+                    unit_type,
+                    dest: Dest::ControlBox,
+                    unit_id,
+                    reg: RegId::new(0x06),
+                    data: [0; 7],
+                };
+                let already_queued = self.write_queue.iter().any(|queued| {
+                    queued.unit_type == flush.unit_type
+                        && queued.unit_id == flush.unit_id
+                        && queued.reg == flush.reg
+                        && queued.data == flush.data
+                });
+                if !already_queued {
+                    self.write_queue.push(flush);
+                }
+                self.pending_reads.push(PendingRead {
+                    unit_type,
+                    unit_id,
+                    reg,
+                    zone,
+                    flush_sent: false,
+                });
             }
             EngineCmd::ResyncMailbox => {
                 self.state = State::RequestDump;
@@ -193,6 +244,13 @@ impl Session {
         if !self.write_queue.is_empty() {
             let records = std::mem::take(&mut self.write_queue);
             self.write_flushed = true;
+            // The queued flush (and any other writes) is now on the bus: only a
+            // getCAN arriving after this TX may resolve the pending reads. The
+            // ack branch above must never arm reads (a pure ack TX drains
+            // nothing).
+            for pending in &mut self.pending_reads {
+                pending.flush_sent = true;
+            }
             return build_set_can(&records);
         }
         EMPTY_SET_CAN.to_vec()
@@ -270,6 +328,10 @@ impl Session {
                         Some(can_records)
                     },
                 });
+                // Reads whose flush rode a previous setCAN resolve against the
+                // dump-merged bank (the early-getCAN path above returned before
+                // the dump, so reads are never resolved there).
+                events.extend(self.resolve_pending_reads());
                 events
             }
             Err(err) => vec![EngineEvent::ProtocolWarn(format!(
@@ -302,12 +364,49 @@ impl Session {
                     }
                 }
                 self.ack_armed = true;
-                vec![EngineEvent::RegistersChanged { records }]
+                let mut events = vec![EngineEvent::RegistersChanged { records }];
+                events.extend(self.resolve_pending_reads());
+                events
             }
             Err(err) => vec![EngineEvent::ProtocolWarn(format!(
                 "getCAN parse failed: {err:?}"
             ))],
         }
+    }
+
+    /// Resolve pending reads whose flush was already TX'd against the bank,
+    /// emitting one [`EngineEvent::RegisterRead`] per read (found or absent)
+    /// and dropping it from the pending list. Reads whose flush has not been
+    /// sent yet stay pending.
+    fn resolve_pending_reads(&mut self) -> Vec<EngineEvent> {
+        let mut events = Vec::new();
+        let mut remaining = Vec::new();
+        for pending in std::mem::take(&mut self.pending_reads) {
+            if !pending.flush_sent {
+                remaining.push(pending);
+                continue;
+            }
+            let data = if aa_registers::is_zone_bearing(pending.reg) {
+                // Zone-bearing reads address a specific bank slot; a None zone
+                // is treated as absent (no slot to look up).
+                pending.zone.and_then(|zone| {
+                    self.bank
+                        .get_zone(pending.unit_type, pending.unit_id, pending.reg, zone)
+                })
+            } else {
+                self.bank
+                    .get(pending.unit_type, pending.unit_id, pending.reg)
+            };
+            events.push(EngineEvent::RegisterRead {
+                unit_type: pending.unit_type,
+                unit_id: pending.unit_id,
+                reg: pending.reg,
+                zone: pending.zone,
+                data,
+            });
+        }
+        self.pending_reads = remaining;
+        events
     }
 
     /// Primary AIRCON unit for the missing-reg-05 unit flush.
@@ -909,5 +1008,280 @@ mod tests {
         assert_eq!(tx, build_set_can(std::slice::from_ref(&flush)));
         // No phantom JZ18 for the outbound write: next is empty poll.
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+    }
+
+    /// Drain steady-state JZ18/empty polls until the write queue is empty.
+    fn drain_steady_polls(s: &mut Session) {
+        for _ in 0..4 {
+            if s.write_queue.is_empty() && !s.ack_armed {
+                break;
+            }
+            s.on_ping();
+        }
+        assert!(
+            s.write_queue.is_empty() && !s.ack_armed,
+            "steady polls must settle with an empty queue"
+        );
+    }
+
+    fn read_flush(unit_type: UnitType, unit_id: UnitId) -> CanRecord {
+        CanRecord {
+            unit_type,
+            dest: Dest::ControlBox,
+            unit_id,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        }
+    }
+
+    #[test]
+    fn read_register_queues_flush_and_dedupes_identical_read() {
+        // D-5: a ReadRegister queues exactly one unit-scoped reg-06 flush
+        // addressed to the target unit; an identical second read dedupes the
+        // flush (one bus round-trip serves both pending reads).
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        drain_steady_polls(&mut s);
+
+        let target = live_unit_reg06();
+        s.apply_cmd(EngineCmd::ReadRegister {
+            unit_type: target.unit_type,
+            unit_id: target.unit_id,
+            reg: RegId::new(0x05),
+            zone: None,
+        });
+        s.apply_cmd(EngineCmd::ReadRegister {
+            unit_type: target.unit_type,
+            unit_id: target.unit_id,
+            reg: RegId::new(0x05),
+            zone: None,
+        });
+        let expected_flush = read_flush(target.unit_type, target.unit_id);
+        assert_eq!(s.write_queue.len(), 1, "identical reads must share a flush");
+        let queued = s.write_queue[0].clone();
+        assert_eq!(queued.unit_type, expected_flush.unit_type);
+        assert_eq!(queued.dest, Dest::ControlBox);
+        assert_eq!(queued.unit_id, expected_flush.unit_id);
+        assert_eq!(queued.reg, RegId::new(0x06));
+        assert_eq!(queued.data, [0; 7]);
+        assert_eq!(s.pending_reads.len(), 2);
+        assert!(
+            s.pending_reads.iter().all(|p| !p.flush_sent),
+            "reads start pending until their flush is TX'd"
+        );
+    }
+
+    #[test]
+    fn read_resolves_after_flush_tx_get_can() {
+        // D-5: flush TX on the next ping, then a getCAN carrying the register
+        // resolves the read with the fresh bank value and removes it.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        drain_steady_polls(&mut s);
+
+        let target = live_unit_reg06();
+        s.apply_cmd(EngineCmd::ReadRegister {
+            unit_type: target.unit_type,
+            unit_id: target.unit_id,
+            reg: RegId::new(0x05),
+            zone: None,
+        });
+        let flush = read_flush(target.unit_type, target.unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&flush))
+        );
+        assert!(s.pending_reads[0].flush_sent);
+
+        let fresh = CanRecord {
+            unit_type: target.unit_type,
+            dest: Dest::Tablet,
+            unit_id: target.unit_id,
+            reg: RegId::new(0x05),
+            data: [0x02, 0x02, 0x04, 0x31, 0x00, 0x02, 0x00],
+        };
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&fresh)));
+        let read = ev
+            .iter()
+            .find(|e| matches!(e, EngineEvent::RegisterRead { .. }))
+            .expect("register read must resolve after flush TX");
+        match read {
+            EngineEvent::RegisterRead {
+                unit_type,
+                unit_id,
+                reg,
+                zone,
+                data: Some(data),
+            } => {
+                assert_eq!(*unit_type, fresh.unit_type);
+                assert_eq!(*unit_id, fresh.unit_id);
+                assert_eq!(*reg, fresh.reg);
+                assert_eq!(*zone, None);
+                assert_eq!(*data, fresh.data);
+            }
+            other => panic!("expected resolved read, got {other:?}"),
+        }
+        assert!(
+            s.pending_reads.is_empty(),
+            "resolved reads must be removed from the pending list"
+        );
+    }
+
+    #[test]
+    fn read_absent_register_emits_none() {
+        // D-5: a register the flush getCAN never delivers resolves to None
+        // (never a stale-bank guess), and the read is still consumed.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        drain_steady_polls(&mut s);
+
+        let target = live_unit_reg06();
+        s.apply_cmd(EngineCmd::ReadRegister {
+            unit_type: target.unit_type,
+            unit_id: target.unit_id,
+            reg: RegId::new(0x02),
+            zone: None,
+        });
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&read_flush(
+                target.unit_type,
+                target.unit_id
+            )))
+        );
+        let ev = s.on_frame(b"getCAN 1");
+        let read = ev
+            .iter()
+            .find(|e| matches!(e, EngineEvent::RegisterRead { .. }))
+            .expect("absent register must still resolve to None");
+        assert!(
+            matches!(read, EngineEvent::RegisterRead { data: None, .. }),
+            "expected RegisterRead with None, got {read:?}"
+        );
+        assert!(s.pending_reads.is_empty());
+    }
+
+    #[test]
+    fn pre_flush_get_can_does_not_resolve_read() {
+        // D-5 flush_sent gate: a spontaneous getCAN before the flush was TX'd
+        // must not answer (or error) the pending read; it resolves only after
+        // the ping that transmits the flush.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        drain_steady_polls(&mut s);
+
+        let target = live_unit_reg06();
+        s.apply_cmd(EngineCmd::ReadRegister {
+            unit_type: target.unit_type,
+            unit_id: target.unit_id,
+            reg: RegId::new(0x05),
+            zone: None,
+        });
+
+        let rec = sample_record();
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, EngineEvent::RegisterRead { .. })),
+            "pre-flush getCAN must not resolve the read: {ev:?}"
+        );
+        assert_eq!(s.pending_reads.len(), 1);
+        assert!(!s.pending_reads[0].flush_sent);
+
+        // The pre-flush getCAN armed ackCAN; ack first, then the flush rides
+        // the next ping.
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&read_flush(
+                target.unit_type,
+                target.unit_id
+            )))
+        );
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
+        assert!(matches!(
+            ev.iter()
+                .find(|e| matches!(e, EngineEvent::RegisterRead { .. })),
+            Some(EngineEvent::RegisterRead { data: Some(_), .. })
+        ));
+        assert!(s.pending_reads.is_empty());
+    }
+
+    #[test]
+    fn zone_read_resolves_addressed_zone_slot() {
+        // D-5: zone-bearing reads resolve the addressed zone's bank slot
+        // (bank.get_zone), so different zones resolve independently — a zone
+        // never delivered stays None while the delivered one returns fresh
+        // data from its own slot.
+        let mut s = Session::new();
+        advance_to_dump(&mut s);
+        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
+        let z1 = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Unknown(0x03),
+            unit_id: UnitId::try_new(0x0_181F3).unwrap(),
+            reg: RegId::new(0x03),
+            data: [0x01, 0xe4, 0x01, 0x2c, 0x14, 0x05, 0x00],
+        };
+        let z2 = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Unknown(0x03),
+            unit_id: z1.unit_id,
+            reg: RegId::new(0x03),
+            data: [0x02, 0xe4, 0x02, 0x2d, 0x15, 0x06, 0x01],
+        };
+        let ev = s.on_frame(&get_can_payload(&[z1.clone(), z2]));
+        assert!(ev.iter().any(|e| matches!(e, EngineEvent::Snapshot { .. })));
+        assert_eq!(s.state, State::Steady);
+        // Dump omitted reg 05 → ack, then the JZ18 + unit flush ride out.
+        drain_steady_polls(&mut s);
+        assert!(s.write_queue.is_empty());
+
+        s.apply_cmd(EngineCmd::ReadRegister {
+            unit_type: z1.unit_type,
+            unit_id: z1.unit_id,
+            reg: z1.reg,
+            zone: Some(0x01),
+        });
+        s.apply_cmd(EngineCmd::ReadRegister {
+            unit_type: z1.unit_type,
+            unit_id: z1.unit_id,
+            reg: z1.reg,
+            zone: Some(0x03),
+        });
+        // Both reads share one flush (identical target + reg 06 + zero data).
+        assert_eq!(s.write_queue.len(), 1);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&read_flush(z1.unit_type, z1.unit_id)))
+        );
+
+        // Fresh zone-1 payload on the flush getCAN; zone 3 is never delivered.
+        let mut fresh_z1 = z1;
+        fresh_z1.data = [0x01, 0xff, 0x03, 0x40, 0x20, 0x0a, 0x02];
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&fresh_z1)));
+        let reads: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::RegisterRead {
+                    unit_type: _,
+                    unit_id: _,
+                    reg: _,
+                    zone,
+                    data,
+                } => Some((*zone, *data)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads.len(), 2, "both zone reads resolve: {reads:?}");
+        assert!(
+            reads.contains(&(Some(0x01), Some(fresh_z1.data))),
+            "zone 1 must read its fresh slot: {reads:?}"
+        );
+        assert!(
+            reads.contains(&(Some(0x03), None)),
+            "undelivered zone 3 must resolve None: {reads:?}"
+        );
+        assert!(s.pending_reads.is_empty());
     }
 }

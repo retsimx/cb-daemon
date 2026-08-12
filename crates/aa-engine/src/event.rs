@@ -1,12 +1,24 @@
 //! Engine command and event types for the CB session runner.
 
-use aa_registers::{CanRecord, RegisterBank};
+use aa_registers::{CanRecord, RegId, RegisterBank, UnitId, UnitType};
 
 /// Commands sent into [`crate::CbEngine::run`] via an mpsc channel.
 #[derive(Debug, Clone)]
 pub enum EngineCmd {
     /// Enqueue register writes for the next steady-state `setCAN` window.
     WriteRegisters(Vec<CanRecord>),
+    /// Queue a unit-scoped reg-06 flush and track a pending read; the flush's
+    /// `getCAN` resolves it via [`EngineEvent::RegisterRead`].
+    ReadRegister {
+        /// Target unit type (also addresses the queued flush).
+        unit_type: UnitType,
+        /// Target unit id (also addresses the queued flush).
+        unit_id: UnitId,
+        /// Register to read.
+        reg: RegId,
+        /// Zone for zone-bearing registers (`0x03`/`0x04`); `None` otherwise.
+        zone: Option<u8>,
+    },
     /// Re-enter the dump path; emits a fresh [`EngineEvent::Snapshot`] when done.
     ResyncMailbox,
     /// Stop the runner and close the link.
@@ -51,6 +63,17 @@ pub enum EngineEvent {
     /// Queued register writes were transmitted in a `setCAN` frame.
     /// Lets the WS bridge defer mailbox acks until the bus actually sent them.
     WriteFlushed,
+    /// Result of a previously queued [`EngineCmd::ReadRegister`]: the flush's
+    /// `getCAN` resolved the register against the bank. `data` is `Some` when
+    /// the flush response carried the register, `None` when it did not (reads
+    /// are never answered with pre-flush bank state).
+    RegisterRead {
+        unit_type: UnitType,
+        unit_id: UnitId,
+        reg: RegId,
+        zone: Option<u8>,
+        data: Option<[u8; 7]>,
+    },
     /// Session lifecycle state transition; the daemon maps it to a wire
     /// `status` frame (see [`SessionState`]).
     SessionState(SessionState),
