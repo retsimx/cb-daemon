@@ -12,7 +12,7 @@ Current Cargo workspace members:
 - **`aa-link`** — async byte I/O seam (`Link`), `MockLink` for hardware-free tests, `AoaLink` for raw `/dev/usb_accessory` (config on open, chunked writes; aaservice must not hold the accessory while open), and `TtyLink` for Linux USB-serial / USB-RS485 (57600 8N1 raw, full-frame writes; default `/dev/ttyUSB0`)
 - **`aa-engine`** — CB session state machine (negotiate / dump / steady poll) over a `Link`
 - **`aa-mailbox`** — northbound mailbox JSON message types and `RegisterBank` ↔ JSON converters (no WS bind)
-- **`cb-daemon`** — runnable daemon: TOML/env/CLI config, engine wiring, and single-session axum WebSocket at `GET /v1/mailbox-stream`
+- **`cb-daemon`** — runnable daemon: TOML/env/CLI config, engine wiring, and multi-consumer axum WebSocket at `GET /v1/mailbox-stream`
 
 ## Configuration (`cb-daemon`)
 
