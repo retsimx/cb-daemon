@@ -8,7 +8,7 @@ use aa_registers::{
 use crate::event::{EngineCmd, EngineEvent};
 use crate::wire::{
     ACK_CAN, ACK_CAN_ZERO, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA,
-    build_set_can, is_can2_in_use, is_get_can, is_get_can_nack, parse_get_can,
+    build_jz18, build_set_can, is_can2_in_use, is_get_can, is_get_can_nack, parse_get_can,
 };
 
 /// Protocol phase for the tablet-side CB session.
@@ -283,6 +283,12 @@ impl Session {
                     if record.reg == RegId::new(0x05) {
                         self.system_status_real = true;
                     }
+                    if record.reg == RegId::new(0x06) {
+                        // JZ18 handshake (aa_interop §7.3): every reg-06 announcement gets
+                        // an all-zero reg-07 reply echoing unit type + id.
+                        self.write_queue
+                            .push(build_jz18(record.unit_type, record.unit_id));
+                    }
                 }
                 // Early getCAN before dump TX (dirty-reset response): ack it and
                 // keep RequestDump until the 08 flush dump is sent.
@@ -382,6 +388,12 @@ impl Session {
                     self.bank.apply(record);
                     if record.reg == RegId::new(0x05) {
                         self.system_status_real = true;
+                    }
+                    if record.reg == RegId::new(0x06) {
+                        // JZ18 handshake (aa_interop §7.3): every reg-06 announcement gets
+                        // an all-zero reg-07 reply echoing unit type + id.
+                        self.write_queue
+                            .push(build_jz18(record.unit_type, record.unit_id));
                     }
                 }
                 self.ack_armed = true;
@@ -680,6 +692,12 @@ mod tests {
         // With reg 05 already in the dump, steady uses empty setCAN (aa_interop sync).
         let mut s = Session::new();
         advance_to_steady(&mut s, &[sample_record()]);
+        // Reset-response getCAN announced reg 06, so the first steady TX is JZ18.
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
     }
 
@@ -833,7 +851,7 @@ mod tests {
             data: [0x01, 0xe4, 0x01, 0x2c, 0x14, 0x05, 0x00],
         };
         let live = live_unit_reg06();
-        let ev = s.on_frame(&get_can_payload(&[live, zone]));
+        let ev = s.on_frame(&get_can_payload(&[live.clone(), zone]));
         assert!(ev.iter().any(|e| matches!(e, EngineEvent::Snapshot { .. })));
         let data = s
             .bank
@@ -849,6 +867,8 @@ mod tests {
         assert_eq!(status.power, Power::On);
         // No unit flush / getSystemData hunt once system_status exists.
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        let jz18 = build_jz18(UnitType::AIRCON, live.unit_id);
+        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
     }
 
@@ -867,6 +887,10 @@ mod tests {
             )
             .expect("fallback reg 05");
         assert_eq!(SystemStatus::from(data).set_temp_x2, 48);
+        // The dump feeds reg-06 twice (reset response + dump getCAN), so two
+        // JZ18 replies ride the first steady TX; empty poll follows.
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
     }
 
@@ -879,6 +903,8 @@ mod tests {
         let live = live_unit_reg06();
         let _ = s.on_frame(&get_can_payload(std::slice::from_ref(&live)));
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        let jz18 = build_jz18(live.unit_type, live.unit_id);
+        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
         assert!(
             s.bank
@@ -924,6 +950,9 @@ mod tests {
         // After dump we synthesize reg 05; XML still overwrites when the bus ever returns it.
         let mut s = Session::new();
         advance_to_steady(&mut s, &[live_unit_reg06()]);
+        // Two reg-06 announcements (reset response + dump getCAN) → two JZ18s.
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(s.on_ping().unwrap(), build_set_can(&[jz18.clone(), jz18]));
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
 
         let ev = s.on_frame(SAMPLE_SYSTEM_XML);
@@ -949,6 +978,11 @@ mod tests {
     fn dump_with_reg05_skips_unit_scoped_flush() {
         let mut s = Session::new();
         advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
     }
 
@@ -957,6 +991,11 @@ mod tests {
         // Regression: empty setCAN while canInUse starves getSystemData on stock CB.
         let mut s = Session::new();
         advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
 
         let _ = s.on_frame(b"CAN2 in use");
@@ -1029,6 +1068,11 @@ mod tests {
         let mut s = Session::new();
         advance_to_steady(&mut s, &[sample_record()]);
 
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
 
         let rec = CanRecord {
@@ -1155,5 +1199,91 @@ mod tests {
             .expect("synthesized reg 05");
         let status = SystemStatus::from(data);
         assert_eq!(status.myzone_id, 3);
+    }
+
+    #[test]
+    fn reg06_announcement_queues_jz18() {
+        // aa_interop §7.3: every reg-06 announcement gets an all-zero reg-07
+        // reply on the next TX after ack, echoing unit type + id. The dump
+        // feeds reg-06 twice (reset response + dump getCAN), so two replies
+        // ride the first steady TX.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[live_unit_reg06()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        let expected = build_set_can(&[jz18.clone(), jz18]);
+        assert_eq!(s.on_ping().unwrap(), expected);
+    }
+
+    #[test]
+    fn type08_announcement_queues_type08_jz18() {
+        // §7.4: split-system (type 08) announcements get a type-08 reply.
+        let mut s = Session::new();
+        advance_to_dump(&mut s);
+        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
+        let rf = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_0F0F0).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rf)));
+        assert!(ev.iter().any(|e| matches!(e, EngineEvent::Snapshot { .. })));
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        // Reset-response getCAN already queued the AIRCON (07) reply; the dump
+        // adds the type-08 reply echoing the announcement's unit type.
+        let expected = build_set_can(&[
+            build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id),
+            build_jz18(rf.unit_type, rf.unit_id),
+        ]);
+        assert_eq!(s.on_ping().unwrap(), expected);
+    }
+
+    #[test]
+    fn steady_reg06_announcement_queues_jz18() {
+        // Steady-state deltas also announce: reg-06 getCAN → ack then JZ18.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+        let rec = live_unit_reg06();
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
+        assert!(matches!(
+            ev.as_slice(),
+            [EngineEvent::RegistersChanged { .. }]
+        ));
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        let expected = build_set_can(&[build_jz18(rec.unit_type, rec.unit_id)]);
+        assert_eq!(s.on_ping().unwrap(), expected);
+    }
+
+    #[test]
+    fn outbound_reg06_flush_does_not_self_trigger_jz18() {
+        // The daemon's own reg-06 flush writes never come back as inbound
+        // announcements; only inbound getCAN reg-06 records queue JZ18.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+        let flush = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: UnitId::try_new(0).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![flush.clone()]));
+        let tx = s.on_ping().unwrap();
+        assert_eq!(tx, build_set_can(std::slice::from_ref(&flush)));
+        // No phantom JZ18 for the outbound write: next is empty poll.
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
     }
 }

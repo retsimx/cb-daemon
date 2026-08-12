@@ -1,6 +1,6 @@
 //! Wire payload constants and helpers for the CAN2 CB tablet side.
 
-use aa_registers::{CanRecord, WireError};
+use aa_registers::{CanRecord, Dest, RegId, UnitId, UnitType, WireError};
 
 /// Ping payload (`CRC = 0xdb`).
 pub(crate) const PING: &[u8] = b"Ping";
@@ -61,6 +61,22 @@ pub(crate) fn parse_get_can(payload: &[u8]) -> Result<Vec<CanRecord>, WireError>
         return Err(WireError::Incomplete);
     };
     CanRecord::parse_many(body)
+}
+
+/// JZ18 handshake reply to a reg-06 (JZ17) firmware announcement.
+///
+/// `aa_interop` §7.3: on each reg-06 announcement, the tablet answers
+/// reg 07 all-zero — `[unit_type][01][uid][07]00000000000000`.
+/// Unit type echoes the announcement (07 wired, 08 split/RF).
+#[must_use]
+pub(crate) const fn build_jz18(unit_type: UnitType, unit_id: UnitId) -> CanRecord {
+    CanRecord {
+        unit_type,
+        dest: Dest::ControlBox,
+        unit_id,
+        reg: RegId::new(0x07),
+        data: [0; 7],
+    }
 }
 
 /// Build a `setCAN …` payload from records (space after `setCAN`, space-separated hex).
@@ -183,5 +199,20 @@ mod tests {
     #[test]
     fn build_set_can_empty_matches_empty_poll_prefix() {
         assert_eq!(build_set_can(&[]), EMPTY_SET_CAN);
+    }
+
+    #[test]
+    fn build_jz18_wire_07() {
+        let r = build_jz18(UnitType::new(0x07), UnitId::try_new(0x0_11111).unwrap());
+        assert_eq!(r.reg, RegId::new(0x07));
+        assert_eq!(r.dest, Dest::ControlBox);
+        assert_eq!(r.data, [0; 7]);
+        assert_eq!(r.to_wire(), "0701111110700000000000000");
+    }
+
+    #[test]
+    fn build_jz18_wire_08() {
+        let r = build_jz18(UnitType::new(0x08), UnitId::try_new(0x0_0ABCD).unwrap());
+        assert_eq!(r.to_wire(), "08010abcd0700000000000000");
     }
 }

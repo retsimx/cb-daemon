@@ -378,6 +378,17 @@ mod tests {
         push_frame(&mock, &notify, b"Ping").await;
         wait_written_contains(&mock, &encoded(ACK_CAN)).await;
 
+        // The reset-response getCAN announced reg 06, so JZ18 precedes the poll.
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        let jz18 =
+            crate::wire::build_jz18(UnitType::new(0x07), UnitId::try_new(0x0_ABCDE).unwrap());
+        let expected_jz18 = encoded(&crate::wire::build_set_can(std::slice::from_ref(&jz18)));
+        wait_written_contains(&mock, &expected_jz18).await;
+
         {
             let mut g = mock.lock().await;
             let _ = g.take_written();
