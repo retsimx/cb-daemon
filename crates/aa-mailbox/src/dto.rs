@@ -59,6 +59,22 @@ pub enum PowerEnum {
     Off,
 }
 
+/// Fresh-air status (reg `05` byte 5).
+///
+/// README table: `00` = none, `01` = off, `02` = on. `None` must survive the
+/// round trip — a system without fresh-air hardware reports `00`, and writing
+/// `01` (off) back makes the `MyAir5` UI show a switch the hardware lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAirEnum {
+    /// No fresh-air hardware / not applicable (`0x00`).
+    None,
+    /// Fresh air off (`0x01`).
+    Off,
+    /// Fresh air on (`0x02`).
+    On,
+}
+
 /// Zone temperature sensor type (reg `03`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,8 +221,8 @@ pub struct SystemStatusDto {
     pub target_temp_c: f64,
     /// `MyZone` id (`0` = disabled / default).
     pub myzone_id: u8,
-    /// Fresh-air on/off.
-    pub fresh_air: bool,
+    /// Fresh-air status (`none`/`off`/`on`).
+    pub fresh_air: FreshAirEnum,
     /// RF system id.
     pub rf_sys_id: u8,
 }
