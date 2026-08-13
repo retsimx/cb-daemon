@@ -175,7 +175,7 @@ impl<L: Link> CbEngine<L> {
 
         if is_ping(&frame.payload) {
             if let Some(payload) = session.on_ping() {
-                let was_write = session.take_write_flushed();
+                let msg_ids = session.take_write_flushed();
                 let encoded = Frame { payload }.encode();
                 trace!(frame = %String::from_utf8_lossy(&encoded), "engine TX");
                 if let Err(err) = self.link.write_all(&encoded).await {
@@ -186,7 +186,12 @@ impl<L: Link> CbEngine<L> {
                     let _ = self.link.close().await;
                     return true;
                 }
-                if was_write && ev_tx.send(EngineEvent::WriteFlushed).await.is_err() {
+                if !msg_ids.is_empty()
+                    && ev_tx
+                        .send(EngineEvent::WriteFlushed(msg_ids))
+                        .await
+                        .is_err()
+                {
                     warn!("engine event channel closed; engine exiting");
                     let _ = self.link.close().await;
                     return true;
@@ -451,7 +456,7 @@ mod tests {
             data: [0; 7],
         };
         cmd_tx
-            .send(EngineCmd::WriteRegisters(vec![write_rec.clone()]))
+            .send(EngineCmd::WriteRegisters(vec![(write_rec.clone(), None)]))
             .await
             .unwrap();
 
@@ -481,6 +486,251 @@ mod tests {
         }
         push_frame(&mock, &notify, b"Ping").await;
         wait_written_contains(&mock, &encoded(ACK_CAN)).await;
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    /// Drive the engine through negotiate → two-phase dump → Snapshot, then
+    /// settle steady TX (ack → JZ18 → empty poll) so the write queue is idle.
+    async fn drive_to_idle_steady(
+        mock: &Arc<Mutex<MockLink>>,
+        notify: &Notify,
+        ev_rx: &mut mpsc::Receiver<EngineEvent>,
+    ) {
+        negotiate_through_can2(mock, notify).await;
+        let _ = recv_event(ev_rx, |e| matches!(e, EngineEvent::Negotiated { .. })).await;
+
+        dump_via_two_phase(mock, notify).await;
+        let rec = sample_record();
+        push_frame(mock, notify, &get_can_body(std::slice::from_ref(&rec))).await;
+        let _ = recv_event(ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
+        let _ = recv_event(ev_rx, |e| {
+            matches!(e, EngineEvent::SessionState(SessionState::Synced))
+        })
+        .await;
+
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(mock, notify, b"Ping").await;
+        wait_written_contains(mock, &encoded(ACK_CAN)).await;
+
+        // The reset-response getCAN announced reg 06, so JZ18 precedes the poll.
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(mock, notify, b"Ping").await;
+        let jz18 =
+            crate::wire::build_jz18(UnitType::new(0x07), UnitId::try_new(0x0_ABCDE).unwrap());
+        let expected_jz18 = encoded(&crate::wire::build_set_can(std::slice::from_ref(&jz18)));
+        wait_written_contains(mock, &expected_jz18).await;
+
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(mock, notify, b"Ping").await;
+        wait_written_contains(mock, &encoded(EMPTY_SET_CAN)).await;
+    }
+
+    fn write_record() -> CanRecord {
+        CanRecord {
+            unit_type: UnitType::new(0x07),
+            dest: Dest::ControlBox,
+            unit_id: UnitId::try_new(0).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        }
+    }
+
+    #[tokio::test]
+    async fn write_flushed_carries_exactly_the_drained_msg_ids() {
+        // D-17: the flush event must carry exactly the msg_ids drained into the
+        // just-TX'd frame, in queue order.
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        drive_to_idle_steady(&mock, &notify, &mut ev_rx).await;
+
+        cmd_tx
+            .send(EngineCmd::WriteRegisters(vec![
+                (write_record(), Some("a".into())),
+                (write_record(), Some("b".into())),
+            ]))
+            .await
+            .unwrap();
+
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        let expected_set = encoded(&crate::wire::build_set_can(&[
+            write_record(),
+            write_record(),
+        ]));
+        wait_written_contains(&mock, &expected_set).await;
+
+        let ev = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::WriteFlushed(_))).await;
+        match ev {
+            EngineEvent::WriteFlushed(ids) => {
+                assert_eq!(
+                    ids,
+                    vec!["a".to_string(), "b".to_string()],
+                    "flush must carry both drained msg_ids in order"
+                );
+            }
+            other => panic!("expected WriteFlushed, got {other:?}"),
+        }
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    #[tokio::test]
+    async fn write_queued_after_drain_flushes_in_the_next_frame() {
+        // D-17: a write that lands between the per-frame drain and the flush
+        // broadcast must not be acked by the current flush; it rides the next.
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        drive_to_idle_steady(&mock, &notify, &mut ev_rx).await;
+
+        // First write, first frame: flush_1 = ["first"].
+        cmd_tx
+            .send(EngineCmd::WriteRegisters(vec![(
+                write_record(),
+                Some("first".into()),
+            )]))
+            .await
+            .unwrap();
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        let expected_set = encoded(&crate::wire::build_set_can(std::slice::from_ref(
+            &write_record(),
+        )));
+        wait_written_contains(&mock, &expected_set).await;
+        let ev1 = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::WriteFlushed(_))).await;
+        match ev1 {
+            EngineEvent::WriteFlushed(ids) => {
+                assert_eq!(ids, vec!["first".to_string()]);
+            }
+            other => panic!("expected WriteFlushed, got {other:?}"),
+        }
+
+        // Second write, second frame: flush_2 = ["second"], not a mix.
+        cmd_tx
+            .send(EngineCmd::WriteRegisters(vec![(
+                write_record(),
+                Some("second".into()),
+            )]))
+            .await
+            .unwrap();
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &expected_set).await;
+        let ev2 = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::WriteFlushed(_))).await;
+        match ev2 {
+            EngineEvent::WriteFlushed(ids) => {
+                assert_eq!(
+                    ids,
+                    vec!["second".to_string()],
+                    "late write must flush in the next frame only"
+                );
+            }
+            other => panic!("expected WriteFlushed, got {other:?}"),
+        }
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    #[tokio::test]
+    async fn internal_none_writes_emit_no_flush_event() {
+        // D-17: internal writes (None msg_id) never produce a flush event with
+        // phantom ids; the machinery still flushes a later client write.
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        drive_to_idle_steady(&mock, &notify, &mut ev_rx).await;
+
+        cmd_tx
+            .send(EngineCmd::WriteRegisters(vec![(write_record(), None)]))
+            .await
+            .unwrap();
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        let expected_set = encoded(&crate::wire::build_set_can(std::slice::from_ref(
+            &write_record(),
+        )));
+        wait_written_contains(&mock, &expected_set).await;
+
+        // Nothing may arrive: no flush event for a None-id write.
+        assert!(
+            timeout(Duration::from_millis(200), ev_rx.recv())
+                .await
+                .is_err(),
+            "None-id writes must not emit a WriteFlushed event"
+        );
+
+        // A subsequent client write still flushes — the machinery is alive.
+        cmd_tx
+            .send(EngineCmd::WriteRegisters(vec![(
+                write_record(),
+                Some("x".into()),
+            )]))
+            .await
+            .unwrap();
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &expected_set).await;
+        let ev = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::WriteFlushed(_))).await;
+        match ev {
+            EngineEvent::WriteFlushed(ids) => assert_eq!(ids, vec!["x".to_string()]),
+            other => panic!("expected WriteFlushed, got {other:?}"),
+        }
 
         cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
         timeout(Duration::from_secs(2), join)

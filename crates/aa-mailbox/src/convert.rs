@@ -299,17 +299,24 @@ fn check_ranges(reg: u8, data: [u8; 7]) -> Result<(), WriteError> {
 /// Validate a register write against the D-4 write policy and the wire ranges
 /// (issue #32).
 ///
-/// Precedence: mode → field → range. Raw-hex payloads bypass the field and
-/// range checks (client responsibility) but still fail the mode check. A typed
-/// payload that fails to encode skips the range check — the outer write path
-/// surfaces the real [`EncodeError`].
+/// Precedence: mode → field → unknown field → range. Raw-hex payloads bypass
+/// the field and range checks (client responsibility) but still fail the mode
+/// check. A typed payload that fails to encode skips the range check — the
+/// outer write path surfaces the real [`EncodeError`].
+///
+/// A typed object payload carrying a key outside the register's DTO field
+/// table ([`dto_field_names`]) is rejected as [`WriteError::UnknownField`]
+/// (issue #57): silently ignoring unknown keys would ack a write that changed
+/// nothing.
 ///
 /// # Errors
 ///
 /// Returns [`WriteError::ReadOnlyRegister`] / [`WriteError::InternalRegister`]
 /// / [`WriteError::UnverifiedRegister`] for non-writable registers,
 /// [`WriteError::ReadOnlyField`] for a typed payload carrying a read-only
-/// field, and [`WriteError::OutOfRange`] for a wire value above its bound.
+/// field, [`WriteError::UnknownField`] for a typed payload carrying a key the
+/// register's DTO does not define, and [`WriteError::OutOfRange`] for a wire
+/// value above its bound.
 pub fn validate_write(reg: RegId, payload: &Value) -> Result<(), WriteError> {
     let policy = write_policy(reg);
     match policy.mode {
@@ -332,6 +339,17 @@ pub fn validate_write(reg: RegId, payload: &Value) -> Result<(), WriteError> {
                 return Err(WriteError::ReadOnlyField {
                     reg: reg.get(),
                     field,
+                });
+            }
+        }
+    }
+    if let Some(obj) = payload.as_object() {
+        let known = dto_field_names(reg);
+        for key in obj.keys() {
+            if !known.contains(&key.as_str()) {
+                return Err(WriteError::UnknownField {
+                    reg: reg.get(),
+                    field: key.clone(),
                 });
             }
         }
@@ -405,6 +423,54 @@ fn classify_full<T: DeserializeOwned>(obj: &serde_json::Map<String, Value>) -> b
     match serde_json::from_value::<T>(Value::Object(obj.clone())) {
         Err(err) if err.to_string().contains("missing field") => false,
         Ok(_) | Err(_) => true,
+    }
+}
+
+/// Complete JSON field-name set for a DTO-bearing register (issue #57).
+///
+/// Mirrors [`is_full_payload`]'s DTO map: the field names are the serde field
+/// names (`snake_case`) of the register's write DTO in [`crate::dto`]. The
+/// drift-guard tests in this module keep the table equal to the DTO key sets
+/// in both directions. Registers without a DTO return an empty slice.
+#[must_use]
+pub const fn dto_field_names(reg: RegId) -> &'static [&'static str] {
+    match reg.get() {
+        0x01 => &[
+            "header",
+            "total_zones",
+            "constant_zones",
+            "constant_zone_ids",
+            "filter_clean_required",
+        ],
+        0x03 => &[
+            "open",
+            "damper_pct",
+            "sensor_type",
+            "target_temp_c",
+            "measured_temp_c",
+        ],
+        0x04 => &[
+            "min_damper",
+            "max_damper",
+            "motion_status",
+            "motion_config",
+            "zone_error",
+            "rssi",
+        ],
+        0x05 => &[
+            "power",
+            "mode",
+            "fan",
+            "target_temp_c",
+            "myzone_id",
+            "fresh_air",
+            "rf_sys_id",
+        ],
+        0x09 => &["action", "unlock_code", "activation_days"],
+        0x12 => &["sensor_uid", "zone"],
+        0x26 => &["pairing_control", "rf_device_type", "zone_channel"],
+        0x27 => &["calibration_control", "channel", "up_down_position"],
+        _ => &[],
     }
 }
 
@@ -659,7 +725,13 @@ fn measured_from_c(temp_c: f64) -> (u8, u8) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        check_ranges, is_full_payload, merge_payload, validate_write, validate_write_merged,
+        check_ranges, decode_payload, dto_field_names, is_full_payload, merge_payload,
+        validate_write, validate_write_merged,
+    };
+    use crate::dto::{
+        ActionEnum, ActivationCodeDto, FanEnum, FreshAirEnum, ModeEnum, PowerEnum,
+        RfDeviceCalibrationDto, RfDevicePairingDto, SensorPairingWriteDto, SensorTypeEnum,
+        SystemStatusDto, ZoneConfigDto, ZoneLimitsDto, ZoneStateDto,
     };
     use crate::error::WriteError;
     use aa_registers::RegId;
@@ -694,6 +766,85 @@ mod tests {
                 reg: 0x03,
                 field: "measured_temp_c",
             }
+        );
+    }
+
+    #[test]
+    fn typed_write_with_unknown_field_rejected() {
+        let err = validate_write(RegId::new(0x03), &json!({ "damperx": 50 })).unwrap_err();
+        assert_eq!(
+            err,
+            WriteError::UnknownField {
+                reg: 0x03,
+                field: "damperx".to_owned(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "unknown field 'damperx' for register 03",
+            "wire contract: reason must name the offending key exactly"
+        );
+    }
+
+    #[test]
+    fn typed_write_with_dto_exact_payload_never_unknown_field() {
+        // Every ZoneStateDto field with valid values: the read-only keys still
+        // fail (precedence), but no key is outside the field table.
+        let result = validate_write(
+            RegId::new(0x03),
+            &json!({
+                "open": true,
+                "damper_pct": 50,
+                "sensor_type": "rf",
+                "target_temp_c": 24.0,
+                "measured_temp_c": 23.1,
+            }),
+        );
+        assert!(
+            !matches!(result, Err(WriteError::UnknownField { .. })),
+            "DTO-exact payload must not produce an unknown-field error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn typed_write_with_full_dto_payload_validates_ok() {
+        // Reg 01 has no read-only fields: the full ZoneConfigDto payload
+        // passes every check.
+        let result = validate_write(
+            RegId::new(0x01),
+            &json!({
+                "header": 0x20,
+                "total_zones": 3,
+                "constant_zones": 1,
+                "constant_zone_ids": [1, 2, 0],
+                "filter_clean_required": false,
+            }),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn raw_hex_write_bypasses_unknown_field_check() {
+        // Raw-hex payloads are byte-exact passthrough and skip the field
+        // checks even on a DTO-bearing register.
+        let result = validate_write(RegId::new(0x03), &raw_hex("02820030000000"));
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn decode_payload_zone_state_unaffected_by_field_table() {
+        let decoded = decode_payload(RegId::new(0x03), [0x00, 0xb2, 0x01, 48, 23, 3, 0x00])
+            .expect("reg 03 decodes");
+        assert_eq!(
+            decoded,
+            json!({
+                "open": true,
+                "damper_pct": 50,
+                "sensor_type": "rf",
+                "target_temp_c": 24.0,
+                "measured_temp_c": 23.3,
+            }),
+            "read path still produces the full DTO object"
         );
     }
 
@@ -1025,6 +1176,190 @@ mod tests {
     #[test]
     fn is_full_payload_unknown_register_is_not_full() {
         assert!(!is_full_payload(RegId::new(0x16), &json!({})));
+    }
+
+    #[test]
+    fn dto_field_names_table_keys_deserialize_into_dtos() {
+        // Drift guard (a): a value carrying exactly the table's keys (built
+        // from the table itself) with valid values must deserialize into the
+        // register's DTO — a bogus or typo'd table key leaves a required DTO
+        // field missing and fails.
+        for reg in [0x01u8, 0x03, 0x04, 0x05, 0x09, 0x12, 0x26, 0x27] {
+            let mut map = serde_json::Map::new();
+            for name in dto_field_names(RegId::new(reg)) {
+                map.insert((*name).to_owned(), valid_field_value(reg, name));
+            }
+            let payload = Value::Object(map);
+            let ok = match reg {
+                0x01 => serde_json::from_value::<ZoneConfigDto>(payload).is_ok(),
+                0x03 => serde_json::from_value::<ZoneStateDto>(payload).is_ok(),
+                0x04 => serde_json::from_value::<ZoneLimitsDto>(payload).is_ok(),
+                0x05 => serde_json::from_value::<SystemStatusDto>(payload).is_ok(),
+                0x09 => serde_json::from_value::<ActivationCodeDto>(payload).is_ok(),
+                0x12 => serde_json::from_value::<SensorPairingWriteDto>(payload).is_ok(),
+                0x26 => serde_json::from_value::<RfDevicePairingDto>(payload).is_ok(),
+                0x27 => serde_json::from_value::<RfDeviceCalibrationDto>(payload).is_ok(),
+                _ => unreachable!(),
+            };
+            assert!(
+                ok,
+                "reg {reg:02x}: every table key must be a real DTO field"
+            );
+        }
+    }
+
+    /// Valid per-field test value for the drift-guard table↔DTO checks.
+    fn valid_field_value(reg: u8, field: &str) -> Value {
+        match (reg, field) {
+            (0x01, "header") => json!(0x20),
+            (0x01, "total_zones")
+            | (0x05, "myzone_id")
+            | (0x26, "zone_channel")
+            | (0x27, "up_down_position") => json!(3),
+            (0x01, "constant_zones")
+            | (0x04, "motion_status")
+            | (0x12, "zone")
+            | (0x26, "pairing_control")
+            | (0x27, "calibration_control") => json!(1),
+            (0x01, "constant_zone_ids") => json!([1, 2, 0]),
+            (0x01, "filter_clean_required") => json!(false),
+            (0x03, "open") => json!(true),
+            (0x03, "damper_pct") => json!(50),
+            (0x03, "sensor_type") => json!("rf"),
+            (0x03 | 0x05, "target_temp_c") => json!(24.0),
+            (0x03, "measured_temp_c") => json!(23.1),
+            (0x04, "min_damper") => json!(10),
+            (0x04, "max_damper") => json!(90),
+            (0x04, "motion_config") | (0x26, "rf_device_type") | (0x27, "channel") => json!(2),
+            (0x04, "zone_error") => json!(0),
+            (0x04, "rssi") | (0x05, "rf_sys_id") => json!(5),
+            (0x05, "power") => json!("on"),
+            (0x05, "mode") => json!("cool"),
+            (0x05, "fan") => json!("high"),
+            (0x05, "fresh_air") => json!("none"),
+            (0x09, "action") => json!("set_code"),
+            (0x09, "unlock_code") => json!("abcd"),
+            (0x09, "activation_days") => json!(30),
+            (0x12, "sensor_uid") => json!("a1b2c3"),
+            _ => panic!("no valid test value for reg {reg:02x} field '{field}'"),
+        }
+    }
+
+    #[test]
+    fn dto_field_names_table_matches_dto_key_sets() {
+        // Drift guard (b): serializing each DTO must produce exactly the
+        // table's key set — no DTO field may be missing from the table, and
+        // no table entry may name a field the DTO lacks.
+        let dtos: Vec<(u8, Value)> = vec![
+            (
+                0x01,
+                serde_json::to_value(ZoneConfigDto {
+                    header: 0x20,
+                    total_zones: 3,
+                    constant_zones: 1,
+                    constant_zone_ids: [1, 2, 0],
+                    filter_clean_required: false,
+                })
+                .unwrap(),
+            ),
+            (
+                0x03,
+                serde_json::to_value(ZoneStateDto {
+                    open: true,
+                    damper_pct: 50,
+                    sensor_type: SensorTypeEnum::Rf,
+                    target_temp_c: 24.0,
+                    measured_temp_c: 23.1,
+                })
+                .unwrap(),
+            ),
+            (
+                0x04,
+                serde_json::to_value(ZoneLimitsDto {
+                    min_damper: 10,
+                    max_damper: 90,
+                    motion_status: 1,
+                    motion_config: 2,
+                    zone_error: 0,
+                    rssi: 5,
+                })
+                .unwrap(),
+            ),
+            (
+                0x05,
+                serde_json::to_value(SystemStatusDto {
+                    power: PowerEnum::On,
+                    mode: ModeEnum::Cool,
+                    fan: FanEnum::High,
+                    target_temp_c: 24.0,
+                    myzone_id: 3,
+                    fresh_air: FreshAirEnum::None,
+                    rf_sys_id: 5,
+                })
+                .unwrap(),
+            ),
+            (
+                0x09,
+                serde_json::to_value(ActivationCodeDto {
+                    action: ActionEnum::SetCode,
+                    unlock_code: "abcd".to_owned(),
+                    activation_days: 30,
+                })
+                .unwrap(),
+            ),
+            (
+                0x12,
+                serde_json::to_value(SensorPairingWriteDto {
+                    sensor_uid: "a1b2c3".to_owned(),
+                    zone: 1,
+                })
+                .unwrap(),
+            ),
+            (
+                0x26,
+                serde_json::to_value(RfDevicePairingDto {
+                    pairing_control: 1,
+                    rf_device_type: 2,
+                    zone_channel: 3,
+                })
+                .unwrap(),
+            ),
+            (
+                0x27,
+                serde_json::to_value(RfDeviceCalibrationDto {
+                    calibration_control: 1,
+                    channel: 2,
+                    up_down_position: 3,
+                })
+                .unwrap(),
+            ),
+        ];
+        for (reg, value) in dtos {
+            let mut dto_keys: Vec<&str> = value
+                .as_object()
+                .expect("DTO serializes to an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            dto_keys.sort_unstable();
+            let mut table_keys: Vec<&str> = dto_field_names(RegId::new(reg)).to_vec();
+            table_keys.sort_unstable();
+            assert_eq!(
+                dto_keys, table_keys,
+                "reg {reg:02x}: DTO key set must equal the field-name table"
+            );
+        }
+    }
+
+    #[test]
+    fn dto_field_names_empty_outside_write_dto_registers() {
+        // The table covers only the write DTO registers (issue #57); other
+        // registers — unknown (16), read-only DTOs (02), unverified (13) —
+        // have no write field table.
+        assert!(dto_field_names(RegId::new(0x16)).is_empty());
+        assert!(dto_field_names(RegId::new(0x02)).is_empty());
+        assert!(dto_field_names(RegId::new(0x0a)).is_empty());
+        assert!(dto_field_names(RegId::new(0x13)).is_empty());
     }
 
     #[test]
