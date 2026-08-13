@@ -38,3 +38,12 @@ tty_baud = 57600
 
 # Seconds between power-off retries while still disconnected (>= 1)
 # ws_idle_retry_seconds = 60
+
+# WebSocket keepalive: daemon-initiated pings every interval seconds; sessions
+# silent for pong_timeout seconds are closed (pong_timeout >= interval).
+# keepalive_interval_seconds = 30
+# keepalive_pong_timeout_seconds = 75
+
+# Seconds a connecting client waits for the first engine snapshot before
+# receiving a link_down status and being closed (engine-down connect).
+# snapshot_timeout_seconds = 15
