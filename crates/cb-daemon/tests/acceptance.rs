@@ -1287,27 +1287,14 @@ async fn invalid_json_rejected_with_error() {
     handle.shutdown().await.expect("shutdown");
 }
 
-/// A9 (T3): the `flush_unit` command returns the exact "not implemented yet"
-/// error ack, and an unknown action returns "unknown action: …"; the
-/// connection stays usable afterwards — a follow-up write is acked success.
+/// A9 (T3): an unknown command action returns the exact "unknown action: …"
+/// error ack, and the connection stays usable afterwards — a follow-up write
+/// is acked success.
 #[tokio::test]
-async fn flush_unit_and_unknown_command_return_error_acks() {
+async fn unknown_command_returns_error_ack_and_connection_stays_usable() {
     let handle = spawn_daemon().await;
     let mut ws = connect_ws(handle.local_addr()).await;
     let _ = wait_for_type(&mut ws, "snapshot").await;
-
-    let flush = json!({
-        "type": "command",
-        "msg_id": "req-a9-flush",
-        "action": "flush_unit"
-    });
-    ws.send(Message::Text(flush.to_string().into()))
-        .await
-        .unwrap();
-    let ack = wait_for_ack(&mut ws, "req-a9-flush").await;
-    assert_eq!(ack["type"], "ack");
-    assert_eq!(ack["status"], "error", "flush_unit ack: {ack}");
-    assert_eq!(ack["reason"], "flush_unit not implemented yet");
 
     let bogus = json!({
         "type": "command",
