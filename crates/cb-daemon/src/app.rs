@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::{Backend, Config};
-use crate::mock_feeder::{self, SharedMockLink};
+use crate::mock_feeder::{self, FeederSpec, SharedMockLink};
 use crate::ws::{self, WsEvent, WsState};
 
 /// Channel capacity for engine cmd / event mpsc (architecture default).
@@ -80,6 +80,20 @@ impl App {
         spawn_mock_inner(bind, true).await
     }
 
+    /// Like [`Self::spawn_mock`] with a [`FeederSpec`] driving the feeder.
+    ///
+    /// # Errors
+    ///
+    /// Propagates bind / spawn failures.
+    #[allow(dead_code)]
+    pub async fn spawn_mock_with_spec(
+        bind: SocketAddr,
+        spec: FeederSpec,
+    ) -> anyhow::Result<AppHandle> {
+        let (handle, _ctrl) = Self::spawn_mock_ctrl_inner(bind, Some(spec)).await?;
+        Ok(handle)
+    }
+
     /// Like [`Self::spawn_mock`] but skips the negotiate/dump feeder.
     ///
     /// Used to exercise disconnect-while-waiting-for-Snapshot (no bank ever arrives).
@@ -103,6 +117,16 @@ impl App {
         bind: SocketAddr,
         with_feeder: bool,
     ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
+        let feeder = with_feeder.then(FeederSpec::default);
+        Self::spawn_mock_ctrl_inner(bind, feeder).await
+    }
+}
+
+impl App {
+    async fn spawn_mock_ctrl_inner(
+        bind: SocketAddr,
+        feeder: Option<FeederSpec>,
+    ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
         let listener = TcpListener::bind(bind)
             .await
             .with_context(|| format!("bind {bind}"))?;
@@ -116,16 +140,7 @@ impl App {
             notify: Arc::clone(&notify),
         };
         let join = tokio::spawn(async move {
-            run_mock_with_parts(
-                listener,
-                shutdown_rx,
-                Some(spy),
-                with_feeder,
-                link,
-                mock,
-                notify,
-            )
-            .await
+            run_mock_with_parts(listener, shutdown_rx, Some(spy), feeder, link, mock, notify).await
         });
         Ok((
             AppHandle {
@@ -200,7 +215,9 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
         let _ = signal_shutdown.send(());
     });
     match config.backend {
-        Backend::Mock => run_mock_with_listener(listener, shutdown_rx, None, true).await,
+        Backend::Mock => {
+            run_mock_with_listener(listener, shutdown_rx, None, Some(FeederSpec::default())).await
+        }
         Backend::Aoa => {
             let hint = config.unit_id_hint;
             let link = open_aoa(&config).await?;
@@ -248,19 +265,10 @@ async fn run_mock_with_listener(
     listener: TcpListener,
     shutdown_rx: oneshot::Receiver<()>,
     cmd_spy: Option<Arc<Mutex<Vec<EngineCmd>>>>,
-    with_feeder: bool,
+    feeder: Option<FeederSpec>,
 ) -> anyhow::Result<()> {
     let (link, mock, notify) = SharedMockLink::new();
-    run_mock_with_parts(
-        listener,
-        shutdown_rx,
-        cmd_spy,
-        with_feeder,
-        link,
-        mock,
-        notify,
-    )
-    .await
+    run_mock_with_parts(listener, shutdown_rx, cmd_spy, feeder, link, mock, notify).await
 }
 
 /// Mock path over pre-built [`SharedMockLink`] parts (tests may hold a
@@ -269,13 +277,12 @@ async fn run_mock_with_parts(
     listener: TcpListener,
     shutdown_rx: oneshot::Receiver<()>,
     cmd_spy: Option<Arc<Mutex<Vec<EngineCmd>>>>,
-    with_feeder: bool,
+    feeder: Option<FeederSpec>,
     link: SharedMockLink,
     mock: Arc<Mutex<MockLink>>,
     notify: Arc<Notify>,
 ) -> anyhow::Result<()> {
-    let feeder =
-        with_feeder.then(|| tokio::spawn(mock_feeder::run_negotiate_dump_feeder(mock, notify)));
+    let feeder = feeder.map(|spec| tokio::spawn(mock_feeder::run_feeder(mock, notify, spec)));
     let result = run_with_link(listener, link, shutdown_rx, cmd_spy, None).await;
     if let Some(feeder) = feeder {
         feeder.abort();

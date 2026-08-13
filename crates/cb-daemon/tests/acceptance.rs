@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use aa_engine::EngineCmd;
 use aa_link::AOA_DEFAULT_PATH;
-use cb_daemon::{App, Backend, mock_backend_avoids_accessory};
+use aa_registers::{UnitId, UnitType};
+use cb_daemon::{App, Backend, FeederSpec, mock_backend_avoids_accessory};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::time::timeout;
@@ -168,6 +169,33 @@ async fn wait_for_event(
                 .expect("closed before event arrived");
             if msg["type"] == "event" && msg["register"] == register {
                 assert_eq!(msg["unit_id"], unit_id);
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("event timeout")
+}
+
+/// Wait until the reg-`register` event from `unit_id` arrives, skipping
+/// same-register events broadcast by other units; panics on close/timeout.
+///
+/// For events whose unit id must distinguish the sender (e.g. the scripted
+/// JZ18 reply, which shares register 07 with the dump-phase announcement
+/// echoes).
+async fn wait_for_event_from(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    register: &str,
+    unit_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(ws)
+                .await
+                .expect("closed before event arrived");
+            if msg["type"] == "event" && msg["register"] == register && msg["unit_id"] == unit_id {
                 return msg;
             }
         }
@@ -952,6 +980,361 @@ async fn read_unreported_register_acks_has_no_value() {
     .expect("read ack timeout");
     assert_eq!(ack["status"], "error", "reg-02 read ack: {ack}");
     assert_eq!(ack["reason"], "register 02 has no value");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Wait until a `link_down` status carrying a string `detail` arrives; panics
+/// on close/timeout.
+///
+/// The engine emits `SessionState(LinkDown)` (detail-less) before `LinkError`,
+/// so the detail-carrying re-broadcast must be waited for (D-8).
+async fn wait_for_link_down(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Value {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(ws)
+                .await
+                .expect("closed before link_down status");
+            if msg["type"] == "status" && msg["state"] == "link_down" && msg["detail"].is_string() {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("link_down status with detail timeout")
+}
+
+/// A1 (T4): three clients connect concurrently to one daemon; none is closed
+/// (a close would panic inside `recv_json`) and each receives a full
+/// `snapshot` covering both the 07 (reg 05) and 08 (reg 06) units of the mock
+/// feeder's `abcde` unit id.
+#[tokio::test]
+async fn three_clients_all_receive_snapshot_and_none_rejected() {
+    let handle = spawn_daemon().await;
+    let addr = handle.local_addr();
+    let mut a = connect_ws(addr).await;
+    let mut b = connect_ws(addr).await;
+    let mut c = connect_ws(addr).await;
+
+    for ws in [&mut a, &mut b, &mut c] {
+        let snap = wait_for_type(ws, "snapshot").await;
+        let reg05 = &snap["units"]["07:abcde"]["05"];
+        assert!(reg05.is_object(), "reg 05 missing from snapshot: {snap}");
+        assert_eq!(reg05["power"], "on");
+        let reg06 = &snap["units"]["08:abcde"]["06"];
+        assert!(reg06.is_object(), "reg 06 missing from snapshot: {snap}");
+        assert_eq!(reg06["fw_major"], 0);
+    }
+
+    let _ = a.close(None).await;
+    let _ = b.close(None).await;
+    let _ = c.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A2 (T2): every write-policy violation path returns the exact error-ack
+/// reason over the wire: read-only register (08), read-only field
+/// (`rf_sys_id` on 05), internal register (07), unverified register (0b),
+/// and an out-of-range typed value (reg 01 `total_zones` > 10). Each ack
+/// carries type "ack", status "error", the matching `msg_id`, and the exact
+/// reason; the connection stays healthy — a follow-up write is acked success.
+#[tokio::test]
+async fn write_policy_error_acks_exact_reasons() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let cases: [(&str, &str, Value, &str); 5] = [
+        (
+            "req-a2-1",
+            "08",
+            json!("00000000000000"),
+            "register 08 is read-only",
+        ),
+        (
+            "req-a2-2",
+            "05",
+            json!({"rf_sys_id": 1}),
+            "field 'rf_sys_id' is read-only on register 05",
+        ),
+        (
+            "req-a2-3",
+            "07",
+            json!("00000000000000"),
+            "register 07 is handled internally",
+        ),
+        (
+            "req-a2-4",
+            "0b",
+            json!("00000000000000"),
+            "register 0b is unverified; writes not permitted",
+        ),
+        (
+            "req-a2-5",
+            "01",
+            json!({
+                "header": 0x20,
+                "total_zones": 11,
+                "constant_zones": 1,
+                "constant_zone_ids": [1, 0, 0],
+                "filter_clean_required": false,
+            }),
+            "field 'numZones' 11 out of range (max 10)",
+        ),
+    ];
+    for (msg_id, register, payload, reason) in cases {
+        let req = json!({
+            "type": "write",
+            "msg_id": msg_id,
+            "register": register,
+            "payload": payload,
+        });
+        ws.send(Message::Text(req.to_string().into()))
+            .await
+            .unwrap();
+        let ack = wait_for_ack(&mut ws, msg_id).await;
+        assert_eq!(ack["type"], "ack");
+        assert_eq!(ack["status"], "error", "{msg_id} ack: {ack}");
+        assert_eq!(ack["reason"], reason, "{msg_id} ack: {ack}");
+    }
+
+    // Connection stays healthy after every error: a follow-up write acks success.
+    ws.send(Message::Text(
+        reg05_write("req-a2-health").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-a2-health").await;
+    assert_eq!(ack["status"], "success", "post-error write ack: {ack}");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A3 (T5): a scripted unsolicited reg-06 announcement from a distinctive
+/// unit (type `0a`, id `fedcb` — never emitted by the default dump, which
+/// only announces 08:abcde) triggers the engine's JZ18 handshake: the
+/// all-zero reg-07 setCAN reply echoes the announcement's unit type + id,
+/// is echoed back by the mock feeder as a getCAN record, and surfaces as an
+/// `event` frame for register 07 addressed to `0a:fedcb` with the raw hex
+/// payload "00000000000000". The dump-phase 08:abcde reg-07 echoes arrive
+/// first and are skipped by `wait_for_event_from`, so the assertion can only
+/// match the scripted injection's reply. Interleaved status frames are
+/// tolerated.
+#[tokio::test]
+async fn jz18_scripted_reg06_announcement_replies_reg07() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let spec = FeederSpec::default().scripted_reg06(
+        UnitType::new(0x0A),
+        UnitId::try_new(0x0_FEDCB).unwrap(),
+        [0; 7],
+    );
+    let handle = App::spawn_mock_with_spec(bind, spec)
+        .await
+        .expect("spawn mock with spec");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let event = wait_for_event_from(&mut ws, "07", "fedcb").await;
+    assert_eq!(event["unit_type"], "0a", "JZ18 reply echo: {event}");
+    assert_eq!(
+        event["payload"], "00000000000000",
+        "JZ18 reply echo: {event}"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A4 (T5): a write addressed with explicit `unit_type: "08"` and
+/// `unit_id: "abcde"` is acked success and its broadcast `event` echo carries
+/// the same 08 type and unit id (multi-unit write echo).
+#[tokio::test]
+async fn multi_unit_write_to_08_unit_echoes_type_08() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-a4-08",
+        "unit_type": "08",
+        "unit_id": "abcde",
+        "register": "05",
+        "payload": "0101032e000100"
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-a4-08").await;
+    assert_eq!(ack["status"], "success", "08-unit write ack: {ack}");
+    let event = wait_for_event(&mut ws, "05", "abcde").await;
+    assert_eq!(event["unit_type"], "08", "08-unit write echo: {event}");
+    assert_eq!(event["unit_id"], "abcde");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A5 (T5): with a `without_reg05()` feeder spec the dump never carries
+/// reg 05, so the snapshot contains the 08 unit but no reg-05 key under any
+/// unit — and no `system_status` DTO (`rf_sys_id` is unique to it) anywhere.
+#[tokio::test]
+async fn no_synthesis_snapshot_without_reg05() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle = App::spawn_mock_with_spec(bind, FeederSpec::default().without_reg05())
+        .await
+        .expect("spawn mock without reg05");
+    let mut ws = connect_ws(handle.local_addr()).await;
+
+    let snap = wait_for_type(&mut ws, "snapshot").await;
+    let reg06 = &snap["units"]["08:abcde"]["06"];
+    assert!(
+        reg06.is_object(),
+        "08 unit reg 06 missing from snapshot: {snap}"
+    );
+    for registers in snap["units"].as_object().unwrap().values() {
+        assert!(
+            !registers.as_object().unwrap().contains_key("05"),
+            "reg 05 must not be synthesized: {snap}"
+        );
+    }
+    assert!(
+        !snap.to_string().contains("rf_sys_id"),
+        "no system_status DTO may appear: {snap}"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A6 (T4): a forced link close broadcasts the `link_down` status to every
+/// connected client — all three synced sessions observe the frame.
+#[tokio::test]
+async fn status_transition_broadcast_to_all_clients() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, ctrl) = App::spawn_mock_ctrl(bind, true)
+        .await
+        .expect("spawn mock with ctrl");
+    let addr = handle.local_addr();
+    let mut a = connect_ws(addr).await;
+    let mut b = connect_ws(addr).await;
+    let mut c = connect_ws(addr).await;
+    let _ = wait_for_type(&mut a, "snapshot").await;
+    let _ = wait_for_type(&mut b, "snapshot").await;
+    let _ = wait_for_type(&mut c, "snapshot").await;
+
+    ctrl.close().await;
+
+    let sa = wait_for_link_down(&mut a).await;
+    assert_eq!(sa["detail"], "link closed");
+    let sb = wait_for_link_down(&mut b).await;
+    assert_eq!(sb["detail"], "link closed");
+    let sc = wait_for_link_down(&mut c).await;
+    assert_eq!(sc["detail"], "link closed");
+
+    let _ = a.close(None).await;
+    let _ = b.close(None).await;
+    let _ = c.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A7 (T3): a binary WebSocket frame is answered with an `error` frame
+/// "binary frames not supported" and the connection stays usable — a
+/// follow-up write is acked success.
+#[tokio::test]
+async fn binary_frame_rejected_with_error() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Binary(vec![0x00, 0x01, 0x02].into()))
+        .await
+        .unwrap();
+    let err = wait_for_type(&mut ws, "error").await;
+    assert_eq!(err["message"], "binary frames not supported");
+
+    ws.send(Message::Text(reg05_write("req-a7").to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-a7").await;
+    assert_eq!(ack["status"], "success", "post-binary write ack: {ack}");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A8 (T3): malformed text is answered with an `error` frame
+/// "invalid client message" carrying a serde `reason`, and the connection
+/// stays usable — a follow-up write is acked success.
+#[tokio::test]
+async fn invalid_json_rejected_with_error() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text("{not json".into())).await.unwrap();
+    let err = wait_for_type(&mut ws, "error").await;
+    assert_eq!(err["message"], "invalid client message");
+    assert!(err["reason"].is_string(), "serde reason missing: {err}");
+
+    ws.send(Message::Text(reg05_write("req-a8").to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-a8").await;
+    assert_eq!(ack["status"], "success", "post-error write ack: {ack}");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A9 (T3): the `flush_unit` command returns the exact "not implemented yet"
+/// error ack, and an unknown action returns "unknown action: …"; the
+/// connection stays usable afterwards — a follow-up write is acked success.
+#[tokio::test]
+async fn flush_unit_and_unknown_command_return_error_acks() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let flush = json!({
+        "type": "command",
+        "msg_id": "req-a9-flush",
+        "action": "flush_unit"
+    });
+    ws.send(Message::Text(flush.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-a9-flush").await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["status"], "error", "flush_unit ack: {ack}");
+    assert_eq!(ack["reason"], "flush_unit not implemented yet");
+
+    let bogus = json!({
+        "type": "command",
+        "msg_id": "req-a9-bogus",
+        "action": "defragment"
+    });
+    ws.send(Message::Text(bogus.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-a9-bogus").await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["status"], "error", "unknown action ack: {ack}");
+    assert_eq!(ack["reason"], "unknown action: defragment");
+
+    ws.send(Message::Text(
+        reg05_write("req-a9-health").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-a9-health").await;
+    assert_eq!(ack["status"], "success", "post-command write ack: {ack}");
 
     let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
