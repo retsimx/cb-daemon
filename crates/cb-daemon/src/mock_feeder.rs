@@ -30,6 +30,7 @@ pub(crate) const FEEDER_UNIT_ID: UnitId = match UnitId::try_new(0x0_ABCDE) {
 pub struct FeederSpec {
     omit_reg05: bool,
     scripted_reg06: Option<CanRecord>,
+    stop_after_dump: bool,
 }
 
 impl FeederSpec {
@@ -60,6 +61,16 @@ impl FeederSpec {
             reg: RegId::new(0x06),
             data,
         });
+        self
+    }
+
+    /// Stop after negotiate+dump instead of entering the steady loop: the bus
+    /// goes silent (no frames, no events) while the engine stays alive — the
+    /// D-12 silent-bus repro.
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn stop_after_dump(mut self) -> Self {
+        self.stop_after_dump = true;
         self
     }
 
@@ -234,11 +245,17 @@ async fn take_written(mock: &Arc<Mutex<MockLink>>) -> Vec<u8> {
 }
 
 /// Play negotiate→dump once, then keep the mock CB alive for steady / resync.
+/// With [`FeederSpec::stop_after_dump`], return right after the dump: the bus
+/// goes silent while the engine stays alive (the D-12 silent-bus repro).
 pub(crate) async fn run_feeder(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spec: FeederSpec) {
     if !feeder_negotiate(&mock, &notify).await {
         return;
     }
     if !feeder_dump(&mock, &notify, &spec).await {
+        return;
+    }
+    if spec.stop_after_dump {
+        debug!("mock feeder: stop-after-dump, bus goes silent");
         return;
     }
     feeder_steady_loop(mock, notify, spec).await;

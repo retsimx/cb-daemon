@@ -40,9 +40,27 @@ pub(crate) enum WsEvent {
     },
 }
 
+/// Per-session write/read timeout durations (production defaults 10 s / 5 s).
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTimeouts {
+    pub write_ack: std::time::Duration,
+    pub read: std::time::Duration,
+}
+
+impl Default for SessionTimeouts {
+    fn default() -> Self {
+        Self {
+            write_ack: std::time::Duration::from_secs(10),
+            read: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
 /// Shared state for the axum router.
 #[derive(Clone)]
 pub(crate) struct WsState {
+    /// Per-session write/read timeout durations.
+    pub timeouts: SessionTimeouts,
     /// Engine command sender (bound 32 upstream).
     pub cmd_tx: mpsc::Sender<EngineCmd>,
     /// Latest dump/resync snapshot (`None` until first [`EngineEvent::Snapshot`]).
@@ -190,7 +208,7 @@ async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Resul
         units: snapshot_units(&held.bank),
     };
     send_json(&mut socket, &snap).await?;
-    bridge_until_disconnect(&mut socket, &state, ev_rx).await
+    bridge_until_disconnect(&mut socket, &state, ev_rx, state.timeouts).await
 }
 
 /// Wait for the first engine Snapshot, aborting if the client disconnects.
@@ -243,17 +261,25 @@ struct PendingAcks {
 }
 
 impl PendingAcks {
-    const fn new() -> Self {
+    /// Override the write-ack timeout (session timeouts / fast tests).
+    const fn with_timeout(timeout: std::time::Duration) -> Self {
         Self {
             deadlines: BTreeMap::new(),
-            timeout: std::time::Duration::from_secs(10),
+            timeout,
         }
     }
 
-    /// Track `msg_id` with a 10s deadline; acked on [`EngineEvent::WriteFlushed`].
+    /// Track `msg_id` with the configured deadline; acked on [`EngineEvent::WriteFlushed`].
     fn push(&mut self, msg_id: String) {
         self.deadlines
             .insert(msg_id, tokio::time::Instant::now() + self.timeout);
+    }
+
+    /// Earliest pending write-ack deadline across all entries (`None` when
+    /// nothing is pending). The map is keyed by `msg_id`, so the earliest
+    /// deadline is the minimum over values, not `first_key_value()`.
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadlines.values().copied().min()
     }
 
     /// Drain every pending `msg_id` as a success (writes were flushed).
@@ -323,6 +349,7 @@ struct PendingReads {
 }
 
 impl PendingReads {
+    #[allow(dead_code)]
     const fn new() -> Self {
         Self {
             deadlines: BTreeMap::new(),
@@ -330,8 +357,7 @@ impl PendingReads {
         }
     }
 
-    /// Test hook: override the read timeout for fast expiry tests.
-    #[cfg(test)]
+    /// Override the read timeout (session timeouts / fast tests).
     const fn with_timeout(timeout: std::time::Duration) -> Self {
         Self {
             deadlines: BTreeMap::new(),
@@ -339,13 +365,21 @@ impl PendingReads {
         }
     }
 
-    /// Track `msg_id` for `key` with a 5s deadline; resolved on the next
+    /// Track `msg_id` for `key` with the configured deadline; resolved on the next
     /// [`EngineEvent::RegisterRead`] for `key`.
     fn push(&mut self, key: ReadKey, msg_id: String) {
         self.deadlines
             .entry(key)
             .or_default()
             .push((msg_id, tokio::time::Instant::now() + self.timeout));
+    }
+
+    /// Earliest pending read deadline across all entries (`None` when empty).
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadlines
+            .values()
+            .flat_map(|entries| entries.iter().map(|(_, deadline)| *deadline))
+            .min()
     }
 
     /// Remove and return every pending `msg_id` for `key`.
@@ -373,13 +407,23 @@ impl PendingReads {
     }
 }
 
+/// Sleep until the earliest pending deadline; when nothing is pending, never
+/// completes so the `select!` degenerates to the socket/event branches.
+async fn wait_until(earliest: Option<tokio::time::Instant>) {
+    match earliest {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn bridge_until_disconnect(
     socket: &mut WebSocket,
     state: &WsState,
     mut ev_rx: broadcast::Receiver<WsEvent>,
+    timeouts: SessionTimeouts,
 ) -> anyhow::Result<()> {
-    let mut pending = PendingAcks::new();
-    let mut pending_reads = PendingReads::new();
+    let mut pending = PendingAcks::with_timeout(timeouts.write_ack);
+    let mut pending_reads = PendingReads::with_timeout(timeouts.read);
     loop {
         // Expire stale write acks so a dead bus surfaces as an error ack.
         for msg_id in pending.drain_expired() {
@@ -402,6 +446,14 @@ async fn bridge_until_disconnect(
             )
             .await?;
         }
+        // Wake at the earliest pending deadline so expiries fire even when
+        // the bus is silent; the loop-top drains above do the removal (and
+        // no entry survives past its deadline, so no double-ack).
+        let earliest = pending
+            .next_deadline()
+            .into_iter()
+            .chain(pending_reads.next_deadline())
+            .min();
         tokio::select! {
             msg = socket.next() => {
                 if !handle_ws_message(socket, state, msg, &mut pending, &mut pending_reads).await? {
@@ -413,6 +465,7 @@ async fn bridge_until_disconnect(
                     break;
                 }
             }
+            () = wait_until(earliest) => {}
         }
     }
     Ok(())
@@ -1477,6 +1530,138 @@ mod tests {
     }
 
     #[test]
+    fn pending_acks_next_deadline_returns_earliest() {
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_mins(1));
+        assert_eq!(pending.next_deadline(), None, "empty");
+
+        pending.push("a".to_owned());
+        let earliest = pending.next_deadline().expect("single deadline");
+        assert!(
+            earliest > tokio::time::Instant::now(),
+            "deadline lies in the future"
+        );
+
+        // A later push cannot move the earliest deadline (pushes are ordered
+        // in real time, so later entries always carry later deadlines).
+        pending.push("b".to_owned());
+        pending.push("c".to_owned());
+        assert_eq!(pending.next_deadline(), Some(earliest));
+    }
+
+    #[test]
+    fn pending_reads_next_deadline_returns_earliest() {
+        let mut pending = PendingReads::with_timeout(std::time::Duration::from_mins(1));
+        assert_eq!(pending.next_deadline(), None, "empty");
+
+        let key = ReadKey {
+            unit_type: UnitType::AIRCON,
+            unit_id: UnitId::try_new(0x0_181F3).unwrap(),
+            reg: RegId::new(0x05),
+            zone: None,
+        };
+        pending.push(key, "r1".to_owned());
+        let earliest = pending.next_deadline().expect("single deadline");
+        assert!(
+            earliest > tokio::time::Instant::now(),
+            "deadline lies in the future"
+        );
+
+        // A later push on the same key — or on a second key — cannot move the
+        // earliest deadline (pushes are ordered in real time).
+        let zoned = ReadKey {
+            reg: RegId::new(0x03),
+            zone: Some(2),
+            ..key
+        };
+        pending.push(key, "r2".to_owned());
+        pending.push(zoned, "r3".to_owned());
+        assert_eq!(pending.next_deadline(), Some(earliest));
+    }
+
+    #[tokio::test]
+    async fn pending_acks_next_deadline_ignores_msg_id_order() {
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_mins(1));
+        assert_eq!(pending.next_deadline(), None, "empty");
+
+        // Push in NON-lex order: the first-pushed id sorts last, so the
+        // lexicographically-first key ("req-a") carries the LATER deadline.
+        pending.push("req-z".to_owned());
+        let earliest = pending.next_deadline().expect("single deadline");
+        assert!(
+            earliest > tokio::time::Instant::now(),
+            "deadline lies in the future"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        pending.push("req-a".to_owned());
+
+        // "req-a" sorts before "req-z" in the BTreeMap, but its deadline is
+        // later (pushes are ordered in real time), so the earliest deadline
+        // is still the first-pushed entry's.
+        assert_eq!(pending.next_deadline(), Some(earliest));
+        assert!(
+            earliest < pending.deadlines["req-a"],
+            "req-a deadline is later, req-z must remain the earliest"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_acks_drain_expired_fires_earliest_deadline_across_ids() {
+        // Real-time (no paused clock available): 10s timeout, generous sleep
+        // margins. "req-z" is pushed first and "req-a" 250ms later, so at
+        // drain time the first entry's deadline has passed while the second's
+        // has not, even though "req-a" sorts first in the BTreeMap.
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_millis(200));
+        pending.push("req-z".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        pending.push("req-a".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(pending.drain_expired(), vec!["req-z".to_owned()]);
+        assert_eq!(pending.drain_all(), vec!["req-a".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn pending_acks_drain_expired_returns_only_dead_entries() {
+        // Real-time (no paused clock available): 200ms timeout with generous
+        // sleep margins so the first entry's deadline passes while the
+        // second's has not (sleeps only overshoot, never undershoot).
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_millis(200));
+        pending.push("early".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        pending.push("late".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(pending.drain_expired(), vec!["early".to_owned()]);
+        assert_eq!(pending.drain_all(), vec!["late".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn interleaved_write_read_deadlines_expire_independently() {
+        // Real-time (no paused clock available): one write and one read die
+        // in the first window while their late siblings survive it, so each
+        // drain only returns its own dead entries.
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_millis(200));
+        let mut pending_reads = PendingReads::with_timeout(std::time::Duration::from_millis(200));
+        let key = ReadKey {
+            unit_type: UnitType::AIRCON,
+            unit_id: UnitId::try_new(0x0_181F3).unwrap(),
+            reg: RegId::new(0x02),
+            zone: None,
+        };
+        pending.push("w1".to_owned());
+        pending_reads.push(key, "r1".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        pending.push("w2".to_owned());
+        pending_reads.push(key, "r2".to_owned());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(pending.drain_expired(), vec!["w1".to_owned()]);
+        assert_eq!(pending_reads.drain_expired(), vec![(key, "r1".to_owned())]);
+        assert_eq!(pending.drain_all(), vec!["w2".to_owned()]);
+        assert_eq!(pending_reads.resolve(key), vec!["r2".to_owned()]);
+    }
+
+    #[test]
     fn read_result_shapes_zone_read_as_read_result() {
         // Acceptance (5): a resolved zone read of reg 03 carries the zone id
         // on the read_result with the typed payload.
@@ -1999,6 +2184,7 @@ mod tests {
                 cmd_spy: Some(spy.clone()),
                 unit_id_hint: None,
                 clients: clients_tx.clone(),
+                timeouts: SessionTimeouts::default(),
             };
             let watchdog = spawn_idle_watchdog(state, timeout, retry_interval);
             Self {

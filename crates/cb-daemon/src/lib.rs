@@ -18,3 +18,4 @@ pub use config::{
     load_config, load_config_from, resolve_config_path,
 };
 pub use mock_feeder::FeederSpec;
+pub use ws::SessionTimeouts;
