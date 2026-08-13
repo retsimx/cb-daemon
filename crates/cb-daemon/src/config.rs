@@ -45,6 +45,19 @@ pub(crate) const DEFAULT_WS_IDLE_RETRY_INTERVAL: Duration = Duration::from_mins(
 /// panicking it and silently disabling the failsafe.
 pub(crate) const MAX_WS_IDLE_TIMEOUT: Duration = Duration::from_hours(8760);
 
+/// Default interval between daemon-initiated WebSocket keepalive pings.
+pub(crate) const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default grace period after a keepalive ping for any inbound frame (pong).
+pub(crate) const DEFAULT_KEEPALIVE_PONG_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Default timeout waiting for a fresh engine snapshot after connect.
+pub(crate) const DEFAULT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on keepalive / snapshot durations (1 year): same
+/// `Instant` overflow rationale as [`MAX_WS_IDLE_TIMEOUT`].
+pub(crate) const MAX_KEEPALIVE_SNAPSHOT_TIMEOUT: Duration = Duration::from_hours(8760);
+
 const ETC_CONFIG: &str = "/etc/cb-daemon/config.toml";
 const CWD_CONFIG: &str = "./config.toml";
 
@@ -110,6 +123,12 @@ pub struct Config {
     pub ws_idle_timeout: Duration,
     /// Idle failsafe retry interval between repeated power-off writes (≥ 1 s).
     pub ws_idle_retry_interval: Duration,
+    /// Daemon-initiated WebSocket keepalive ping interval (≥ 1 s).
+    pub keepalive_interval: Duration,
+    /// Grace period after a keepalive ping for any inbound frame (≥ `keepalive_interval`).
+    pub keepalive_pong_timeout: Duration,
+    /// Timeout waiting for a fresh engine snapshot after connect (> 0).
+    pub snapshot_timeout: Duration,
 }
 
 impl Default for Config {
@@ -125,6 +144,9 @@ impl Default for Config {
             tty_baud: DEFAULT_TTY_BAUD,
             ws_idle_timeout: DEFAULT_WS_IDLE_TIMEOUT,
             ws_idle_retry_interval: DEFAULT_WS_IDLE_RETRY_INTERVAL,
+            keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+            keepalive_pong_timeout: DEFAULT_KEEPALIVE_PONG_TIMEOUT,
+            snapshot_timeout: DEFAULT_SNAPSHOT_TIMEOUT,
         }
     }
 }
@@ -159,6 +181,12 @@ pub struct FileConfig {
     pub ws_idle_timeout_minutes: Option<u64>,
     /// Idle failsafe retry interval in seconds.
     pub ws_idle_retry_seconds: Option<u64>,
+    /// Keepalive ping interval in seconds.
+    pub keepalive_interval_seconds: Option<u64>,
+    /// Keepalive pong grace period in seconds.
+    pub keepalive_pong_timeout_seconds: Option<u64>,
+    /// Snapshot-wait timeout in seconds.
+    pub snapshot_timeout_seconds: Option<u64>,
 }
 
 /// CLI flags (only applied when present).
@@ -208,6 +236,18 @@ pub struct CliArgs {
     /// Idle failsafe retry interval in seconds.
     #[arg(long)]
     pub ws_idle_retry_seconds: Option<u64>,
+
+    /// Daemon-initiated keepalive ping interval in seconds.
+    #[arg(long)]
+    pub keepalive_interval_seconds: Option<u64>,
+
+    /// Keepalive pong grace period in seconds.
+    #[arg(long)]
+    pub keepalive_pong_timeout_seconds: Option<u64>,
+
+    /// Snapshot-wait timeout in seconds.
+    #[arg(long)]
+    pub snapshot_timeout_seconds: Option<u64>,
 }
 
 /// Environment overlay (manual; clear precedence over clap env feature).
@@ -235,6 +275,12 @@ pub struct EnvOverrides {
     pub ws_idle_timeout_minutes: Option<String>,
     /// `CB_DAEMON_WS_IDLE_RETRY_SECONDS`
     pub ws_idle_retry_seconds: Option<String>,
+    /// `CB_DAEMON_KEEPALIVE_INTERVAL_SECONDS`
+    pub keepalive_interval_seconds: Option<String>,
+    /// `CB_DAEMON_KEEPALIVE_PONG_TIMEOUT_SECONDS`
+    pub keepalive_pong_timeout_seconds: Option<String>,
+    /// `CB_DAEMON_SNAPSHOT_TIMEOUT_SECONDS`
+    pub snapshot_timeout_seconds: Option<String>,
 }
 
 impl EnvOverrides {
@@ -253,6 +299,10 @@ impl EnvOverrides {
             tty_baud: env::var("CB_DAEMON_TTY_BAUD").ok(),
             ws_idle_timeout_minutes: env::var("CB_DAEMON_WS_IDLE_TIMEOUT_MINUTES").ok(),
             ws_idle_retry_seconds: env::var("CB_DAEMON_WS_IDLE_RETRY_SECONDS").ok(),
+            keepalive_interval_seconds: env::var("CB_DAEMON_KEEPALIVE_INTERVAL_SECONDS").ok(),
+            keepalive_pong_timeout_seconds: env::var("CB_DAEMON_KEEPALIVE_PONG_TIMEOUT_SECONDS")
+                .ok(),
+            snapshot_timeout_seconds: env::var("CB_DAEMON_SNAPSHOT_TIMEOUT_SECONDS").ok(),
         }
     }
 }
@@ -372,6 +422,15 @@ fn apply_file(cfg: &mut Config, file: &FileConfig) -> Result<()> {
     if let Some(seconds) = file.ws_idle_retry_seconds {
         cfg.ws_idle_retry_interval = Duration::from_secs(seconds);
     }
+    if let Some(seconds) = file.keepalive_interval_seconds {
+        cfg.keepalive_interval = Duration::from_secs(seconds);
+    }
+    if let Some(seconds) = file.keepalive_pong_timeout_seconds {
+        cfg.keepalive_pong_timeout = Duration::from_secs(seconds);
+    }
+    if let Some(seconds) = file.snapshot_timeout_seconds {
+        cfg.snapshot_timeout = Duration::from_secs(seconds);
+    }
     Ok(())
 }
 
@@ -421,6 +480,24 @@ fn apply_env(cfg: &mut Config, env: &EnvOverrides) -> Result<()> {
             .with_context(|| format!("CB_DAEMON_WS_IDLE_RETRY_SECONDS `{raw}`"))?;
         cfg.ws_idle_retry_interval = Duration::from_secs(seconds);
     }
+    if let Some(ref raw) = env.keepalive_interval_seconds {
+        let seconds: u64 = raw
+            .parse()
+            .with_context(|| format!("CB_DAEMON_KEEPALIVE_INTERVAL_SECONDS `{raw}`"))?;
+        cfg.keepalive_interval = Duration::from_secs(seconds);
+    }
+    if let Some(ref raw) = env.keepalive_pong_timeout_seconds {
+        let seconds: u64 = raw
+            .parse()
+            .with_context(|| format!("CB_DAEMON_KEEPALIVE_PONG_TIMEOUT_SECONDS `{raw}`"))?;
+        cfg.keepalive_pong_timeout = Duration::from_secs(seconds);
+    }
+    if let Some(ref raw) = env.snapshot_timeout_seconds {
+        let seconds: u64 = raw
+            .parse()
+            .with_context(|| format!("CB_DAEMON_SNAPSHOT_TIMEOUT_SECONDS `{raw}`"))?;
+        cfg.snapshot_timeout = Duration::from_secs(seconds);
+    }
     Ok(())
 }
 
@@ -454,6 +531,15 @@ fn apply_cli(cfg: &mut Config, cli: &CliArgs) -> Result<()> {
     }
     if let Some(seconds) = cli.ws_idle_retry_seconds {
         cfg.ws_idle_retry_interval = Duration::from_secs(seconds);
+    }
+    if let Some(seconds) = cli.keepalive_interval_seconds {
+        cfg.keepalive_interval = Duration::from_secs(seconds);
+    }
+    if let Some(seconds) = cli.keepalive_pong_timeout_seconds {
+        cfg.keepalive_pong_timeout = Duration::from_secs(seconds);
+    }
+    if let Some(seconds) = cli.snapshot_timeout_seconds {
+        cfg.snapshot_timeout = Duration::from_secs(seconds);
     }
     Ok(())
 }
@@ -514,6 +600,38 @@ fn validate(cfg: &Config) -> Result<()> {
             "ws_idle_retry_seconds must be >= 1 second, got {}",
             cfg.ws_idle_retry_interval.as_secs()
         );
+    }
+    if cfg.keepalive_interval < Duration::from_secs(1) {
+        bail!(
+            "keepalive_interval_seconds must be >= 1 second, got {}",
+            cfg.keepalive_interval.as_secs()
+        );
+    }
+    if cfg.keepalive_pong_timeout == Duration::ZERO {
+        bail!("keepalive_pong_timeout_seconds must be > 0");
+    }
+    if cfg.keepalive_pong_timeout < cfg.keepalive_interval {
+        bail!(
+            "keepalive_pong_timeout_seconds must be >= keepalive_interval_seconds, got {} < {}",
+            cfg.keepalive_pong_timeout.as_secs(),
+            cfg.keepalive_interval.as_secs()
+        );
+    }
+    if cfg.snapshot_timeout == Duration::ZERO {
+        bail!("snapshot_timeout_seconds must be > 0");
+    }
+    for (name, value) in [
+        ("keepalive_interval_seconds", cfg.keepalive_interval),
+        ("keepalive_pong_timeout_seconds", cfg.keepalive_pong_timeout),
+        ("snapshot_timeout_seconds", cfg.snapshot_timeout),
+    ] {
+        if value > MAX_KEEPALIVE_SNAPSHOT_TIMEOUT {
+            bail!(
+                "{name} must be <= {} seconds (1 year), got {}",
+                MAX_KEEPALIVE_SNAPSHOT_TIMEOUT.as_secs(),
+                value.as_secs()
+            );
+        }
     }
     Ok(())
 }
@@ -603,11 +721,17 @@ mod tests {
         assert_eq!(cfg.tty_baud, DEFAULT_TTY_BAUD);
         assert_eq!(cfg.ws_idle_timeout, DEFAULT_WS_IDLE_TIMEOUT);
         assert_eq!(cfg.ws_idle_retry_interval, DEFAULT_WS_IDLE_RETRY_INTERVAL);
+        assert_eq!(cfg.keepalive_interval, DEFAULT_KEEPALIVE_INTERVAL);
+        assert_eq!(cfg.keepalive_pong_timeout, DEFAULT_KEEPALIVE_PONG_TIMEOUT);
+        assert_eq!(cfg.snapshot_timeout, DEFAULT_SNAPSHOT_TIMEOUT);
         assert_eq!(DEFAULT_AOA_CHUNK_SIZE, AOA_MAX_CHUNK);
         assert_eq!(DEFAULT_AOA_CHUNK_DELAY_MS, AOA_INTER_CHUNK_DELAY_MS);
         assert_eq!(DEFAULT_TTY_BAUD, TTY_BAUD);
         assert_eq!(DEFAULT_WS_IDLE_TIMEOUT, Duration::ZERO);
         assert_eq!(DEFAULT_WS_IDLE_RETRY_INTERVAL, Duration::from_mins(1));
+        assert_eq!(DEFAULT_KEEPALIVE_INTERVAL, Duration::from_secs(30));
+        assert_eq!(DEFAULT_KEEPALIVE_PONG_TIMEOUT, Duration::from_secs(75));
+        assert_eq!(DEFAULT_SNAPSHOT_TIMEOUT, Duration::from_secs(15));
     }
 
     #[test]
@@ -647,6 +771,9 @@ ws_idle_retry_seconds = 120
             tty_baud: Some("19200".into()),
             ws_idle_timeout_minutes: Some("45".into()),
             ws_idle_retry_seconds: Some("180".into()),
+            keepalive_interval_seconds: Some("40".into()),
+            keepalive_pong_timeout_seconds: Some("90".into()),
+            snapshot_timeout_seconds: Some("20".into()),
             config: None,
         };
         apply_env(&mut cfg, &env).unwrap();
@@ -662,6 +789,9 @@ ws_idle_retry_seconds = 120
             tty_baud: Some(38400),
             ws_idle_timeout_minutes: Some(60),
             ws_idle_retry_seconds: Some(240),
+            keepalive_interval_seconds: Some(50),
+            keepalive_pong_timeout_seconds: Some(100),
+            snapshot_timeout_seconds: Some(25),
             config: None,
         };
         apply_cli(&mut cfg, &cli).unwrap();
@@ -677,6 +807,9 @@ ws_idle_retry_seconds = 120
         assert_eq!(cfg.tty_baud, 38400);
         assert_eq!(cfg.ws_idle_timeout, Duration::from_hours(1));
         assert_eq!(cfg.ws_idle_retry_interval, Duration::from_mins(4));
+        assert_eq!(cfg.keepalive_interval, Duration::from_secs(50));
+        assert_eq!(cfg.keepalive_pong_timeout, Duration::from_secs(100));
+        assert_eq!(cfg.snapshot_timeout, Duration::from_secs(25));
 
         let _ = fs::remove_file(path);
     }
@@ -923,5 +1056,246 @@ log_level = "debug"
         validate(&cfg).unwrap();
         assert_eq!(cfg.ws_idle_timeout, Duration::from_mins(20));
         assert_eq!(cfg.ws_idle_retry_interval, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn keepalive_snapshot_file_layer_override() {
+        let mut cfg = Config::default();
+        apply_file(
+            &mut cfg,
+            &FileConfig {
+                keepalive_interval_seconds: Some(45),
+                keepalive_pong_timeout_seconds: Some(120),
+                snapshot_timeout_seconds: Some(22),
+                ..FileConfig::default()
+            },
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.keepalive_interval, Duration::from_secs(45));
+        assert_eq!(cfg.keepalive_pong_timeout, Duration::from_mins(2));
+        assert_eq!(cfg.snapshot_timeout, Duration::from_secs(22));
+    }
+
+    #[test]
+    fn keepalive_snapshot_env_beats_file() {
+        let mut cfg = Config::default();
+        apply_file(
+            &mut cfg,
+            &FileConfig {
+                keepalive_interval_seconds: Some(45),
+                keepalive_pong_timeout_seconds: Some(120),
+                snapshot_timeout_seconds: Some(22),
+                ..FileConfig::default()
+            },
+        )
+        .unwrap();
+        let env = EnvOverrides {
+            keepalive_interval_seconds: Some("60".into()),
+            keepalive_pong_timeout_seconds: Some("150".into()),
+            snapshot_timeout_seconds: Some("30".into()),
+            ..EnvOverrides::default()
+        };
+        apply_env(&mut cfg, &env).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.keepalive_interval, Duration::from_mins(1));
+        assert_eq!(cfg.keepalive_pong_timeout, Duration::from_secs(150));
+        assert_eq!(cfg.snapshot_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn keepalive_snapshot_cli_beats_env() {
+        let mut cfg = Config::default();
+        let env = EnvOverrides {
+            keepalive_interval_seconds: Some("60".into()),
+            keepalive_pong_timeout_seconds: Some("150".into()),
+            snapshot_timeout_seconds: Some("30".into()),
+            ..EnvOverrides::default()
+        };
+        apply_env(&mut cfg, &env).unwrap();
+        let cli = CliArgs {
+            keepalive_interval_seconds: Some(75),
+            keepalive_pong_timeout_seconds: Some(180),
+            snapshot_timeout_seconds: Some(40),
+            ..CliArgs::default()
+        };
+        apply_cli(&mut cfg, &cli).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.keepalive_interval, Duration::from_secs(75));
+        assert_eq!(cfg.keepalive_pong_timeout, Duration::from_mins(3));
+        assert_eq!(cfg.snapshot_timeout, Duration::from_secs(40));
+    }
+
+    #[test]
+    fn keepalive_snapshot_cli_absent_leaves_env_value() {
+        let mut cfg = Config::default();
+        let env = EnvOverrides {
+            keepalive_interval_seconds: Some("60".into()),
+            keepalive_pong_timeout_seconds: Some("150".into()),
+            snapshot_timeout_seconds: Some("30".into()),
+            ..EnvOverrides::default()
+        };
+        apply_env(&mut cfg, &env).unwrap();
+        apply_cli(&mut cfg, &CliArgs::default()).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.keepalive_interval, Duration::from_mins(1));
+        assert_eq!(cfg.keepalive_pong_timeout, Duration::from_secs(150));
+        assert_eq!(cfg.snapshot_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn keepalive_interval_zero_rejected_by_validation() {
+        let cfg = Config {
+            keepalive_interval: Duration::ZERO,
+            ..Config::default()
+        };
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("keepalive_interval_seconds must be >= 1 second, got 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keepalive_pong_timeout_zero_rejected_by_validation() {
+        let cfg = Config {
+            keepalive_pong_timeout: Duration::ZERO,
+            ..Config::default()
+        };
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("keepalive_pong_timeout_seconds must be > 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keepalive_pong_timeout_below_interval_rejected_by_validation() {
+        let cfg = Config {
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_pong_timeout: Duration::from_secs(10),
+            ..Config::default()
+        };
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "keepalive_pong_timeout_seconds must be >= keepalive_interval_seconds, got 10 < 30"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_timeout_zero_rejected_by_validation() {
+        let cfg = Config {
+            snapshot_timeout: Duration::ZERO,
+            ..Config::default()
+        };
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("snapshot_timeout_seconds must be > 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keepalive_snapshot_over_one_year_rejected_by_validation() {
+        let over = MAX_KEEPALIVE_SNAPSHOT_TIMEOUT + Duration::from_secs(1);
+        for cfg in [
+            Config {
+                keepalive_interval: over,
+                keepalive_pong_timeout: over,
+                ..Config::default()
+            },
+            Config {
+                keepalive_interval: Duration::from_hours(1),
+                keepalive_pong_timeout: over,
+                ..Config::default()
+            },
+            Config {
+                snapshot_timeout: over,
+                ..Config::default()
+            },
+        ] {
+            let err = validate(&cfg).unwrap_err();
+            let full = err.to_string();
+            assert!(
+                full.contains("must be <= 31536000 seconds (1 year)"),
+                "{full}"
+            );
+        }
+    }
+
+    #[test]
+    fn keepalive_snapshot_at_one_year_passes_validation() {
+        let cfg = Config {
+            keepalive_interval: MAX_KEEPALIVE_SNAPSHOT_TIMEOUT,
+            keepalive_pong_timeout: MAX_KEEPALIVE_SNAPSHOT_TIMEOUT,
+            snapshot_timeout: MAX_KEEPALIVE_SNAPSHOT_TIMEOUT,
+            ..Config::default()
+        };
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn keepalive_snapshot_env_bad_values_error() {
+        let env = EnvOverrides {
+            keepalive_interval_seconds: Some("abc".into()),
+            ..EnvOverrides::default()
+        };
+        let mut cfg = Config::default();
+        let err = apply_env(&mut cfg, &env).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("CB_DAEMON_KEEPALIVE_INTERVAL_SECONDS"),
+            "{full}"
+        );
+
+        let env = EnvOverrides {
+            keepalive_pong_timeout_seconds: Some("nope".into()),
+            ..EnvOverrides::default()
+        };
+        let mut cfg = Config::default();
+        let err = apply_env(&mut cfg, &env).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("CB_DAEMON_KEEPALIVE_PONG_TIMEOUT_SECONDS"),
+            "{full}"
+        );
+
+        let env = EnvOverrides {
+            snapshot_timeout_seconds: Some("bad".into()),
+            ..EnvOverrides::default()
+        };
+        let mut cfg = Config::default();
+        let err = apply_env(&mut cfg, &env).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("CB_DAEMON_SNAPSHOT_TIMEOUT_SECONDS"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn keepalive_interval_at_one_second_passes_validation() {
+        let cfg = Config {
+            keepalive_interval: Duration::from_secs(1),
+            keepalive_pong_timeout: Duration::from_secs(1),
+            ..Config::default()
+        };
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn keepalive_pong_timeout_equals_interval_passes_validation() {
+        let cfg = Config {
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_pong_timeout: Duration::from_secs(30),
+            ..Config::default()
+        };
+        validate(&cfg).unwrap();
     }
 }
