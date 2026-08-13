@@ -360,6 +360,7 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
                 Some(FeederSpec::default()),
                 config.ws_idle_timeout,
                 config.ws_idle_retry_interval,
+                config_timeouts(&config),
             )
             .await
         }
@@ -374,7 +375,7 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
                 hint,
                 config.ws_idle_timeout,
                 config.ws_idle_retry_interval,
-                ws::SessionTimeouts::default(),
+                config_timeouts(&config),
             )
             .await
         }
@@ -389,10 +390,20 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
                 hint,
                 config.ws_idle_timeout,
                 config.ws_idle_retry_interval,
-                ws::SessionTimeouts::default(),
+                config_timeouts(&config),
             )
             .await
         }
+    }
+}
+
+/// Session timeout durations from config, keeping the write/read ack defaults.
+fn config_timeouts(config: &Config) -> ws::SessionTimeouts {
+    ws::SessionTimeouts {
+        keepalive_interval: config.keepalive_interval,
+        keepalive_pong_timeout: config.keepalive_pong_timeout,
+        snapshot_timeout: config.snapshot_timeout,
+        ..ws::SessionTimeouts::default()
     }
 }
 
@@ -433,6 +444,7 @@ async fn run_mock_with_listener(
     feeder: Option<FeederSpec>,
     ws_idle_timeout: Duration,
     ws_idle_retry_interval: Duration,
+    timeouts: ws::SessionTimeouts,
 ) -> anyhow::Result<()> {
     let (link, mock, notify) = SharedMockLink::new();
     run_mock_with_parts(
@@ -445,7 +457,7 @@ async fn run_mock_with_listener(
         notify,
         ws_idle_timeout,
         ws_idle_retry_interval,
-        ws::SessionTimeouts::default(),
+        timeouts,
     )
     .await
 }

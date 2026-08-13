@@ -1688,6 +1688,7 @@ async fn silent_bus_write_times_out() {
         SessionTimeouts {
             write_ack: Duration::from_millis(400),
             read: Duration::from_millis(300),
+            ..SessionTimeouts::default()
         },
     )
     .await
@@ -1738,6 +1739,7 @@ async fn silent_bus_read_times_out() {
         SessionTimeouts {
             write_ack: Duration::from_millis(400),
             read: Duration::from_millis(300),
+            ..SessionTimeouts::default()
         },
     )
     .await
@@ -1786,6 +1788,7 @@ async fn short_timeouts_normal_traffic_not_double_acked() {
         SessionTimeouts {
             write_ack: Duration::from_millis(400),
             read: Duration::from_millis(300),
+            ..SessionTimeouts::default()
         },
     )
     .await
@@ -2054,5 +2057,165 @@ async fn steady_getcan_nack_resends_written_frame_once() {
     );
 
     let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-18: daemon-initiated keepalive end-to-end. A client that connects,
+/// receives the snapshot, and then goes fully silent — sending nothing, and
+/// not even reading (a tungstenite client read would flush queued pong
+/// replies to the daemon's pings, which would count as liveness) — is evicted
+/// by the keepalive gate: the session closes within ~2 ping intervals past
+/// its pong timeout (100 ms interval / 300 ms grace → the ping-tick gate
+/// fires at ~400 ms). The eviction releases the client-count guard, and the
+/// >0 → 0 transition arms the idle failsafe, which fires the power-off write
+/// (observed on the `cmd_spy`) — the server-side count drop, end to end.
+#[tokio::test]
+async fn keepalive_evicts_never_ponging_client_and_releases_count() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, _ctrl) = App::spawn_mock_ctrl_with_session_timeouts(
+        bind,
+        Some(FeederSpec::default()),
+        Duration::from_millis(200),
+        Duration::from_millis(100),
+        SessionTimeouts {
+            keepalive_interval: Duration::from_millis(100),
+            keepalive_pong_timeout: Duration::from_millis(300),
+            ..SessionTimeouts::default()
+        },
+    )
+    .await
+    .expect("spawn mock with short keepalive + failsafe timeouts");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    // The count must still be 1 here: the watchdog is disarmed by the
+    // connected client, so no power-off write may have fired yet.
+    let writes_before = handle
+        .cmd_spy
+        .lock()
+        .await
+        .iter()
+        .filter(|cmd| matches!(cmd, EngineCmd::WriteRegisters(_)))
+        .count();
+    assert_eq!(
+        writes_before, 0,
+        "no power-off write may fire while a client is connected"
+    );
+
+    // Fully silent for 2× the pong timeout (600 ms > ~400 ms eviction point).
+    // Deliberately no `ws.next()` here: reading would flush the queued pong
+    // replies to the daemon's pings and reset its liveness gate.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // The session must now be gone: close / EOF / read error within a bound.
+    let closed = timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(closed, Ok(true)),
+        "silent client was not disconnected by the keepalive gate"
+    );
+
+    // The keepalive-forced close released the client count (1 → 0), arming
+    // the idle failsafe, which queues the power-off write for the AIRCON
+    // unit: the first `WriteRegisters` on the spy after the eviction can only
+    // be the failsafe's.
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let spy = handle.cmd_spy.lock().await;
+            if let Some(cmd) = spy
+                .iter()
+                .find(|cmd| matches!(cmd, EngineCmd::WriteRegisters(_)))
+            {
+                match cmd {
+                    EngineCmd::WriteRegisters(records) => {
+                        assert_eq!(records.len(), 1, "one AIRCON unit in the bank");
+                        let rec = &records[0];
+                        assert_eq!(rec.unit_type, UnitType::AIRCON);
+                        assert_eq!(rec.unit_id, UnitId::try_new(0x0_ABCDE).unwrap());
+                        assert_eq!(rec.reg.get(), 0x05);
+                        assert_eq!(
+                            rec.data,
+                            [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+                            "power byte flipped to Off, every other byte preserved"
+                        );
+                        return;
+                    }
+                    _ => unreachable!("spy only records WriteRegisters here"),
+                }
+            }
+            drop(spy);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("keepalive-eviction failsafe power-off write not observed on spy");
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-18: snapshot-wait timeout end-to-end. A client connecting while no
+/// snapshot is ever produced (no feeder → no dump) receives a `status` frame
+/// with state `link_down` and detail "snapshot timeout", and the session
+/// closes within the configured snapshot timeout (150 ms override) instead of
+/// hanging — a bare default-timeout daemon (15 s) would hold the session up.
+#[tokio::test]
+async fn dead_engine_connect_gets_link_down_status_and_close() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, _ctrl) = App::spawn_mock_ctrl_with_session_timeouts(
+        bind,
+        None, // no feeder → no dump → no snapshot, ever (engine down)
+        Duration::from_mins(1),
+        Duration::from_mins(1),
+        SessionTimeouts {
+            snapshot_timeout: Duration::from_millis(150),
+            ..SessionTimeouts::default()
+        },
+    )
+    .await
+    .expect("spawn mock with short snapshot timeout");
+    let mut ws = connect_ws(handle.local_addr()).await;
+
+    // The connect-time `negotiating` status (D-8) precedes the deadline; only
+    // the `link_down` status proves the snapshot-wait timed out.
+    let (state, detail) = timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before the link_down status");
+            if msg["type"] == "status" && msg["state"] == "link_down" {
+                return (
+                    msg["state"].as_str().unwrap_or("").to_owned(),
+                    msg["detail"].as_str().unwrap_or("").to_owned(),
+                );
+            }
+        }
+    })
+    .await
+    .expect("link_down status timeout");
+    assert_eq!(state, "link_down", "snapshot-wait timeout status");
+    assert_eq!(detail, "snapshot timeout", "snapshot-wait timeout detail");
+
+    // The session must close right after the status instead of hanging.
+    let closed = timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(closed, Ok(true)),
+        "dead-engine session did not close after the link_down status"
+    );
+
     handle.shutdown().await.expect("shutdown");
 }

@@ -41,11 +41,16 @@ pub(crate) enum WsEvent {
     },
 }
 
-/// Per-session write/read timeout durations (production defaults 10 s / 5 s).
+/// Per-session timeout durations: write/read ack deadlines, daemon-initiated
+/// keepalive ping interval + pong grace, and the snapshot-wait deadline
+/// (production defaults 10 s / 5 s / 30 s / 75 s / 15 s).
 #[derive(Debug, Clone, Copy)]
 pub struct SessionTimeouts {
     pub write_ack: std::time::Duration,
     pub read: std::time::Duration,
+    pub keepalive_interval: std::time::Duration,
+    pub keepalive_pong_timeout: std::time::Duration,
+    pub snapshot_timeout: std::time::Duration,
 }
 
 impl Default for SessionTimeouts {
@@ -53,6 +58,9 @@ impl Default for SessionTimeouts {
         Self {
             write_ack: std::time::Duration::from_secs(10),
             read: std::time::Duration::from_secs(5),
+            keepalive_interval: std::time::Duration::from_secs(30),
+            keepalive_pong_timeout: std::time::Duration::from_secs(75),
+            snapshot_timeout: std::time::Duration::from_secs(15),
         }
     }
 }
@@ -186,7 +194,12 @@ async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Resul
         detail: None,
     };
     send_json(&mut socket, &status).await?;
-    let held = wait_for_snapshot(&mut socket, state.snapshot.clone()).await?;
+    let held = wait_for_snapshot(
+        &mut socket,
+        state.snapshot.clone(),
+        state.timeouts.snapshot_timeout,
+    )
+    .await?;
 
     // Subscribe to the event fan-out BEFORE re-reading the status watch: the
     // broadcast has no history, so a transition that raced the snapshot wait
@@ -219,7 +232,9 @@ async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Resul
 async fn wait_for_snapshot(
     socket: &mut WebSocket,
     mut rx: watch::Receiver<Option<HeldSnapshot>>,
+    snapshot_timeout: std::time::Duration,
 ) -> anyhow::Result<HeldSnapshot> {
+    let deadline = tokio::time::Instant::now() + snapshot_timeout;
     loop {
         let current = rx.borrow_and_update().clone();
         if let Some(held) = current {
@@ -245,6 +260,18 @@ async fn wait_for_snapshot(
                         return Err(err.into());
                     }
                 }
+            }
+            // The engine may be down (no dump ever produced): don't hold a
+            // connecting client counted as connected forever. Report the
+            // failed health as `link_down`, then end the session so the
+            // client-count guard drop releases the count (D-18).
+            () = tokio::time::sleep_until(deadline) => {
+                let status = ServerMessage::Status {
+                    state: StatusState::LinkDown,
+                    detail: Some("snapshot timeout".into()),
+                };
+                send_json(socket, &status).await?;
+                anyhow::bail!("snapshot not produced within timeout");
             }
         }
     }
@@ -425,6 +452,13 @@ async fn bridge_until_disconnect(
 ) -> anyhow::Result<()> {
     let mut pending = PendingAcks::with_timeout(timeouts.write_ack);
     let mut pending_reads = PendingReads::with_timeout(timeouts.read);
+    // Liveness = any received frame since the previous ping: tungstenite
+    // answers our pings with pongs at the library level, so the peer's pong
+    // (or any other frame) is what proves the peer is alive. Tradeoff
+    // (issue-sanctioned): a healthy-but-idle client that never sends frames
+    // may be closed after `keepalive_pong_timeout` of silence.
+    let mut last_frame_at = tokio::time::Instant::now();
+    let mut next_ping_at = tokio::time::Instant::now() + timeouts.keepalive_interval;
     loop {
         // Expire stale write acks so a dead bus surfaces as an error ack.
         for msg_id in pending.drain_expired() {
@@ -447,6 +481,20 @@ async fn bridge_until_disconnect(
             )
             .await?;
         }
+        // Daemon-initiated keepalive: any wake may be the ping deadline (or
+        // an ack/read deadline — the `wait_until` wake covers all three).
+        // Probe only when the ping is actually due.
+        let now = tokio::time::Instant::now();
+        if now >= next_ping_at {
+            if now - last_frame_at > timeouts.keepalive_pong_timeout {
+                info!("mailbox-stream client silent; closing session");
+                break;
+            }
+            socket.send(Message::Ping(Vec::new().into())).await?;
+            // Advance past `now`, else the select! would wake immediately
+            // again and spin until the next interval elapses.
+            next_ping_at += timeouts.keepalive_interval;
+        }
         // Wake at the earliest pending deadline so expiries fire even when
         // the bus is silent; the loop-top drains above do the removal (and
         // no entry survives past its deadline, so no double-ack).
@@ -454,10 +502,20 @@ async fn bridge_until_disconnect(
             .next_deadline()
             .into_iter()
             .chain(pending_reads.next_deadline())
+            .chain([next_ping_at])
             .min();
         tokio::select! {
             msg = socket.next() => {
-                if !handle_ws_message(socket, state, msg, &mut pending, &mut pending_reads).await? {
+                if !handle_ws_message(
+                    socket,
+                    state,
+                    msg,
+                    &mut pending,
+                    &mut pending_reads,
+                    &mut last_frame_at,
+                )
+                .await?
+                {
                     break;
                 }
             }
@@ -479,7 +537,13 @@ async fn handle_ws_message(
     msg: Option<Result<Message, axum::Error>>,
     pending: &mut PendingAcks,
     pending_reads: &mut PendingReads,
+    last_frame_at: &mut tokio::time::Instant,
 ) -> anyhow::Result<bool> {
+    // Any received frame — including the peer's pongs — proves liveness for
+    // the keepalive gate (tungstenite answers pings with pongs internally).
+    if matches!(msg, Some(Ok(_))) {
+        *last_frame_at = tokio::time::Instant::now();
+    }
     match msg {
         Some(Ok(Message::Text(text))) => {
             handle_client_text(socket, state, &text, pending, pending_reads).await?;
@@ -1214,6 +1278,7 @@ async fn idle_watchdog_loop(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::mock_feeder::FeederSpec;
     use aa_engine::EngineCmd;
     use aa_registers::{CanRecord, Dest, RegId, UnitId, UnitType};
     use futures_util::SinkExt;
@@ -2777,6 +2842,305 @@ mod tests {
         })
         .await
         .expect("snapshot timeout")
+    }
+
+    /// Keepalive/snapshot-wait test timeouts: fast daemon pings (50 ms) with
+    /// a 200 ms pong grace and a 150 ms snapshot-wait deadline.
+    fn fast_session_timeouts() -> SessionTimeouts {
+        SessionTimeouts {
+            keepalive_interval: std::time::Duration::from_millis(50),
+            keepalive_pong_timeout: std::time::Duration::from_millis(200),
+            snapshot_timeout: std::time::Duration::from_millis(150),
+            ..SessionTimeouts::default()
+        }
+    }
+
+    /// Wait until the daemon closes the session (close frame / EOF / error).
+    ///
+    /// The daemon drops the socket without a close handshake on forced
+    /// teardown, so the client observes either `Close`, `None`, or a read
+    /// error — all treated as "session ended".
+    async fn app_wait_disconnect(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMsg::Close(_)) | Err(_)) | None => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("daemon did not close the session");
+    }
+
+    /// Poll the app cmd spy until at least `min` power-off writes are
+    /// recorded (the failsafe fired — client count reached zero).
+    async fn app_wait_power_offs(handle: &crate::app::AppHandle, min: usize) -> Vec<EngineCmd> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let writes = handle
+                    .cmd_spy
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|cmd| matches!(cmd, EngineCmd::WriteRegisters(_)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if writes.len() >= min {
+                    return writes;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timeout waiting for idle-failsafe power-off write(s)")
+    }
+
+    #[tokio::test]
+    async fn keepalive_silent_client_is_disconnected() {
+        // (a) A client that never sends another frame after the snapshot is
+        // evicted once `keepalive_pong_timeout` (200 ms) of silence elapses:
+        // the daemon-initiated keepalive stops counting it as connected.
+        // Note: the client must not *read* either — tungstenite's client
+        // `read()` flushes queued pong replies at the top of the read loop,
+        // which would feed the daemon's liveness gate.
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = crate::app::App::spawn_mock_ctrl_with_session_timeouts(
+            bind,
+            Some(FeederSpec::default()),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_secs(1),
+            fast_session_timeouts(),
+        )
+        .await
+        .expect("spawn mock")
+        .0;
+        let mut ws = app_connect(handle.local_addr()).await;
+        app_wait_snapshot(&mut ws).await;
+        // Fully silent (no reads, no writes) for ~3× the pong grace: the
+        // daemon must evict the session during this window.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // The session must be gone: drain any buffered frames, then close/EOF.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMsg::Close(_)) | Err(_)) | None => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("silent client was not disconnected");
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn keepalive_active_client_stays_connected() {
+        // (b) Any received frame counts as liveness: a client emitting pongs
+        // stays connected well past `keepalive_pong_timeout` (200 ms).
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = crate::app::App::spawn_mock_ctrl_with_session_timeouts(
+            bind,
+            Some(FeederSpec::default()),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_secs(1),
+            fast_session_timeouts(),
+        )
+        .await
+        .expect("spawn mock")
+        .0;
+        let mut ws = app_connect(handle.local_addr()).await;
+        app_wait_snapshot(&mut ws).await;
+
+        // Keep emitting frames for ~3× the pong grace (600 ms > 200 ms).
+        let end = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
+        while tokio::time::Instant::now() < end {
+            ws.send(WsMsg::Pong(Vec::new().into()))
+                .await
+                .expect("pong send");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Probe: the stream must still be open — no close/EOF/error; a
+        // timeout (no frame pending) or a ping both prove liveness.
+        let closed = matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), ws.next()).await,
+            Ok(Some(Ok(WsMsg::Close(_)) | Err(_)) | None)
+        );
+        assert!(
+            !closed,
+            "a client emitting frames must survive the pong grace"
+        );
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn keepalive_client_observes_ping_frames() {
+        // (c) The daemon pings every `keepalive_interval` (50 ms): the
+        // client observes received ping frames at ~that cadence while its
+        // own pongs keep the session alive.
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = crate::app::App::spawn_mock_ctrl_with_session_timeouts(
+            bind,
+            Some(FeederSpec::default()),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_secs(1),
+            fast_session_timeouts(),
+        )
+        .await
+        .expect("spawn mock")
+        .0;
+        let mut ws = app_connect(handle.local_addr()).await;
+        app_wait_snapshot(&mut ws).await;
+
+        let mut pings: Vec<tokio::time::Instant> = Vec::new();
+        let end = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        while tokio::time::Instant::now() < end {
+            ws.send(WsMsg::Pong(Vec::new().into()))
+                .await
+                .expect("pong send");
+            if let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(std::time::Duration::from_millis(60), ws.next()).await
+            {
+                match msg {
+                    WsMsg::Ping(_) => pings.push(tokio::time::Instant::now()),
+                    WsMsg::Close(_) => panic!("session closed while observing pings"),
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            pings.len() >= 2,
+            "expected repeated pings at ~50 ms, got {pings:?}"
+        );
+        for pair in pings.windows(2) {
+            let gap = pair[1].saturating_duration_since(pair[0]);
+            assert!(
+                gap >= std::time::Duration::from_millis(20)
+                    && gap <= std::time::Duration::from_millis(300),
+                "ping cadence off: gap {gap:?}"
+            );
+        }
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn keepalive_forced_close_releases_client_count() {
+        // (d) The keepalive-forced close drops the session's
+        // `ClientCountGuard`, taking the count back to zero — the idle
+        // failsafe arms on the 1→0 transition and fires a power-off write
+        // shortly after the silent client is evicted.
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = crate::app::App::spawn_mock_ctrl_with_session_timeouts(
+            bind,
+            Some(FeederSpec::default()),
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(50),
+            fast_session_timeouts(),
+        )
+        .await
+        .expect("spawn mock")
+        .0;
+        let mut ws = app_connect(handle.local_addr()).await;
+        app_wait_snapshot(&mut ws).await;
+        // Go silent: keepalive evicts the client at ~250 ms, arming the
+        // failsafe, which fires after its 150 ms deadline.
+        let writes = app_wait_power_offs(&handle, 1).await;
+        let EngineCmd::WriteRegisters(records) = &writes[0] else {
+            panic!("expected WriteRegisters");
+        };
+        assert_eq!(records.len(), 1);
+        assert_power_off(
+            &records[0],
+            UnitId::try_new(0x0_ABCDE).unwrap(),
+            [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        );
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn snapshot_wait_times_out_with_link_down_status() {
+        // (e) With no snapshot ever produced (no feeder), the client receives
+        // a `link_down` status frame ("snapshot timeout") and the session
+        // closes within the snapshot timeout (150 ms).
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = crate::app::App::spawn_mock_ctrl_with_session_timeouts(
+            bind,
+            None, // no feeder → no dump → no snapshot, ever
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_secs(1),
+            fast_session_timeouts(),
+        )
+        .await
+        .expect("spawn mock")
+        .0;
+        let mut ws = app_connect(handle.local_addr()).await;
+
+        let detail = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let msg = ws.next().await.expect("ws stream").expect("ws msg");
+                match msg {
+                    WsMsg::Text(text) => {
+                        let msg: Value = serde_json::from_str(&text).expect("json");
+                        if msg["type"] == "status" && msg["state"] == "link_down" {
+                            return msg["detail"].as_str().unwrap_or("").to_owned();
+                        }
+                    }
+                    WsMsg::Close(_) => panic!("closed before the link_down status"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("link_down status timeout");
+        assert_eq!(detail, "snapshot timeout");
+        app_wait_disconnect(&mut ws).await;
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn snapshot_before_timeout_proceeds_normally() {
+        // (f) A snapshot arriving before the deadline proceeds exactly as
+        // before: no `link_down` status, no close — the session stays up
+        // well past the (short) snapshot deadline.
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let timeouts = SessionTimeouts {
+            snapshot_timeout: std::time::Duration::from_millis(150),
+            ..SessionTimeouts::default()
+        };
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = crate::app::App::spawn_mock_ctrl_with_session_timeouts(
+            bind,
+            Some(FeederSpec::default()),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_secs(1),
+            timeouts,
+        )
+        .await
+        .expect("spawn mock")
+        .0;
+        let mut ws = app_connect(handle.local_addr()).await;
+        let snap = app_wait_snapshot(&mut ws).await;
+        assert!(
+            snap["units"]["08:abcde"].is_object() || snap["units"]["aircon:abcde"].is_object(),
+            "snapshot missing expected unit: {snap}"
+        );
+        // No close/EOF/error within 3× the snapshot deadline.
+        if let Ok(Some(Ok(WsMsg::Close(_)) | Err(_)) | None) =
+            tokio::time::timeout(std::time::Duration::from_millis(450), ws.next()).await
+        {
+            panic!("session must survive past the snapshot deadline");
+        }
+        let _ = ws.close(None).await;
+        handle.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
