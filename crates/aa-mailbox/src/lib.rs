@@ -32,8 +32,8 @@ pub mod message;
 pub mod policy;
 
 pub use convert::{
-    decode_payload, encode_payload, event_body, merge_payload, snapshot_units, validate_write,
-    validate_write_merged,
+    decode_payload, encode_payload, event_body, is_full_payload, merge_payload, snapshot_units,
+    validate_write, validate_write_merged,
 };
 pub use dto::{
     AckStatus, ActionEnum, ActivationStatus, FanEnum, FirmwareDto, InfoByteDto, ModeEnum,

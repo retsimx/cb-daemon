@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aa_engine::{EngineCmd, EngineEvent};
+use aa_mailbox::convert::is_full_payload;
 use aa_mailbox::{
     AckStatus, ClientMessage, PolicyMode, ServerMessage, StatusState, decode_payload,
     encode_payload, event_body, merge_payload, snapshot_units, validate_write,
@@ -800,16 +801,20 @@ async fn handle_read(
 ///
 /// The client payload must be a JSON object; any other non-string value
 /// (number, array, bool, null) is rejected exactly as the pre-merge path did.
-/// The bank must hold a value for the address and it must decode to a typed
-/// object — otherwise the write errors rather than silently writing zeros or
-/// raw bytes. The merged payload is validated with [`validate_write_merged`]
+/// A field-complete payload (every field the register's DTO consumes, per
+/// [`is_full_payload`]) is accepted with no bank state at all: it is
+/// validated directly and written as-is (D-13). Otherwise the bank must hold
+/// a value for the address and it must decode to a typed
+/// object — else the write errors rather than silently writing zeros or raw
+/// bytes. The merged payload is validated with [`validate_write_merged`]
 /// (mode check on the merged payload, read-only field check on the client-sent
 /// keys only, range check on the merged bytes).
 ///
 /// # Errors
 ///
 /// Returns a human-readable reason for a non-object payload, missing bank
-/// state, or an undecodable (raw-hex) bank value.
+/// state (when the payload is not field-complete), or an undecodable (raw-hex)
+/// bank value.
 fn sparse_merge_payload(
     bank: Option<&RegisterBank>,
     unit_type: UnitType,
@@ -836,6 +841,14 @@ fn sparse_merge_payload(
         bank.and_then(|bank| bank.get(unit_type, unit_id, reg))
     };
     let Some(bank_data) = bank_data else {
+        if is_full_payload(reg, payload) {
+            // D-13: a field-complete payload needs no bank state — validate
+            // and write it directly.
+            let mut full = payload.clone();
+            drop_reg12_read_only_fields(&mut full, reg);
+            validate_write_merged(reg, payload, &full).map_err(|e| e.to_string())?;
+            return Ok(full);
+        }
         return Err(format!(
             "no bank state for register {:02x}{}; send a full payload or issue a read first",
             reg.get(),
@@ -1841,6 +1854,199 @@ mod tests {
             "uid from bank, zone from client, write shape"
         );
     }
+
+    #[test]
+    fn build_write_record_full_payload_no_bank_reg09() {
+        // D-13: a field-complete reg-09 typed write succeeds with no bank
+        // state — validated directly and encoded as-is.
+        let bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "09",
+            None,
+            &serde_json::json!({
+                "action": "set_code",
+                "unlock_code": "A1B2",
+                "activation_days": 43,
+            }),
+        )
+        .expect("full payload with empty bank must succeed");
+        assert_eq!(rec.unit_type, UnitType::AIRCON);
+        assert_eq!(rec.dest, Dest::ControlBox);
+        assert_eq!(rec.unit_id, id);
+        assert_eq!(rec.reg, RegId::new(0x09));
+        assert_eq!(
+            rec.data,
+            [0x01, 0xA1, 0xB2, 0x2B, 0x00, 0x00, 0x00],
+            "action set_code, code A1B2, 43 days"
+        );
+    }
+
+    #[test]
+    fn build_write_record_partial_payload_no_bank_reg09_rejected() {
+        // D-13 regression (D-11): a partial reg-09 write with no bank state
+        // still errors ack with the exact documented reason.
+        let bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        let err = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "09",
+            None,
+            &serde_json::json!({"action": "unlock"}),
+        )
+        .expect_err("partial payload with no bank state must be rejected");
+        assert_eq!(
+            err,
+            "no bank state for register 09; send a full payload or issue a read first"
+        );
+    }
+
+    #[test]
+    fn build_write_record_full_payload_no_bank_reg26() {
+        // D-13: a field-complete reg-26 typed write succeeds with no bank
+        // state.
+        let bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "26",
+            None,
+            &serde_json::json!({
+                "pairing_control": 1,
+                "rf_device_type": 2,
+                "zone_channel": 3,
+            }),
+        )
+        .expect("full payload with empty bank must succeed");
+        assert_eq!(rec.unit_type, UnitType::AIRCON);
+        assert_eq!(rec.dest, Dest::ControlBox);
+        assert_eq!(rec.unit_id, id);
+        assert_eq!(rec.reg, RegId::new(0x26));
+        assert_eq!(
+            rec.data,
+            [0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00],
+            "pairing_control, rf_device_type, zone_channel in wire order"
+        );
+    }
+
+    #[test]
+    fn build_write_record_partial_payload_no_bank_reg26_rejected() {
+        // D-13: a partial reg-26 write with no bank state still errors ack
+        // with the exact documented reason (missing zone_channel).
+        let bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        let err = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "26",
+            None,
+            &serde_json::json!({"pairing_control": 1, "rf_device_type": 2}),
+        )
+        .expect_err("partial payload with no bank state must be rejected");
+        assert_eq!(
+            err,
+            "no bank state for register 26; send a full payload or issue a read first"
+        );
+    }
+
+    #[test]
+    fn build_write_record_full_payload_no_bank_reg27() {
+        // D-13: a field-complete reg-27 typed write succeeds with no bank
+        // state.
+        let bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "27",
+            None,
+            &serde_json::json!({
+                "calibration_control": 1,
+                "channel": 2,
+                "up_down_position": 3,
+            }),
+        )
+        .expect("full payload with empty bank must succeed");
+        assert_eq!(rec.unit_type, UnitType::AIRCON);
+        assert_eq!(rec.dest, Dest::ControlBox);
+        assert_eq!(rec.unit_id, id);
+        assert_eq!(rec.reg, RegId::new(0x27));
+        assert_eq!(
+            rec.data,
+            [0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00],
+            "calibration_control, channel, up_down_position in wire order"
+        );
+    }
+
+    #[test]
+    fn build_write_record_sparse_reg26_merges_over_seeded_bank() {
+        // D-13 regression (D-11): a partial reg-26 write with bank state
+        // still sparse-merges — un-seeded fields come from the bank.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x26),
+            data: [0x01, 0x0A, 0x03, 0x00, 0x00, 0x00, 0x00],
+        });
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "26",
+            None,
+            &serde_json::json!({"pairing_control": 2}),
+        )
+        .expect("sparse merge must succeed");
+        assert_eq!(rec.data[0], 0x02, "pairing_control from the client");
+        assert_eq!(rec.data[1], 0x0A, "rf_device_type preserved from the bank");
+        assert_eq!(rec.data[2], 0x03, "zone_channel preserved from the bank");
+    }
+
+    #[test]
+    fn build_write_record_full_payload_no_bank_reg12_write_shape() {
+        // D-13: a field-complete reg-12 write-shape payload succeeds with no
+        // bank state and encodes as the write shape.
+        let bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "12",
+            None,
+            &serde_json::json!({"sensor_uid": "613d01", "zone": 1}),
+        )
+        .expect("full payload with empty bank must succeed");
+        assert_eq!(rec.unit_type, UnitType::AIRCON);
+        assert_eq!(rec.dest, Dest::ControlBox);
+        assert_eq!(rec.unit_id, id);
+        assert_eq!(rec.reg, RegId::new(0x12));
+        assert_eq!(
+            rec.data,
+            [0x61, 0x3d, 0x01, 0x01, 0x00, 0x00, 0x00],
+            "sensor_uid then zone, write shape"
+        );
+    }
+
     fn aircon_reg05(unit_id: UnitId, data: [u8; 7]) -> CanRecord {
         CanRecord {
             unit_type: UnitType::AIRCON,

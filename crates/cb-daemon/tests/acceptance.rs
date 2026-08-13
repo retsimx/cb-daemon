@@ -1465,6 +1465,125 @@ async fn sparse_typed_write_client_sent_read_only_field_errors() {
     let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
 }
+
+/// D-13: a field-complete typed write to reg 09 succeeds with no bank state
+/// (reg 09 is write-only and never carried by the mock dump). The ack is
+/// success and the queued write is observed on the `cmd_spy` as the exact
+/// record the engine encodes into the setCAN frame the mock feeder receives:
+/// action `set_code`, unlock code `A1B2`, 43 days →
+/// [0x01,0xA1,0xB2,0x2B,0x00,0x00,0x00].
+#[tokio::test]
+async fn d13_full_typed_write_to_reg09_without_bank_state_succeeds() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-d13-1",
+        "register": "09",
+        "payload": {"action": "set_code", "unlock_code": "A1B2", "activation_days": 43}
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-d13-1").await;
+    assert_eq!(ack["status"], "success", "full reg-09 write ack: {ack}");
+
+    // The engine encodes the written record verbatim into the setCAN frame
+    // the mock feeder receives (observed on the command spy).
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let spy = handle.cmd_spy.lock().await;
+            if let Some(cmd) = spy
+                .iter()
+                .find(|c| matches!(c, EngineCmd::WriteRegisters(_)))
+            {
+                match cmd {
+                    EngineCmd::WriteRegisters(records) => {
+                        assert_eq!(records.len(), 1, "one record per write");
+                        let rec = &records[0];
+                        assert_eq!(rec.unit_type, UnitType::AIRCON);
+                        assert_eq!(rec.reg.get(), 0x09);
+                        assert_eq!(
+                            rec.data,
+                            [0x01, 0xA1, 0xB2, 0x2B, 0x00, 0x00, 0x00],
+                            "set_code, unlock code A1B2, 43 days"
+                        );
+                        return;
+                    }
+                    _ => unreachable!("spy only records WriteRegisters here"),
+                }
+            }
+            drop(spy);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("full reg-09 write not observed on spy");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-13 regression (D-11): a partial typed write to reg 09 — no bank state,
+/// since the mock dump never carries reg 09 — is rejected with the exact
+/// documented no-bank reason, and nothing is queued: the error path never
+/// reaches the engine, so no reg-09 record ever lands on the `cmd_spy` (and
+/// no setCAN frame is written to the mock feeder within several poll cycles).
+#[tokio::test]
+async fn d13_partial_typed_write_to_reg09_without_bank_state_rejected() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-d13-2",
+        "register": "09",
+        "payload": {"action": "unlock"}
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-d13-2").await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["status"], "error", "partial reg-09 write ack: {ack}");
+    assert_eq!(
+        ack["reason"], "no bank state for register 09; send a full payload or issue a read first",
+        "partial reg-09 write ack: {ack}"
+    );
+
+    // No write may be queued: a queued write would surface as a setCAN
+    // reg-09 record on the spy within one feeder poll cycle, so the 2s
+    // window elapsing with nothing queued is the passing condition.
+    let queued = timeout(Duration::from_secs(2), async {
+        loop {
+            let spy = handle.cmd_spy.lock().await;
+            let found = spy.iter().any(|cmd| {
+                matches!(
+                    cmd,
+                    EngineCmd::WriteRegisters(records)
+                        if records.iter().any(|rec| rec.reg.get() == 0x09)
+                )
+            });
+            drop(spy);
+            if found {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        !matches!(queued, Ok(true)),
+        "a reg-09 write was queued despite the error ack"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
 /// A10 (T6): idle-failsafe watchdog end-to-end. A real WS client connects,
 /// receives the snapshot, disconnects; with the (short) idle timeout armed
 /// by the >0 → 0 transition, the daemon queues a power-off write for the

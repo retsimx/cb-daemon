@@ -364,6 +364,50 @@ pub fn merge_payload(bank: &Value, overlay: &Value) -> Value {
     Value::Object(obj)
 }
 
+/// Whether a typed payload carries every field the register's DTO consumes.
+///
+/// A full payload needs no bank state: the caller can validate and encode it
+/// directly (design D-13). Classification comes from deserializing the
+/// payload into the register's DTO (the DTO definitions are the single source
+/// of truth, so the completeness check cannot drift):
+///
+/// - [`serde_json::from_value`] `Ok` → full (`true`).
+/// - An error whose message contains "missing field" → partial (`false`): the
+///   payload keys are incomplete and the sparse merge needs bank state.
+/// - Any other error (bad enum value, wrong field type) → full (`true`): the
+///   payload is key-complete but invalid, and the caller's [`encode_payload`]
+///   surfaces the precise error.
+///
+/// Non-object payloads (raw-hex strings) are never full, and registers
+/// without a DTO in the catalog are never full.
+#[must_use]
+pub fn is_full_payload(reg: RegId, payload: &Value) -> bool {
+    let Some(obj) = payload.as_object() else {
+        return false;
+    };
+    match reg.get() {
+        0x01 => classify_full::<crate::dto::ZoneConfigDto>(obj),
+        0x03 => classify_full::<crate::dto::ZoneStateDto>(obj),
+        0x04 => classify_full::<crate::dto::ZoneLimitsDto>(obj),
+        0x05 => classify_full::<crate::dto::SystemStatusDto>(obj),
+        0x09 => classify_full::<crate::dto::ActivationCodeDto>(obj),
+        0x12 => classify_full::<crate::dto::SensorPairingWriteDto>(obj),
+        0x26 => classify_full::<crate::dto::RfDevicePairingDto>(obj),
+        0x27 => classify_full::<crate::dto::RfDeviceCalibrationDto>(obj),
+        _ => false,
+    }
+}
+
+/// Classify a DTO deserialization: `Ok` → full; "missing field" error →
+/// partial; any other error → full (key-complete but invalid — the caller's
+/// [`encode_payload`] surfaces the precise error).
+fn classify_full<T: DeserializeOwned>(obj: &serde_json::Map<String, Value>) -> bool {
+    match serde_json::from_value::<T>(Value::Object(obj.clone())) {
+        Err(err) if err.to_string().contains("missing field") => false,
+        Ok(_) | Err(_) => true,
+    }
+}
+
 /// Validate a sparse-merge write against the D-4 write policy and the wire
 /// ranges.
 ///
@@ -614,7 +658,9 @@ fn measured_from_c(temp_c: f64) -> (u8, u8) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{check_ranges, merge_payload, validate_write, validate_write_merged};
+    use super::{
+        check_ranges, is_full_payload, merge_payload, validate_write, validate_write_merged,
+    };
     use crate::error::WriteError;
     use aa_registers::RegId;
     use serde_json::{Value, json};
@@ -909,6 +955,76 @@ mod tests {
             bank,
             "non-object overlay returns bank's object unchanged"
         );
+    }
+
+    #[test]
+    fn is_full_payload_full_activation_code_is_full() {
+        let payload = json!({
+            "action": "set_code",
+            "unlock_code": "abcd",
+            "activation_days": 30,
+        });
+        assert!(is_full_payload(RegId::new(0x09), &payload));
+    }
+
+    #[test]
+    fn is_full_payload_partial_activation_code_is_partial() {
+        let payload = json!({ "action": "set_code", "unlock_code": "abcd" });
+        assert!(
+            !is_full_payload(RegId::new(0x09), &payload),
+            "missing activation_days → partial"
+        );
+    }
+
+    #[test]
+    fn is_full_payload_activation_code_with_bad_enum_is_full() {
+        let payload = json!({
+            "action": "bogus",
+            "unlock_code": "abcd",
+            "activation_days": 30,
+        });
+        assert!(
+            is_full_payload(RegId::new(0x09), &payload),
+            "key-complete but invalid enum → full; encode_payload surfaces the error"
+        );
+    }
+
+    #[test]
+    fn is_full_payload_non_object_is_not_full() {
+        assert!(!is_full_payload(RegId::new(0x09), &json!(42)));
+        assert!(!is_full_payload(
+            RegId::new(0x09),
+            &raw_hex("01020304000000")
+        ));
+    }
+
+    #[test]
+    fn is_full_payload_rf_device_pairing() {
+        let full = json!({
+            "pairing_control": 1,
+            "rf_device_type": 2,
+            "zone_channel": 3,
+        });
+        assert!(is_full_payload(RegId::new(0x26), &full));
+        let partial = json!({ "pairing_control": 1, "rf_device_type": 2 });
+        assert!(
+            !is_full_payload(RegId::new(0x26), &partial),
+            "missing zone_channel → partial"
+        );
+    }
+
+    #[test]
+    fn is_full_payload_reg12_write_shape_is_full() {
+        let payload = json!({ "sensor_uid": "a1b2c3", "zone": 1 });
+        assert!(
+            is_full_payload(RegId::new(0x12), &payload),
+            "write shape (sensor_uid + zone) → full"
+        );
+    }
+
+    #[test]
+    fn is_full_payload_unknown_register_is_not_full() {
+        assert!(!is_full_payload(RegId::new(0x16), &json!({})));
     }
 
     #[test]
