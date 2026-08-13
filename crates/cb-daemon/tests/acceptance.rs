@@ -1478,3 +1478,59 @@ async fn sparse_typed_write_client_sent_read_only_field_errors() {
     let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
 }
+/// A10 (T6): idle-failsafe watchdog end-to-end. A real WS client connects,
+/// receives the snapshot, disconnects; with the (short) idle timeout armed
+/// by the >0 → 0 transition, the daemon queues a power-off write for the
+/// AIRCON unit — observed on the `cmd_spy` with reg-05 bytes preserved and
+/// power = Off. The client never writes, so the first `WriteRegisters` on the
+/// spy can only be the failsafe's.
+#[tokio::test]
+async fn idle_failsafe_powers_off_after_client_disconnect() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle =
+        App::spawn_mock_with_timeouts(bind, Duration::from_millis(150), Duration::from_millis(100))
+            .await
+            .expect("spawn mock with short failsafe timeouts");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+    let _ = ws.close(None).await;
+    // Drain until the server observes the close / stream ends (the session
+    // count decrement arms the watchdog from this moment).
+    let _ = timeout(Duration::from_secs(2), async {
+        while ws.next().await.is_some() {}
+    })
+    .await;
+
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let spy = handle.cmd_spy.lock().await;
+            if let Some(cmd) = spy
+                .iter()
+                .find(|cmd| matches!(cmd, EngineCmd::WriteRegisters(_)))
+            {
+                match cmd {
+                    EngineCmd::WriteRegisters(records) => {
+                        assert_eq!(records.len(), 1, "one AIRCON unit in the bank");
+                        let rec = &records[0];
+                        assert_eq!(rec.unit_type, UnitType::AIRCON);
+                        assert_eq!(rec.unit_id, UnitId::try_new(0x0_ABCDE).unwrap());
+                        assert_eq!(rec.reg.get(), 0x05);
+                        assert_eq!(
+                            rec.data,
+                            [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+                            "power byte flipped to Off, every other byte preserved"
+                        );
+                        return;
+                    }
+                    _ => unreachable!("spy only records WriteRegisters here"),
+                }
+            }
+            drop(spy);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("idle-failsafe power-off write not observed on spy");
+
+    handle.shutdown().await.expect("shutdown");
+}
