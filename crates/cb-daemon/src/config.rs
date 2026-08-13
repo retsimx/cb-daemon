@@ -31,9 +31,11 @@ pub(crate) const DEFAULT_TTY_BAUD: u32 = TTY_BAUD;
 /// Default tracing level when `RUST_LOG` is unset.
 pub(crate) const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// Default idle failsafe timeout: power off AIRCON units after this long with
-/// zero connected WebSocket clients (`0` disables the failsafe).
-pub(crate) const DEFAULT_WS_IDLE_TIMEOUT: Duration = Duration::from_mins(15);
+/// Default idle failsafe timeout: the failsafe is disabled by default; set
+/// `ws_idle_timeout_minutes` to a positive value (in minutes) to enable
+/// powering off AIRCON units after that long with zero connected WebSocket
+/// clients.
+pub(crate) const DEFAULT_WS_IDLE_TIMEOUT: Duration = Duration::ZERO;
 
 /// Default interval between repeated idle-failsafe power-off writes.
 pub(crate) const DEFAULT_WS_IDLE_RETRY_INTERVAL: Duration = Duration::from_mins(1);
@@ -604,7 +606,7 @@ mod tests {
         assert_eq!(DEFAULT_AOA_CHUNK_SIZE, AOA_MAX_CHUNK);
         assert_eq!(DEFAULT_AOA_CHUNK_DELAY_MS, AOA_INTER_CHUNK_DELAY_MS);
         assert_eq!(DEFAULT_TTY_BAUD, TTY_BAUD);
-        assert_eq!(DEFAULT_WS_IDLE_TIMEOUT, Duration::from_mins(15));
+        assert_eq!(DEFAULT_WS_IDLE_TIMEOUT, Duration::ZERO);
         assert_eq!(DEFAULT_WS_IDLE_RETRY_INTERVAL, Duration::from_mins(1));
     }
 
