@@ -627,15 +627,6 @@ async fn handle_client_text(
                     send_ack(socket, &msg_id, AckStatus::Success, None).await?;
                 }
             }
-            "flush_unit" => {
-                send_ack(
-                    socket,
-                    &msg_id,
-                    AckStatus::Error,
-                    Some("flush_unit not implemented yet".into()),
-                )
-                .await?;
-            }
             other => {
                 send_ack(
                     socket,
