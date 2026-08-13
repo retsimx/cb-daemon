@@ -1076,15 +1076,9 @@ async fn write_policy_error_acks_exact_reasons() {
         ),
         (
             "req-a2-5",
-            "01",
-            json!({
-                "header": 0x20,
-                "total_zones": 11,
-                "constant_zones": 1,
-                "constant_zone_ids": [1, 0, 0],
-                "filter_clean_required": false,
-            }),
-            "field 'numZones' 11 out of range (max 10)",
+            "05",
+            json!({"myzone_id": 11}),
+            "field 'myzone' 11 out of range (max 10)",
         ),
     ];
     for (msg_id, register, payload, reason) in cases {
@@ -1335,6 +1329,151 @@ async fn flush_unit_and_unknown_command_return_error_acks() {
     .unwrap();
     let ack = wait_for_ack(&mut ws, "req-a9-health").await;
     assert_eq!(ack["status"], "success", "post-command write ack: {ack}");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-11: a sparse typed write on reg 05 merges over the bank's current value
+/// (the mock dump seeds reg 05 for `07:abcde` with
+/// [0x01,0x01,0x03,0x30,0x00,0x01,0x00] → on/cool/high/24.0/off). The client
+/// sends only `{"fan":"low"}`; the ack is success and the write's `event`
+/// echo carries the merged DTO: `fan` from the client, every other field
+/// preserved from the bank. A follow-up read still resolves a typed reg-05
+/// payload with the preserved fields intact.
+///
+/// Note on the read's `fan`: the mock feeder answers a reg-06 flush (the
+/// read's unit-scoped flush) with its canned sample set, which includes the
+/// original reg-05 bytes; that getCAN overwrites the bank's reg-05 slot
+/// before the read resolves, so the read's `fan` reflects the canned sample
+/// rather than the merged write. The merged state is therefore asserted on
+/// the `event` echo (the authoritative end-to-end evidence of the merge).
+#[tokio::test]
+async fn sparse_typed_write_on_reg05_merges_over_bank() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-d11-1",
+        "register": "05",
+        "payload": {"fan": "low"}
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-d11-1").await;
+    assert_eq!(ack["status"], "success", "sparse merge write ack: {ack}");
+
+    // The mock feeder echoes the written record back as a getCAN; the `event`
+    // fan-out carries the merged DTO — the authoritative end-to-end evidence
+    // of the sparse merge.
+    let ev = wait_for_event(&mut ws, "05", "abcde").await;
+    let payload = &ev["payload"];
+    assert!(payload.is_object(), "event payload must be typed: {ev}");
+    assert_eq!(payload["fan"], "low", "fan from client: {ev}");
+    assert_eq!(payload["power"], "on", "power preserved from bank: {ev}");
+    assert_eq!(payload["mode"], "cool", "mode preserved from bank: {ev}");
+    assert_eq!(
+        payload["target_temp_c"], 24.0,
+        "target_temp_c preserved from bank: {ev}"
+    );
+    assert_eq!(
+        payload["fresh_air"], false,
+        "fresh_air preserved from bank: {ev}"
+    );
+    assert_eq!(
+        payload["rf_sys_id"], 0,
+        "rf_sys_id preserved from bank: {ev}"
+    );
+
+    // The read path still resolves a typed reg-05 payload with the preserved
+    // fields intact (see the note above on the mock's canned flush reply).
+    ws.send(Message::Text(
+        reg_read("req-d11-read", "05").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let result = wait_for_read_result(&mut ws, "req-d11-read").await;
+    assert_eq!(result["unit_type"], "07");
+    assert_eq!(result["unit_id"], "abcde");
+    assert_eq!(result["register"], "05");
+    let payload = &result["payload"];
+    assert!(
+        payload.is_object(),
+        "known register payload must be typed: {result}"
+    );
+    assert_eq!(payload["power"], "on", "power preserved: {result}");
+    assert_eq!(payload["mode"], "cool", "mode preserved: {result}");
+    assert_eq!(
+        payload["target_temp_c"], 24.0,
+        "target_temp_c preserved: {result}"
+    );
+    assert_eq!(payload["fresh_air"], false, "fresh_air preserved: {result}");
+    assert_eq!(payload["rf_sys_id"], 0, "rf_sys_id preserved: {result}");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-11: a sparse typed write on a register/zone the bank has no state for
+/// (reg 03 is zone-bearing and absent from the default dump) is rejected with
+/// the documented no-bank reason — never silently written as zeros.
+#[tokio::test]
+async fn sparse_typed_write_with_no_bank_state_errors() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-d11-2",
+        "register": "03",
+        "zone": 2,
+        "payload": {"open": true}
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-d11-2").await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["status"], "error", "no-bank sparse write ack: {ack}");
+    assert_eq!(
+        ack["reason"],
+        "no bank state for register 03 [zone 2]; send a full payload or issue a read first",
+        "no-bank sparse write ack: {ack}"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-11: a sparse typed write carrying a read-only field is rejected — the
+/// read-only check applies to the client-sent subset, so `rf_sys_id` on reg
+/// 05 errors even though the bank's decoded DTO legitimately carries it.
+#[tokio::test]
+async fn sparse_typed_write_client_sent_read_only_field_errors() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-d11-3",
+        "register": "05",
+        "payload": {"rf_sys_id": 1}
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-d11-3").await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["status"], "error", "read-only sparse write ack: {ack}");
+    assert_eq!(
+        ack["reason"], "field 'rf_sys_id' is read-only on register 05",
+        "read-only sparse write ack: {ack}"
+    );
 
     let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
