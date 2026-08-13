@@ -6,7 +6,12 @@ use aa_registers::{CanRecord, RegId, RegisterBank, UnitId, UnitType};
 #[derive(Debug, Clone)]
 pub enum EngineCmd {
     /// Enqueue register writes for the next steady-state `setCAN` window.
-    WriteRegisters(Vec<CanRecord>),
+    ///
+    /// Each record carries an optional client `msg_id`: `Some(msg_id)` for
+    /// daemon client writes (confirmed via [`EngineEvent::WriteFlushed`] once
+    /// the frame is transmitted), `None` for internal engine writes (reg-06
+    /// flush, JZ18 replies) and tests.
+    WriteRegisters(Vec<(CanRecord, Option<String>)>),
     /// Queue a unit-scoped reg-06 flush and track a pending read; the flush's
     /// `getCAN` resolves it via [`EngineEvent::RegisterRead`].
     ReadRegister {
@@ -61,8 +66,10 @@ pub enum EngineEvent {
     /// Incremental register updates from a steady-state `getCAN`.
     RegistersChanged { records: Vec<CanRecord> },
     /// Queued register writes were transmitted in a `setCAN` frame.
-    /// Lets the WS bridge defer mailbox acks until the bus actually sent them.
-    WriteFlushed,
+    /// `msg_ids` are the client `msg_id`s confirmed in the just-transmitted
+    /// frame (the WS bridge acks exactly these). Never emitted with an empty
+    /// list: internal writes carry no `msg_id` and produce no event.
+    WriteFlushed(Vec<String>),
     /// Result of a previously queued [`EngineCmd::ReadRegister`]: the flush's
     /// `getCAN` resolved the register against the bank. `data` is `Some` when
     /// the flush response carried the register, `None` when it did not (reads

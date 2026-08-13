@@ -18,7 +18,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use futures_util::StreamExt;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
@@ -40,6 +40,16 @@ pub(crate) enum WsEvent {
         detail: Option<String>,
     },
 }
+
+/// Minimal socket capability shared by the session plumbing and test doubles:
+/// send WebSocket frames, failing with the same `axum::Error` type.
+///
+/// Production sessions use axum's `WebSocket`; unit tests use a mock sink, so
+/// every session function is generic over this capability instead of naming
+/// `WebSocket` directly.
+trait SessionSocket: Sink<Message, Error = axum::Error> + Unpin {}
+
+impl<S> SessionSocket for S where S: Sink<Message, Error = axum::Error> + Unpin {}
 
 /// Per-session timeout durations: write/read ack deadlines, daemon-initiated
 /// keepalive ping interval + pong grace, and the snapshot-wait deadline
@@ -184,7 +194,10 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     }
 }
 
-async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Result<()> {
+async fn run_session<S>(mut socket: S, mut state: WsState) -> anyhow::Result<()>
+where
+    S: SessionSocket + Stream<Item = Result<Message, axum::Error>>,
+{
     // Late clients learn the current health instantly (D-8): send the latest
     // session state on connect, before the snapshot wait. The watch already
     // holds the most recent transition (negotiating until the first dump).
@@ -194,6 +207,11 @@ async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Resul
         detail: None,
     };
     send_json(&mut socket, &status).await?;
+    // Subscribe to the event fan-out BEFORE the snapshot wait: the broadcast
+    // has no history, so any event emitted while the session was waiting for
+    // the snapshot would be silently lost without this subscription.
+    let ev_rx = state.events.subscribe();
+
     let held = wait_for_snapshot(
         &mut socket,
         state.snapshot.clone(),
@@ -201,12 +219,10 @@ async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Resul
     )
     .await?;
 
-    // Subscribe to the event fan-out BEFORE re-reading the status watch: the
-    // broadcast has no history, so a transition that raced the snapshot wait
-    // must either arrive on this subscription or be echoed from the watch
-    // here. The fanout writes the watch before broadcasting, so exactly one
-    // of the two paths is guaranteed to deliver a changed state.
-    let ev_rx = state.events.subscribe();
+    // Re-read the status watch: a transition that raced the snapshot wait
+    // must either arrive on the subscription above or be echoed from the
+    // watch here. The fanout writes the watch before broadcasting, so
+    // exactly one of the two paths is guaranteed to deliver a changed state.
     let current_state = *state.status.borrow_and_update();
     if current_state != connect_state {
         let status = ServerMessage::Status {
@@ -218,22 +234,49 @@ async fn run_session(mut socket: WebSocket, mut state: WsState) -> anyhow::Resul
     if let Some((_, unit_id)) = primary_unit(&held.bank, state.unit_id_hint) {
         info!(%unit_id, "mailbox snapshot unit_id");
     }
+    // Re-read the bank AFTER the snapshot wait: an event that raced the wait
+    // (the snapshot became visible only to the watch) must be reflected in
+    // the sent snapshot, not silently stale. The fanout writes the watch
+    // before broadcasting, so this re-read is at least as fresh as anything
+    // the subscription can deliver; the held clone is the fallback when the
+    // watch is still empty. A benign duplicate Snapshot may also arrive on
+    // the subscription — snapshot frames are idempotent replacements.
+    let bank = snapshot_bank(&mut state.snapshot, &held);
     let snap = ServerMessage::Snapshot {
-        units: snapshot_units(&held.bank),
+        units: snapshot_units(&bank),
     };
     send_json(&mut socket, &snap).await?;
     bridge_until_disconnect(&mut socket, &state, ev_rx, state.timeouts).await
+}
+
+/// Pick the bank for the session-opening `Snapshot` frame: the snapshot
+/// watch re-read (the fanout writes the watch before broadcasting, so this
+/// is at least as fresh as anything the session's subscription can deliver),
+/// falling back to the `HeldSnapshot` the snapshot wait returned when the
+/// watch is still empty.
+fn snapshot_bank(
+    snapshot: &mut watch::Receiver<Option<HeldSnapshot>>,
+    held: &HeldSnapshot,
+) -> RegisterBank {
+    snapshot
+        .borrow_and_update()
+        .as_ref()
+        .cloned()
+        .map_or_else(|| held.bank.clone(), |h| h.bank)
 }
 
 /// Wait for the first engine Snapshot, aborting if the client disconnects.
 ///
 /// Aborts promptly when the holder drops before dump completes: no bank is ever
 /// published, so a waiting session would hang forever otherwise.
-async fn wait_for_snapshot(
-    socket: &mut WebSocket,
+async fn wait_for_snapshot<S>(
+    socket: &mut S,
     mut rx: watch::Receiver<Option<HeldSnapshot>>,
     snapshot_timeout: std::time::Duration,
-) -> anyhow::Result<HeldSnapshot> {
+) -> anyhow::Result<HeldSnapshot>
+where
+    S: SessionSocket + Stream<Item = Result<Message, axum::Error>>,
+{
     let deadline = tokio::time::Instant::now() + snapshot_timeout;
     loop {
         let current = rx.borrow_and_update().clone();
@@ -277,12 +320,13 @@ async fn wait_for_snapshot(
     }
 }
 
-/// Per-session write ack state: acks are deferred until the engine
-/// confirms the write was transmitted ([`EngineEvent::WriteFlushed`]), so a
-/// success ack never lies when the bus is dead. The engine batches the entire
-/// write queue into one CAN TX and emits exactly one `WriteFlushed` per TX, so
-/// every pending `msg_id` since the last flush belongs to that TX and is acked
-/// together.
+/// Per-session write ack state: acks are deferred until the engine confirms
+/// the write was transmitted ([`EngineEvent::WriteFlushed`]), so a success
+/// ack never lies when the bus is dead. The engine is the only witness of
+/// frame membership: a `WriteFlushed` carries the exact `msg_id`s confirmed
+/// in the just-transmitted `setCAN` frame, and the session acks ONLY those
+/// ([`PendingAcks::drain_matching`]). Writes that missed the frame stay
+/// pending and land in the next flush's frame or error-ack on deadline.
 struct PendingAcks {
     deadlines: BTreeMap<String, tokio::time::Instant>,
     timeout: std::time::Duration,
@@ -311,8 +355,23 @@ impl PendingAcks {
     }
 
     /// Drain every pending `msg_id` as a success (writes were flushed).
+    #[cfg(test)]
     fn drain_all(&mut self) -> Vec<String> {
         std::mem::take(&mut self.deadlines).into_keys().collect()
+    }
+
+    /// Remove and return the pending `msg_id`s attested by a just-transmitted
+    /// frame: only ids present in `frame_ids` are acked (a write queued after
+    /// the frame's drain belongs to a later TX and stays pending), in frame
+    /// order.
+    fn drain_matching(&mut self, frame_ids: &[String]) -> Vec<String> {
+        let mut acked = Vec::new();
+        for id in frame_ids {
+            if self.deadlines.remove(id).is_some() {
+                acked.push(id.clone());
+            }
+        }
+        acked
     }
 
     /// Remove and return every `msg_id` whose deadline has passed.
@@ -444,12 +503,15 @@ async fn wait_until(earliest: Option<tokio::time::Instant>) {
     }
 }
 
-async fn bridge_until_disconnect(
-    socket: &mut WebSocket,
+async fn bridge_until_disconnect<S>(
+    socket: &mut S,
     state: &WsState,
     mut ev_rx: broadcast::Receiver<WsEvent>,
     timeouts: SessionTimeouts,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: SessionSocket + Stream<Item = Result<Message, axum::Error>>,
+{
     let mut pending = PendingAcks::with_timeout(timeouts.write_ack);
     let mut pending_reads = PendingReads::with_timeout(timeouts.read);
     // Liveness = any received frame since the previous ping: tungstenite
@@ -531,14 +593,17 @@ async fn bridge_until_disconnect(
 }
 
 /// Returns `false` when the session should end.
-async fn handle_ws_message(
-    socket: &mut WebSocket,
+async fn handle_ws_message<S>(
+    socket: &mut S,
     state: &WsState,
     msg: Option<Result<Message, axum::Error>>,
     pending: &mut PendingAcks,
     pending_reads: &mut PendingReads,
     last_frame_at: &mut tokio::time::Instant,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<bool>
+where
+    S: SessionSocket,
+{
     // Any received frame — including the peer's pongs — proves liveness for
     // the keepalive gate (tungstenite answers pings with pongs internally).
     if matches!(msg, Some(Ok(_))) {
@@ -618,13 +683,16 @@ fn read_result_message(
 }
 
 /// Returns `false` when the session should end.
-async fn forward_engine_event(
-    socket: &mut WebSocket,
+async fn forward_engine_event<S>(
+    socket: &mut S,
     _state: &WsState,
     ev: Result<WsEvent, broadcast::error::RecvError>,
     pending: &mut PendingAcks,
     pending_reads: &mut PendingReads,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<bool>
+where
+    S: SessionSocket,
+{
     match ev {
         Ok(WsEvent::Engine(EngineEvent::RegistersChanged { records })) => {
             for record in records {
@@ -639,8 +707,11 @@ async fn forward_engine_event(
             send_json(socket, &snap).await?;
             Ok(true)
         }
-        Ok(WsEvent::Engine(EngineEvent::WriteFlushed)) => {
-            for msg_id in pending.drain_all() {
+        Ok(WsEvent::Engine(EngineEvent::WriteFlushed(ids))) => {
+            // Ack only the msg_ids the engine attests were confirmed in the
+            // just-transmitted frame: a write queued after the frame's drain
+            // belongs to a later TX and must NOT be acked here.
+            for msg_id in pending.drain_matching(&ids) {
                 send_ack(socket, &msg_id, AckStatus::Success, None).await?;
             }
             Ok(true)
@@ -685,20 +756,32 @@ async fn forward_engine_event(
             Ok(true)
         }
         Err(broadcast::error::RecvError::Lagged(n)) => {
-            warn!(n, "event broadcast lagged");
-            Ok(true)
+            // Disconnect-on-lag: `n` events were dropped, so this session can
+            // no longer present a consistent view to the client. There is no
+            // catch-up path — ending the session makes the client reconnect,
+            // and the existing connect-time snapshot/status recovery restores
+            // a fresh, consistent view (the fanout watch holds the latest
+            // state).
+            warn!(
+                n,
+                "event broadcast lagged; ending session so the client reconnects for a fresh snapshot"
+            );
+            Ok(false)
         }
         Err(broadcast::error::RecvError::Closed) => Ok(false),
     }
 }
 
-async fn handle_client_text(
-    socket: &mut WebSocket,
+async fn handle_client_text<S>(
+    socket: &mut S,
     state: &WsState,
     text: &str,
     pending: &mut PendingAcks,
     pending_reads: &mut PendingReads,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: SessionSocket,
+{
     let parsed: Result<ClientMessage, _> = serde_json::from_str(text);
     match parsed {
         Ok(ClientMessage::Write {
@@ -860,12 +943,15 @@ fn validate_read_register(register: &str, zone: Option<u8>) -> Result<RegId, Str
 /// [`EngineCmd::ReadRegister`]. The reply arrives later as a correlated
 /// `read_result` from the flush's [`EngineEvent::RegisterRead`] (or a `read
 /// timeout` error ack after 5s when the bus never reports the register).
-async fn handle_read(
-    socket: &mut WebSocket,
+async fn handle_read<S>(
+    socket: &mut S,
     state: &WsState,
     pending: &mut PendingReads,
     msg: ReadRequest,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: SessionSocket,
+{
     let reg = match validate_read_register(&msg.register, msg.zone) {
         Ok(reg) => reg,
         Err(reason) => {
@@ -1047,6 +1133,13 @@ fn build_write_record(
             data,
         });
     }
+    // Typed payloads run the full write validation (issue #57): a key outside
+    // the register's DTO field table must be rejected up front — the lenient
+    // DTO deserializer used by the sparse merge would otherwise silently drop
+    // the unknown key and ack a write that changed nothing. Partial payloads
+    // still pass here (encoding them fails → validation returns Ok), so the
+    // sparse merge keeps its bank-state semantics.
+    validate_write(reg, payload).map_err(|e| e.to_string())?;
     let merged = sparse_merge_payload(bank, unit_type, unit_id, reg, zone, payload)?;
     let mut data = encode_payload(reg, &merged).map_err(|err| err.to_string())?;
     // The zone id is part of the CAN address, not the payload: the codec stamps
@@ -1068,12 +1161,15 @@ fn build_write_record(
 
 /// `write`: encode the register payload and queue it as a single register
 /// write. Ack is deferred until the engine confirms the frame was transmitted.
-async fn handle_write(
-    socket: &mut WebSocket,
+async fn handle_write<S>(
+    socket: &mut S,
     state: &WsState,
     pending: &mut PendingAcks,
     msg: WriteRequest,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: SessionSocket,
+{
     // Clone the held snapshot: `watch::Ref` is not `Send`, so the borrow guard
     // must not span the awaits below.
     let bank = state.snapshot.borrow().as_ref().cloned();
@@ -1092,7 +1188,10 @@ async fn handle_write(
             return Ok(());
         }
     };
-    let cmd = EngineCmd::WriteRegisters(vec![record]);
+    // Attach the client's msg_id so the engine can attest frame membership:
+    // the flush event carries exactly the ids confirmed in the transmitted
+    // frame, and only those are acked. Clone BEFORE the record move.
+    let cmd = EngineCmd::WriteRegisters(vec![(record, Some(msg.msg_id.clone()))]);
     record_spy(state, &cmd).await;
     if let Err(err) = state.cmd_tx.send(cmd).await {
         send_ack(socket, &msg.msg_id, AckStatus::Error, Some(err.to_string())).await?;
@@ -1109,12 +1208,15 @@ async fn record_spy(state: &WsState, cmd: &EngineCmd) {
     }
 }
 
-async fn send_ack(
-    socket: &mut WebSocket,
+async fn send_ack<S>(
+    socket: &mut S,
     msg_id: &str,
     status: AckStatus,
     reason: Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: SessionSocket,
+{
     send_json(
         socket,
         &ServerMessage::Ack {
@@ -1126,7 +1228,10 @@ async fn send_ack(
     .await
 }
 
-async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> anyhow::Result<()> {
+async fn send_json<S>(socket: &mut S, msg: &ServerMessage) -> anyhow::Result<()>
+where
+    S: SessionSocket,
+{
     let text = serde_json::to_string(msg)?;
     socket.send(Message::Text(text.into())).await?;
     Ok(())
@@ -1177,7 +1282,7 @@ async fn fire_idle_power_off(state: &WsState) {
         .map(|record| record.unit_id.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let cmd = EngineCmd::WriteRegisters(records);
+    let cmd = EngineCmd::WriteRegisters(records.into_iter().map(|rec| (rec, None)).collect());
     record_spy(state, &cmd).await;
     if let Err(err) = state.cmd_tx.send(cmd).await {
         warn!(?err, %units, "idle failsafe: failed to queue power-off write");
@@ -1728,6 +1833,412 @@ mod tests {
         assert_eq!(pending_reads.drain_expired(), vec![(key, "r1".to_owned())]);
         assert_eq!(pending.drain_all(), vec!["w2".to_owned()]);
         assert_eq!(pending_reads.resolve(key), vec!["r2".to_owned()]);
+    }
+
+    #[test]
+    fn pending_acks_drain_matching_acks_only_frame_confirmed_ids() {
+        // Ack scoping: a WriteFlushed frame acks ONLY the pending ids the
+        // engine attests were in its just-transmitted frame. A write queued
+        // after the frame's drain ("late") and a write that never made any
+        // frame ("neither") stay pending for the next flush or the deadline.
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_mins(1));
+        pending.push("late".to_owned());
+        pending.push("in-frame".to_owned());
+        pending.push("neither".to_owned());
+
+        // "in-frame" is attested; "other-frame" is not pending at all; the
+        // rest are not in the frame list → only "in-frame" is acked.
+        let acked = pending.drain_matching(&["in-frame".to_owned(), "other-frame".to_owned()]);
+        assert_eq!(acked, vec!["in-frame".to_owned()]);
+
+        // BTreeMap key order: "late" < "neither".
+        assert_eq!(
+            pending.drain_all(),
+            vec!["late".to_owned(), "neither".to_owned()],
+            "a late write and a no-frame write must survive the flush"
+        );
+
+        // A write pending across flushes is acked by the flush whose frame
+        // actually carries it, and only once.
+        pending.push("next-frame".to_owned());
+        assert_eq!(
+            pending.drain_matching(&["next-frame".to_owned(), "next-frame".to_owned()]),
+            vec!["next-frame".to_owned()],
+            "frame ids are acked once, in frame order"
+        );
+        assert!(pending.drain_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_flushed_acks_only_frame_confirmed_ids() {
+        // Ack scoping via the session path: the WriteFlushed ids are the
+        // engine's attestation of frame membership; exactly those pending ids
+        // are acked on the wire, everything else stays pending.
+        let (state, ..) = session_test_state();
+        let mut mock = MockSessionSocket::new();
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_mins(1));
+        pending.push("late".to_owned());
+        pending.push("in-frame".to_owned());
+        pending.push("neither".to_owned());
+        let mut pending_reads = PendingReads::with_timeout(std::time::Duration::from_mins(1));
+
+        let keep_running = forward_engine_event(
+            &mut mock,
+            &state,
+            Ok(WsEvent::Engine(EngineEvent::WriteFlushed(vec![
+                "in-frame".to_owned(),
+                "other-frame".to_owned(),
+            ]))),
+            &mut pending,
+            &mut pending_reads,
+        )
+        .await
+        .expect("flush handling must not error");
+        assert!(keep_running, "a flush must not end the session");
+
+        let sent = mock.sent();
+        assert_eq!(sent.len(), 1, "exactly one ack, for the confirmed id");
+        let ServerMessage::Ack {
+            msg_id,
+            status,
+            reason,
+        } = sent_message(&mock, 0)
+        else {
+            panic!("expected an Ack frame");
+        };
+        assert_eq!(msg_id, "in-frame");
+        assert_eq!(status, AckStatus::Success);
+        assert_eq!(reason, None);
+
+        assert_eq!(
+            pending.drain_all(),
+            vec!["late".to_owned(), "neither".to_owned()],
+            "a late write and a no-frame write must not be acked by this flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn lagged_broadcast_ends_session() {
+        // Disconnect-on-lag: CHANNEL_BOUND+1 events over a CHANNEL_BOUND-slot
+        // broadcast produce a Lagged error on the session's subscription, and
+        // the session's engine-event path must end the session (`Ok(false)`)
+        // so the client reconnects for a fresh snapshot.
+        let (events_tx, mut ev_rx) = broadcast::channel::<WsEvent>(crate::app::CHANNEL_BOUND);
+        for _ in 0..=crate::app::CHANNEL_BOUND {
+            events_tx
+                .send(WsEvent::Status {
+                    state: StatusState::Synced,
+                    detail: None,
+                })
+                .expect("broadcast send");
+        }
+        let ev = ev_rx.recv().await;
+        let Err(err) = ev else {
+            panic!("33 over 32 must lag, got Ok");
+        };
+        let broadcast::error::RecvError::Lagged(n) = err else {
+            panic!("expected Lagged, got {err:?}");
+        };
+        assert!(n > 0, "lag count must be positive");
+
+        let (state, ..) = session_test_state();
+        let mut mock = MockSessionSocket::new();
+        let mut pending = PendingAcks::with_timeout(std::time::Duration::from_mins(1));
+        let mut pending_reads = PendingReads::with_timeout(std::time::Duration::from_mins(1));
+        let keep_running = forward_engine_event(
+            &mut mock,
+            &state,
+            Err(broadcast::error::RecvError::Lagged(n)),
+            &mut pending,
+            &mut pending_reads,
+        )
+        .await
+        .expect("lagged handling must not error");
+        assert!(
+            !keep_running,
+            "a lagged session must end (disconnect-on-lag)"
+        );
+        assert!(
+            mock.sent().is_empty(),
+            "the lagged path must not emit frames"
+        );
+    }
+
+    #[test]
+    fn snapshot_bank_prefers_post_wait_watch_value() {
+        // Snapshot freshness: the session-opening Snapshot is sent from the
+        // post-wait watch re-read, so a bank update that raced the snapshot
+        // wait (fanout writes the watch before broadcasting) is reflected in
+        // the sent snapshot even when the held clone is stale. An empty watch
+        // falls back to the held clone.
+        let stale = HeldSnapshot {
+            bank: single_aircon_bank(),
+        };
+        let newer_bank = {
+            let mut bank = single_aircon_bank();
+            bank.apply(&aircon_reg05(
+                UnitId::try_new(0x0_00002).unwrap(),
+                [0x01, 0x02, 0x03, 0x2e, 0x00, 0x01, 0x00],
+            ));
+            bank
+        };
+        assert_ne!(
+            snapshot_units(&stale.bank),
+            snapshot_units(&newer_bank),
+            "fixture: the newer bank must differ from the stale one"
+        );
+
+        let (snapshot_tx, snapshot_rx) = watch::channel::<Option<HeldSnapshot>>(None);
+        let mut rx = snapshot_rx;
+
+        // Watch empty → the held clone is the fallback.
+        assert_eq!(
+            snapshot_units(&snapshot_bank(&mut rx, &stale)),
+            snapshot_units(&stale.bank)
+        );
+
+        // Watch updated while the session waited → the re-read wins over the
+        // stale held clone.
+        snapshot_tx
+            .send(Some(HeldSnapshot {
+                bank: newer_bank.clone(),
+            }))
+            .unwrap();
+        assert_eq!(
+            snapshot_units(&snapshot_bank(&mut rx, &stale)),
+            snapshot_units(&newer_bank)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_reflects_post_subscribe_events() {
+        // Snapshot ordering (D-17): the session subscribes to the event
+        // fan-out BEFORE waiting for the snapshot and sends its Snapshot from
+        // a post-wait re-read of the watch. An event emitted after the
+        // subscription (fanout order: watch written, then broadcast) is
+        // therefore either reflected in the sent Snapshot or delivered on the
+        // subscription — never lost.
+        let (state, snapshot_tx, _status_tx, events_tx) = session_test_state();
+        let mock = MockSessionSocket::new();
+        let client = mock.clone();
+
+        let newer_bank = {
+            let mut bank = single_aircon_bank();
+            bank.apply(&aircon_reg05(
+                UnitId::try_new(0x0_00002).unwrap(),
+                [0x01, 0x02, 0x03, 0x2e, 0x00, 0x01, 0x00],
+            ));
+            bank
+        };
+        let newer_rec = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: UnitId::try_new(0x0_00002).unwrap(),
+            reg: RegId::new(0x05),
+            data: [0x01, 0x02, 0x03, 0x2e, 0x00, 0x01, 0x00],
+        };
+
+        let session = tokio::spawn(run_session(mock, state));
+
+        // The snapshot watch is empty, so the session blocks in the snapshot
+        // wait AFTER subscribing: `receiver_count() == 1` is the deterministic
+        // "subscription in place" barrier.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while events_tx.receiver_count() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session never subscribed to the event fan-out");
+
+        // Fanout ordering while the session waits: watch first, then broadcast.
+        snapshot_tx
+            .send(Some(HeldSnapshot {
+                bank: newer_bank.clone(),
+            }))
+            .unwrap();
+        events_tx
+            .send(WsEvent::Engine(EngineEvent::RegistersChanged {
+                records: vec![newer_rec.clone()],
+            }))
+            .unwrap();
+
+        // The Snapshot frame comes from the post-wait re-read: it reflects
+        // the newer bank (the wait raced the update, so the held clone would
+        // have been stale).
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                for msg in client.sent() {
+                    let Message::Text(text) = msg else {
+                        continue;
+                    };
+                    let Ok(server) = serde_json::from_str::<ServerMessage>(text.as_str()) else {
+                        continue;
+                    };
+                    if let ServerMessage::Snapshot { units } = server {
+                        return units;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no Snapshot frame reached the client");
+        assert_eq!(
+            snap,
+            snapshot_units(&newer_bank),
+            "snapshot must come from the post-wait watch re-read, not the held clone"
+        );
+
+        // The in-window RegistersChanged is delivered on the subscription (no
+        // lost window), in addition to being reflected in the snapshot.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                for msg in client.sent() {
+                    let Message::Text(text) = msg else {
+                        continue;
+                    };
+                    let Ok(server) = serde_json::from_str::<ServerMessage>(text.as_str()) else {
+                        continue;
+                    };
+                    if let ServerMessage::Event { unit_id, .. } = server {
+                        assert_eq!(unit_id, "00002", "in-window event must be delivered");
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-window event never reached the client");
+
+        // The session's own `WsState` holds an `events` sender clone, so the
+        // fan-out cannot be closed from outside: end the session the way a
+        // real client would — disconnect the socket.
+        client.disconnect();
+        // The mock's inbound stream has no I/O wakeup source, so the parked
+        // select loop would never re-poll the socket: nudge it with a
+        // broadcast. The socket branch is declared first, so on wakeup it
+        // observes the disconnect and wins over the buffered event.
+        events_tx
+            .send(WsEvent::Status {
+                state: StatusState::LinkDown,
+                detail: None,
+            })
+            .expect("broadcast send");
+        session
+            .await
+            .expect("session task panicked")
+            .expect("session must end cleanly on client disconnect");
+    }
+
+    /// Minimal `WsState` for session tests: no spy, live watch/broadcast
+    /// channels the test drives directly.
+    fn session_test_state() -> (
+        WsState,
+        watch::Sender<Option<HeldSnapshot>>,
+        watch::Sender<StatusState>,
+        broadcast::Sender<WsEvent>,
+    ) {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<EngineCmd>(crate::app::CHANNEL_BOUND);
+        let (snapshot_tx, snapshot_rx) = watch::channel::<Option<HeldSnapshot>>(None);
+        let (status_tx, status_rx) = watch::channel::<StatusState>(StatusState::Negotiating);
+        let (events_tx, _events_rx) = broadcast::channel::<WsEvent>(crate::app::CHANNEL_BOUND);
+        let (clients_tx, _clients_rx) = watch::channel::<usize>(0);
+        let state = WsState {
+            cmd_tx,
+            snapshot: snapshot_rx,
+            events: events_tx.clone(),
+            status: status_rx,
+            cmd_spy: None,
+            unit_id_hint: None,
+            clients: clients_tx,
+            timeouts: SessionTimeouts::default(),
+        };
+        (state, snapshot_tx, status_tx, events_tx)
+    }
+
+    /// Test double for the session socket: records sent frames in a shared
+    /// `Vec` (observable through any clone) and yields no inbound messages
+    /// until the test flags a client disconnect — the paused engine is driven
+    /// entirely by the test. Implements the `SessionSocket` + inbound-`Stream`
+    /// capabilities so the real session plumbing runs against it.
+    #[derive(Clone, Default)]
+    struct MockSessionSocket {
+        sent: Arc<std::sync::Mutex<Vec<Message>>>,
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockSessionSocket {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// All frames sent so far (wire messages, in order).
+        fn sent(&self) -> Vec<Message> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        /// Flag a client disconnect: the next inbound poll yields `None`, so
+        /// the session ends exactly as a closed WebSocket would.
+        fn disconnect(&self) {
+            self.disconnected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Sink<Message> for MockSessionSocket {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.sent.lock().unwrap().push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for MockSessionSocket {
+        type Item = Result<Message, axum::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.disconnected.load(std::sync::atomic::Ordering::SeqCst) {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// Decode the `i`-th sent frame as a [`ServerMessage`].
+    fn sent_message(mock: &MockSessionSocket, i: usize) -> ServerMessage {
+        let msgs = mock.sent();
+        let Message::Text(text) = &msgs[i] else {
+            panic!("expected a Text frame at {i}, got {:?}", msgs[i]);
+        };
+        serde_json::from_str(text.as_str()).expect("sent frame must parse as ServerMessage")
     }
 
     #[test]
@@ -2519,7 +3030,7 @@ mod tests {
         };
         assert_eq!(records.len(), 1);
         assert_power_off(
-            &records[0],
+            &records[0].0,
             UnitId::try_new(0x0_ABCDE).unwrap(),
             [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
         );
@@ -2550,10 +3061,10 @@ mod tests {
             panic!("expected WriteRegisters");
         };
         assert_eq!(records.len(), 2, "both AIRCON units must be powered off");
-        let mut ids: Vec<u32> = records.iter().map(|rec| rec.unit_id.get()).collect();
+        let mut ids: Vec<u32> = records.iter().map(|(rec, _)| rec.unit_id.get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0x00_0002, 0x0_ABCDE]);
-        for rec in records {
+        for (rec, _) in records {
             // Known fixture expectations: each unit's reg-05 status with the
             // power byte flipped On → Off and every other byte preserved.
             let (expected_id, expected_data) = match rec.unit_id.get() {
@@ -2602,7 +3113,7 @@ mod tests {
         };
         assert_eq!(records.len(), 1);
         assert_eq!(
-            records[0].unit_id, with_status,
+            records[0].0.unit_id, with_status,
             "reg-05-less unit must be skipped"
         );
 
@@ -2657,7 +3168,11 @@ mod tests {
             panic!("expected WriteRegisters");
         };
         assert_eq!(records.len(), 1, "only the AIRCON unit may be powered off");
-        assert_power_off(&records[0], id, [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00]);
+        assert_power_off(
+            &records[0].0,
+            id,
+            [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        );
         assert_eq!(
             bank.get(UnitType::new(0x08), id, RegId::new(0x05)),
             Some([0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00]),
@@ -2710,7 +3225,7 @@ mod tests {
             };
             assert_eq!(records.len(), 1);
             assert_power_off(
-                &records[0],
+                &records[0].0,
                 UnitId::try_new(0x0_ABCDE).unwrap(),
                 [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
             );
@@ -2754,7 +3269,7 @@ mod tests {
         };
         assert_eq!(records.len(), 1);
         assert_power_off(
-            &records[0],
+            &records[0].0,
             UnitId::try_new(0x0_ABCDE).unwrap(),
             [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
         );
@@ -3057,8 +3572,10 @@ mod tests {
             panic!("expected WriteRegisters");
         };
         assert_eq!(records.len(), 1);
+        let (rec, msg_id) = &records[0];
+        assert!(msg_id.is_none(), "internal failsafe write");
         assert_power_off(
-            &records[0],
+            rec,
             UnitId::try_new(0x0_ABCDE).unwrap(),
             [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
         );

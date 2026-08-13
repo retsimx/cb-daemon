@@ -50,6 +50,14 @@ pub enum WriteError {
         /// JSON DTO field name.
         field: &'static str,
     },
+    /// A typed payload carries a field the register's DTO does not define
+    /// (issue #57).
+    UnknownField {
+        /// Register id.
+        reg: u8,
+        /// JSON field name from the client payload.
+        field: String,
+    },
     /// Whole register is write-only (writable; reads rejected).
     WriteOnlyRegister {
         /// Register id.
@@ -82,6 +90,9 @@ impl fmt::Display for WriteError {
             Self::ReadOnlyRegister { reg } => write!(f, "register {reg:02x} is read-only"),
             Self::ReadOnlyField { reg, field } => {
                 write!(f, "field '{field}' is read-only on register {reg:02x}")
+            }
+            Self::UnknownField { reg, field } => {
+                write!(f, "unknown field '{field}' for register {reg:02x}")
             }
             Self::WriteOnlyRegister { reg } => write!(f, "register {reg:02x} is write-only"),
             Self::InternalRegister { reg } => write!(f, "register {reg:02x} is handled internally"),
@@ -118,6 +129,15 @@ mod tests {
             err.to_string(),
             "field 'measured_temp_c' is read-only on register 03"
         );
+    }
+
+    #[test]
+    fn display_unknown_field() {
+        let err = WriteError::UnknownField {
+            reg: 0x03,
+            field: "damperx".to_owned(),
+        };
+        assert_eq!(err.to_string(), "unknown field 'damperx' for register 03");
     }
 
     #[test]
