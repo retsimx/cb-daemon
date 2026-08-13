@@ -39,12 +39,12 @@ Canonical example: [`packaging/cb-daemon.example.toml`](packaging/cb-daemon.exam
 | `aoa_chunk_size` | `63` | ≥ 1 |
 | `aoa_chunk_delay_ms` | `1` | Milliseconds between AOA chunks |
 | `tty_baud` | `57600` | Must be a supported termios rate |
-| `ws_idle_timeout_minutes` | `15` | Minutes with zero connected WebSocket clients before the power-off failsafe fires; `0` disables it (max 1 year) |
+| `ws_idle_timeout_minutes` | `0` | Power-off failsafe disabled by default; N minutes with zero connected WebSocket clients enables it (max 1 year) |
 | `ws_idle_retry_seconds` | `60` | Seconds between power-off retries while still disconnected; ≥ 1 |
 
 The WebSocket idle failsafe is open-loop: the daemon transmits the power-off frame but cannot verify the unit obeyed. While no client is connected, the frame is re-sent every `ws_idle_retry_seconds`.
 
-> **Development note:** with the default mock backend, an unattended daemon run with no client connected will log a power-off `warn!` after the idle timeout — harmless in development (no real aircon), but set `ws_idle_timeout_minutes = 0` or connect a client to avoid it.
+> **Development note:** with the default mock backend, an unattended daemon run with no client connected never powers off — the idle failsafe is opt-in. Set `ws_idle_timeout_minutes` to a positive value to arm it.
 
 ### Environment
 

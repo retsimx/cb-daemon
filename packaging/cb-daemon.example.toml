@@ -32,9 +32,9 @@ aoa_chunk_delay_ms = 1
 # TTY baud rate (e.g. 9600, 19200, 38400, 57600, 115200, 230400)
 tty_baud = 57600
 
-# WebSocket idle failsafe: minutes with zero connected WS clients before all
-# aircon units are powered off; 0 disables the failsafe entirely.
-# ws_idle_timeout_minutes = 15
+# WebSocket idle failsafe: disabled by default. Set to N minutes with zero
+# connected WS clients to enable powering off all aircon units.
+# ws_idle_timeout_minutes = 0
 
 # Seconds between power-off retries while still disconnected (>= 1)
 # ws_idle_retry_seconds = 60
