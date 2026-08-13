@@ -246,7 +246,7 @@ async fn mock_backend_ws_receives_mailbox_snapshot() {
     assert_eq!(reg05["mode"], "cool");
     assert_eq!(reg05["fan"], "high");
     assert_eq!(reg05["target_temp_c"], 24.0);
-    assert_eq!(reg05["fresh_air"], false);
+    assert_eq!(reg05["fresh_air"], "off");
     assert_eq!(reg05["rf_sys_id"], 0);
     // 08-type record from the flush-dump reply must surface as its own unit.
     let reg06 = &msg["units"]["08:abcde"]["06"];
@@ -801,7 +801,7 @@ async fn read_known_register_returns_typed_read_result() {
     assert_eq!(payload["mode"], "cool");
     assert_eq!(payload["fan"], "high");
     assert_eq!(payload["target_temp_c"], 24.0);
-    assert_eq!(payload["fresh_air"], false);
+    assert_eq!(payload["fresh_air"], "off");
     assert_eq!(payload["rf_sys_id"], 0);
 
     let _ = ws.close(None).await;
@@ -1380,7 +1380,7 @@ async fn sparse_typed_write_on_reg05_merges_over_bank() {
         "target_temp_c preserved from bank: {ev}"
     );
     assert_eq!(
-        payload["fresh_air"], false,
+        payload["fresh_air"], "off",
         "fresh_air preserved from bank: {ev}"
     );
     assert_eq!(
@@ -1410,7 +1410,7 @@ async fn sparse_typed_write_on_reg05_merges_over_bank() {
         payload["target_temp_c"], 24.0,
         "target_temp_c preserved: {result}"
     );
-    assert_eq!(payload["fresh_air"], false, "fresh_air preserved: {result}");
+    assert_eq!(payload["fresh_air"], "off", "fresh_air preserved: {result}");
     assert_eq!(payload["rf_sys_id"], 0, "rf_sys_id preserved: {result}");
 
     let _ = ws.close(None).await;
