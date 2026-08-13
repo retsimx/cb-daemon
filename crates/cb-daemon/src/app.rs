@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::{Backend, Config, DEFAULT_WS_IDLE_RETRY_INTERVAL, DEFAULT_WS_IDLE_TIMEOUT};
-use crate::mock_feeder::{self, FeederSpec, SharedMockLink};
+use crate::mock_feeder::{self, FeederSpec, SharedMockLink, WireEntry};
 use crate::ws::{self, WsEvent, WsState};
 
 /// Channel capacity for engine cmd / event mpsc (architecture default).
@@ -228,6 +228,7 @@ impl App {
         let ctrl = MockLinkCtrl {
             mock: Arc::clone(&mock),
             notify: Arc::clone(&notify),
+            history: link.wire_history(),
         };
         let join = tokio::spawn(async move {
             run_mock_with_parts(
@@ -257,11 +258,17 @@ impl App {
 }
 
 /// Test handle for the mock link: force it closed so the engine's next read
-/// errors → `SessionState(LinkDown)` + `LinkError` fan-out.
+/// errors → `SessionState(LinkDown)` + `LinkError` fan-out; inspect the wire
+/// history.
+///
+/// The feeder drains `written()` every poll, so `wire_history` is the only
+/// stable record of what the engine wrote and read.
 #[derive(Clone)]
 pub struct MockLinkCtrl {
     mock: Arc<Mutex<MockLink>>,
     notify: Arc<Notify>,
+    /// Never-drained wire record (engine Tx + engine Rx chunks).
+    history: Arc<Mutex<Vec<WireEntry>>>,
 }
 
 impl MockLinkCtrl {
@@ -299,6 +306,13 @@ impl MockLinkCtrl {
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// Snapshot of every wire record since startup, in chronological order:
+    /// frames the engine wrote ([`WireEntry::Tx`]) and chunks it read
+    /// ([`WireEntry::Rx`], i.e. frames the feeder pushed inbound).
+    pub async fn wire_history(&self) -> Vec<WireEntry> {
+        self.history.lock().await.clone()
     }
 }
 

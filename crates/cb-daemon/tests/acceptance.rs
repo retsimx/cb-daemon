@@ -9,7 +9,10 @@ use aa_engine::EngineCmd;
 use aa_frame::Frame;
 use aa_link::AOA_DEFAULT_PATH;
 use aa_registers::{UnitId, UnitType};
-use cb_daemon::{App, Backend, FeederSpec, SessionTimeouts, mock_backend_avoids_accessory};
+use cb_daemon::{
+    App, Backend, FeederSpec, SessionTimeouts, WireEntry, mock_backend_avoids_accessory,
+};
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::time::timeout;
@@ -228,6 +231,34 @@ async fn wait_for_read_result(
     })
     .await
     .expect("read_result timeout")
+}
+
+/// Wire payloads of the D-15 NACK acceptance test: the engine encodes the
+/// `reg05_write` payload as `setCAN 0701abcde050101032e000100`
+/// (07/AIRCON, 01/ControlBox, abcde, reg 05, raw hex payload bytes).
+const NACK_WRITE_SET_CAN: &[u8] = b"setCAN 0701abcde050101032e000100";
+/// ackCAN polarity for a CRC-passing getCAN (the NACK acks with this).
+const NACK_ACK_CAN: &[u8] = b"ackCAN 1";
+/// The canonical steady NACK frame the scripted feeder pushes.
+const NACK_GET_CAN_ZERO: &[u8] = b"getCAN 0";
+
+/// Encoded wire form of `payload`; the engine writes exactly one encoded
+/// frame per TX, so a `Tx` history chunk is one complete frame.
+fn encoded_frame(payload: &[u8]) -> Vec<u8> {
+    Frame {
+        payload: payload.to_vec(),
+    }
+    .encode()
+}
+
+/// Byte offsets of every occurrence of `needle` in `haystack`.
+fn byte_offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 #[tokio::test]
@@ -1893,6 +1924,133 @@ async fn mock_backend_crc_failed_getcan_nacks_then_acks() {
     assert!(
         ctrl.wait_written_contains(&ack1).await,
         "ackCAN 1 never hit the wire (polarity not restored)"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-15: with `scripted_nack_after_write`, the mock CB NACKs the first client
+/// write (`getCAN 0` instead of the write echo). The engine acks and resends
+/// the exact setCAN on a later ping, so the wire shows the write setCAN
+/// exactly twice (original TX + byte-identical resend) with an ackCAN 1
+/// between them, a `getCAN 0` pushed right after the first setCAN, and
+/// exactly one `WriteFlushed` ack to the WS client (the resend bypasses the
+/// queue branch, so no duplicate flush). The dump's JZ18 reg-07 setCANs are
+/// engine-internal and never consume the fire-once flag, so the NACK
+/// deterministically targets the client's write; the reg-07 echo wait also
+/// guarantees the write TXs standalone (never batched with a JZ18).
+#[tokio::test]
+async fn steady_getcan_nack_resends_written_frame_once() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // Default-equivalent watchdog durations (15 min / 1 min): the single
+    // connected client keeps the idle failsafe dormant for the whole test.
+    let (handle, ctrl) = App::spawn_mock_ctrl_with_timeouts(
+        bind,
+        Some(FeederSpec::default().scripted_nack_after_write()),
+        Duration::from_mins(15),
+        Duration::from_mins(1),
+    )
+    .await
+    .expect("spawn mock with nack spec");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    // The dump queues JZ18 reg-07 replies; they TX and echo before any
+    // client write. Waiting for their echo guarantees the write's setCAN
+    // goes out standalone, so the fire-once NACK cannot batch with a JZ18.
+    let _ = wait_for_event(&mut ws, "07", "abcde").await;
+
+    ws.send(Message::Text(reg05_write("req-nack").to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-nack").await;
+    assert_eq!(ack["status"], "success", "NACK'd write ack: {ack}");
+
+    // The reg-05 echo only fires once the NACK'd setCAN was resent and
+    // echoed — its arrival is the sync point that the resend has played out.
+    let _ = wait_for_event(&mut ws, "05", "abcde").await;
+
+    let history = ctrl.wire_history().await;
+    let write_encoded = encoded_frame(NACK_WRITE_SET_CAN);
+    let tx: Vec<u8> = history
+        .iter()
+        .filter_map(|entry| match entry {
+            WireEntry::Tx(bytes) => Some(bytes.clone()),
+            WireEntry::Rx(_) => None,
+        })
+        .flatten()
+        .collect();
+    let rx: Vec<u8> = history
+        .iter()
+        .filter_map(|entry| match entry {
+            WireEntry::Rx(bytes) => Some(bytes.clone()),
+            WireEntry::Tx(_) => None,
+        })
+        .flatten()
+        .collect();
+
+    // The exact write setCAN frame appears exactly twice on the wire: the
+    // original TX and the byte-identical NACK resend.
+    let write_offsets = byte_offsets(&tx, &write_encoded);
+    assert_eq!(
+        write_offsets.len(),
+        2,
+        "write setCAN must be TX'd exactly twice (original + resend): {tx:?}"
+    );
+
+    // An ackCAN 1 sits between the two setCAN TXs (the NACK's ack).
+    assert!(
+        byte_offsets(&tx, &encoded_frame(NACK_ACK_CAN))
+            .iter()
+            .any(|&ack| write_offsets[0] < ack && ack < write_offsets[1]),
+        "ackCAN 1 must sit between the original TX and the resend: {tx:?}"
+    );
+
+    // A `getCAN 0` was pushed inbound after the first setCAN TX: it is in
+    // the Rx half, and the Rx entry carrying it follows the first setCAN's
+    // Tx entry in the chronological history (only the NACK path arms the
+    // ack and schedules the byte-identical resend).
+    let get0_encoded = encoded_frame(NACK_GET_CAN_ZERO);
+    assert!(
+        !byte_offsets(&rx, &get0_encoded).is_empty(),
+        "getCAN 0 must have been pushed after the first setCAN: {rx:?}"
+    );
+    let first_tx_idx = history
+        .iter()
+        .position(|entry| {
+            matches!(entry, WireEntry::Tx(bytes)
+                if bytes.windows(write_encoded.len()).any(|w| w == write_encoded))
+        })
+        .expect("wire history must contain the original setCAN TX");
+    let nack_rx_idx = history
+        .iter()
+        .position(|entry| {
+            matches!(entry, WireEntry::Rx(bytes)
+                if bytes.windows(get0_encoded.len()).any(|w| w == get0_encoded))
+        })
+        .expect("wire history must contain the getCAN 0 NACK");
+    assert!(
+        nack_rx_idx > first_tx_idx,
+        "getCAN 0 must arrive after the first setCAN TX"
+    );
+
+    // Exactly one WriteFlushed: the resend bypasses the queue branch, so no
+    // second ack may arrive within a generous window after the echo.
+    let second_ack = timeout(Duration::from_millis(1500), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before second-ack window");
+            if msg["type"] == "ack" && msg["msg_id"] == "req-nack" {
+                return msg;
+            }
+        }
+    })
+    .await;
+    assert!(
+        second_ack.is_err(),
+        "resend must not raise a second WriteFlushed: {second_ack:?}"
     );
 
     let _ = ws.close(None).await;

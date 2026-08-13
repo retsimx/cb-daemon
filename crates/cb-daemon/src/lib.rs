@@ -17,5 +17,5 @@ pub use config::{
     Backend, CliArgs, Config, EnvOverrides, FileConfig, build_env_filter, init_tracing,
     load_config, load_config_from, resolve_config_path,
 };
-pub use mock_feeder::FeederSpec;
+pub use mock_feeder::{FeederSpec, WireEntry};
 pub use ws::SessionTimeouts;
