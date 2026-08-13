@@ -475,9 +475,11 @@ async fn mailbox_write_and_resync_reach_engine() {
     ws.send(Message::Text(update.to_string().into()))
         .await
         .unwrap();
-    let ack = recv_json(&mut ws).await;
+    // D-17 (design decision #2): the session's subscription may deliver a
+    // benign duplicate snapshot / status echo after the connect snapshot, so
+    // wait for the matching ack instead of requiring it as the next frame.
+    let ack = wait_for_ack(&mut ws, "req-101").await;
     assert_eq!(ack["type"], "ack");
-    assert_eq!(ack["msg_id"], "req-101");
     assert_eq!(ack["status"], "success");
 
     let resync = json!({
@@ -542,9 +544,9 @@ async fn write_zone_bearing_register_stamps_wire_zone() {
     ws.send(Message::Text(update.to_string().into()))
         .await
         .unwrap();
-    let ack = recv_json(&mut ws).await;
+    // D-17 (design decision #2): benign duplicate snapshot may interleave.
+    let ack = wait_for_ack(&mut ws, "req-301").await;
     assert_eq!(ack["type"], "ack");
-    assert_eq!(ack["msg_id"], "req-301");
     assert_eq!(ack["status"], "success");
 
     timeout(Duration::from_secs(3), async {
@@ -557,7 +559,7 @@ async fn write_zone_bearing_register_stamps_wire_zone() {
                 match cmd {
                     EngineCmd::WriteRegisters(records) => {
                         assert_eq!(records.len(), 1);
-                        let rec = &records[0];
+                        let rec = &records[0].0;
                         assert_eq!(rec.reg.get(), 0x03);
                         assert_eq!(rec.data[0], 2, "zone must be stamped into wire byte 0");
                         assert_eq!(rec.data[1], 0xE4, "payload bytes must be untouched");
@@ -595,7 +597,8 @@ async fn write_non_zone_register_ignores_zone() {
     ws.send(Message::Text(update.to_string().into()))
         .await
         .unwrap();
-    let ack = recv_json(&mut ws).await;
+    // D-17 (design decision #2): benign duplicate snapshot may interleave.
+    let ack = wait_for_ack(&mut ws, "req-302").await;
     assert_eq!(ack["type"], "ack");
     assert_eq!(ack["status"], "success");
 
@@ -608,7 +611,7 @@ async fn write_non_zone_register_ignores_zone() {
             {
                 match cmd {
                     EngineCmd::WriteRegisters(records) => {
-                        let rec = &records[0];
+                        let rec = &records[0].0;
                         assert_eq!(rec.reg.get(), 0x05);
                         assert_eq!(rec.data[0], 0x01, "power byte must not be overwritten");
                         return;
@@ -1534,7 +1537,7 @@ async fn d13_full_typed_write_to_reg09_without_bank_state_succeeds() {
                 match cmd {
                     EngineCmd::WriteRegisters(records) => {
                         assert_eq!(records.len(), 1, "one record per write");
-                        let rec = &records[0];
+                        let rec = &records[0].0;
                         assert_eq!(rec.unit_type, UnitType::AIRCON);
                         assert_eq!(rec.reg.get(), 0x09);
                         assert_eq!(
@@ -1596,7 +1599,7 @@ async fn d13_partial_typed_write_to_reg09_without_bank_state_rejected() {
                 matches!(
                     cmd,
                     EngineCmd::WriteRegisters(records)
-                        if records.iter().any(|rec| rec.reg.get() == 0x09)
+                        if records.iter().any(|(rec, _)| rec.reg.get() == 0x09)
                 )
             });
             drop(spy);
@@ -1649,7 +1652,7 @@ async fn idle_failsafe_powers_off_after_client_disconnect() {
                 match cmd {
                     EngineCmd::WriteRegisters(records) => {
                         assert_eq!(records.len(), 1, "one AIRCON unit in the bank");
-                        let rec = &records[0];
+                        let rec = &records[0].0;
                         assert_eq!(rec.unit_type, UnitType::AIRCON);
                         assert_eq!(rec.unit_id, UnitId::try_new(0x0_ABCDE).unwrap());
                         assert_eq!(rec.reg.get(), 0x05);
@@ -1702,18 +1705,24 @@ async fn silent_bus_write_times_out() {
     .await
     .unwrap();
 
-    // The very next frame must be the timeout ack ("without any other
-    // traffic"); wait_for_ack guards against a close, `timeout` bounds the
-    // window, and the final asserts pin status/reason.
+    // The timeout ack must follow with no silent-bus traffic in between:
+    // D-17 (design decision #2) the session's subscription may deliver a
+    // benign duplicate snapshot / status echo after the connect snapshot, so
+    // those are skipped; any other frame is a failure.
     let ack = timeout(Duration::from_secs(2), async {
-        let msg = recv_json_or_close(&mut ws)
-            .await
-            .expect("closed before write timeout ack");
-        assert_eq!(
-            msg["type"], "ack",
-            "silent bus must not interleave {msg:?} before the timeout ack"
-        );
-        msg
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before write timeout ack");
+            if msg["type"] == "snapshot" || msg["type"] == "status" {
+                continue;
+            }
+            assert_eq!(
+                msg["type"], "ack",
+                "silent bus must not interleave {msg:?} before the timeout ack"
+            );
+            return msg;
+        }
     })
     .await
     .expect("write timeout ack missing");
@@ -1754,14 +1763,22 @@ async fn silent_bus_read_times_out() {
     .unwrap();
 
     let ack = timeout(Duration::from_secs(2), async {
-        let msg = recv_json_or_close(&mut ws)
-            .await
-            .expect("closed before read timeout ack");
-        assert_eq!(
-            msg["type"], "ack",
-            "silent bus must not interleave {msg:?} before the read timeout ack"
-        );
-        msg
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before read timeout ack");
+            // D-17 (design decision #2): a benign duplicate snapshot / status
+            // echo may interleave after the connect snapshot; the silent bus
+            // itself still interleaves nothing.
+            if msg["type"] == "snapshot" || msg["type"] == "status" {
+                continue;
+            }
+            assert_eq!(
+                msg["type"], "ack",
+                "silent bus must not interleave {msg:?} before the read timeout ack"
+            );
+            return msg;
+        }
     })
     .await
     .expect("read timeout ack missing");
@@ -1928,7 +1945,70 @@ async fn mock_backend_crc_failed_getcan_nacks_then_acks() {
         ctrl.wait_written_contains(&ack1).await,
         "ackCAN 1 never hit the wire (polarity not restored)"
     );
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
 
+/// D-17 (issue #57): a typed write carrying a key outside the register's DTO
+/// field table is rejected with the exact contract reason over the wire —
+/// `"unknown field '<name>' for register <xx>"` — while a typed write whose
+/// keys are exactly the DTO's fields still succeeds. The read-only-field
+/// check keeps its precedence over the unknown-field check.
+#[tokio::test]
+async fn unknown_field_typed_write_ack_errors_with_exact_reason() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    // Unknown key on a zone-bearing register: the reg-03 field table is
+    // {open, damper_pct, sensor_type, target_temp_c, measured_temp_c} —
+    // "damperx" (a typo of "damper_pct") must be named exactly in the reason.
+    let update = json!({
+        "type": "write",
+        "msg_id": "req-unknown-1",
+        "register": "03",
+        "zone": 2,
+        "payload": {"damperx": 50}
+    });
+    ws.send(Message::Text(update.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-unknown-1").await;
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["status"], "error", "unknown-field ack: {ack}");
+    assert_eq!(
+        ack["reason"], "unknown field 'damperx' for register 03",
+        "unknown-field ack: {ack}"
+    );
+
+    // DTO-exact payload (full ZoneConfigDto on reg 01 — every key in the DTO
+    // field table, no bank state needed): must still be accepted.
+    let full = json!({
+        "type": "write",
+        "msg_id": "req-unknown-2",
+        "register": "01",
+        "payload": {
+            "header": 0x20,
+            "total_zones": 3,
+            "constant_zones": 1,
+            "constant_zone_ids": [1, 2, 0],
+            "filter_clean_required": false
+        }
+    });
+    ws.send(Message::Text(full.to_string().into()))
+        .await
+        .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-unknown-2").await;
+    assert_eq!(ack["status"], "success", "DTO-exact write ack: {ack}");
+
+    // The connection stays healthy after both paths.
+    ws.send(Message::Text(
+        reg05_write("req-unknown-health").to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let ack = wait_for_ack(&mut ws, "req-unknown-health").await;
+    assert_eq!(ack["status"], "success", "post-unknown write ack: {ack}");
     let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
 }
@@ -2055,6 +2135,204 @@ async fn steady_getcan_nack_resends_written_frame_once() {
         second_ack.is_err(),
         "resend must not raise a second WriteFlushed: {second_ack:?}"
     );
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-17: a stalled client whose broadcast receiver overflows (>32 buffered
+/// events, tokio broadcast capacity) is disconnected by the daemon
+/// (disconnect-on-lag — no catch-up), and a fresh connection then receives a
+/// full snapshot (client reconnect is the recovery path).
+///
+/// Stalling mechanism: the client connects with a tiny TCP receive window
+/// (`SO_RCVBUF` set before connect) and stops reading. The session blocks
+/// pushing wire frames into the full window, so its broadcast receiver is not
+/// drained while the engine keeps flushing and broadcasting — 150 writes
+/// (each → `WriteFlushed` ack + echoed event) and 250 reads (each → resolved
+/// `RegisterRead` frame) overflow the 32-slot buffer. The client is alive and
+/// the link is up, so the session ending can only be the lag path.
+#[tokio::test]
+async fn lagged_session_disconnects_and_reconnect_gets_snapshot() {
+    let handle = spawn_daemon().await;
+    let addr = handle.local_addr();
+
+    // Stall-capable client: tiny `SO_RCVBUF` (the kernel doubles it), never
+    // read again after the connect snapshot.
+    let url = format!("ws://{addr}/v1/mailbox-stream");
+    let socket = tokio::net::TcpSocket::new_v4().expect("tcp socket");
+    socket.set_recv_buffer_size(512).expect("set SO_RCVBUF");
+    let stream = socket.connect(addr).await.expect("connect");
+    let stream = tokio_tungstenite::MaybeTlsStream::Plain(stream);
+    let (mut stalled, _) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async(&url, stream),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("ws upgrade");
+    let _ = wait_for_type(&mut stalled, "snapshot").await;
+
+    // Burst while the client does not read: writes (ack + echoed event each)
+    // and reads (a resolved read_result each) keep the engine flushing and
+    // broadcasting; the session cannot keep up once its socket window fills.
+    for i in 0..150 {
+        stalled
+            .send(Message::Text(
+                reg05_write(&format!("lag-w{i:03}")).to_string().into(),
+            ))
+            .await
+            .unwrap();
+    }
+    for i in 0..250 {
+        stalled
+            .send(Message::Text(
+                reg_read(&format!("lag-r{i:03}"), "05").to_string().into(),
+            ))
+            .await
+            .unwrap();
+    }
+    // Let the session block on its full receive window while the engine
+    // produces the burst's broadcasts (reads resolve over ~1-2 flush cycles).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Resume reading: the buffered frames drain, then the session's first
+    // recv hits Lagged(n) → the session ends (close / EOF) while the client
+    // is alive and the link is up.
+    let ended = timeout(Duration::from_secs(8), async {
+        loop {
+            match stalled.next().await {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("lagged session did not end within 8s");
+    assert!(ended, "stalled session must be disconnected by the daemon");
+
+    // Reconnect: a fresh session receives a full snapshot (07/reg-05 and
+    // 08/reg-06 units from the mock dump).
+    let mut ws = connect_ws(addr).await;
+    let snap = wait_for_type(&mut ws, "snapshot").await;
+    let reg05 = &snap["units"]["07:abcde"]["05"];
+    assert!(
+        reg05.is_object(),
+        "reg 05 missing from reconnect snapshot: {snap}"
+    );
+    assert_eq!(reg05["power"], "on");
+    let reg06 = &snap["units"]["08:abcde"]["06"];
+    assert!(
+        reg06.is_object(),
+        "reg 06 missing from reconnect snapshot: {snap}"
+    );
+    assert_eq!(reg06["fw_major"], 0);
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-17: ack-ordering wire guard — every success ack is emitted from its own
+/// write's TX/flush cycle (frame-attested), and the write's event echo (the
+/// wire-visible proof the frame reached the bus) strictly follows that ack.
+/// Write A is sent and acked first; write B is sent only after A's ack. The
+/// per-write ack-before-own-echo invariants are asserted on a frame-sequence
+/// log, and each echo is attributable to its own write by its bytes (A = power
+/// on, B = power off). The deterministic window-closure proof (a write queued
+/// after a flush's drain is not acked by that flush) lives in the ws.rs /
+/// aa-engine unit tests; this is the end-to-end regression guard.
+#[tokio::test]
+async fn success_ack_precedes_own_write_echo_in_wire_order() {
+    let handle = spawn_daemon().await;
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    let write_a = json!({
+        "type": "write",
+        "msg_id": "req-ord-a",
+        "register": "05",
+        "payload": "0101032e000100"
+    });
+    ws.send(Message::Text(write_a.to_string().into()))
+        .await
+        .unwrap();
+    // The ack is emitted with A's frame TX (WriteFlushed) and always precedes
+    // A's echo (the echo requires the feeder's getCAN round-trip).
+    let ack_a = wait_for_ack(&mut ws, "req-ord-a").await;
+    assert_eq!(ack_a["status"], "success", "write A ack: {ack_a}");
+
+    // B is queued only after A's ack — after A's frame drained, so B rides
+    // its own flush cycle.
+    let write_b = json!({
+        "type": "write",
+        "msg_id": "req-ord-b",
+        "register": "05",
+        "payload": "00010330000100"
+    });
+    ws.send(Message::Text(write_b.to_string().into()))
+        .await
+        .unwrap();
+
+    // Record the remaining frames in order: A's echo, B's ack, B's echo (the
+    // two echoes may batch into one getCAN reply, so ev_a may follow ack_b).
+    let mut ev_a = None;
+    let mut ack_b = None;
+    let mut ev_b = None;
+    let mut seq: Vec<&str> = Vec::new();
+    timeout(Duration::from_secs(6), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before ordering frames");
+            let label = match (
+                msg["type"].as_str(),
+                msg["msg_id"].as_str(),
+                msg["register"].as_str(),
+            ) {
+                (Some("event"), _, Some("05")) if ev_a.is_none() => {
+                    ev_a = Some(msg.clone());
+                    "ev_a"
+                }
+                (Some("event"), _, Some("05")) if ev_b.is_none() => {
+                    ev_b = Some(msg.clone());
+                    "ev_b"
+                }
+                (Some("ack"), Some("req-ord-b"), _) if msg["status"] == "success" => {
+                    ack_b = Some(msg.clone());
+                    "ack_b"
+                }
+                (Some("ack"), Some("req-ord-b"), _) => {
+                    panic!("write B acked non-success: {msg}")
+                }
+                _ => "other",
+            };
+            seq.push(label);
+            if ev_a.is_some() && ack_b.is_some() && ev_b.is_some() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("ordering frames timeout");
+
+    let pos = |label: &str| {
+        seq.iter()
+            .position(|entry| *entry == label)
+            .unwrap_or_else(|| panic!("{label} missing from sequence: {seq:?}"))
+    };
+    assert!(
+        pos("ack_b") < pos("ev_b"),
+        "ack B must precede its own echo: {seq:?}"
+    );
+    assert!(
+        pos("ev_a") < pos("ev_b"),
+        "A's echo must precede B's echo (echo FIFO): {seq:?}"
+    );
+
+    // Each echo is its own write's bytes: A = power on, B = power off.
+    let ev_a = ev_a.expect("ev_a");
+    let ev_b = ev_b.expect("ev_b");
+    assert_eq!(ev_a["payload"]["power"], "on", "A's echo: {ev_a}");
+    assert_eq!(ev_b["payload"]["power"], "off", "B's echo: {ev_b}");
 
     let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
@@ -2136,7 +2414,8 @@ async fn keepalive_evicts_never_ponging_client_and_releases_count() {
                 match cmd {
                     EngineCmd::WriteRegisters(records) => {
                         assert_eq!(records.len(), 1, "one AIRCON unit in the bank");
-                        let rec = &records[0];
+                        let (rec, msg_id) = &records[0];
+                        assert!(msg_id.is_none(), "internal failsafe write");
                         assert_eq!(rec.unit_type, UnitType::AIRCON);
                         assert_eq!(rec.unit_id, UnitId::try_new(0x0_ABCDE).unwrap());
                         assert_eq!(rec.reg.get(), 0x05);

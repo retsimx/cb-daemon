@@ -36,7 +36,7 @@ enum NackResend {
 pub(crate) struct Session {
     state: State,
     bank: RegisterBank,
-    write_queue: Vec<CanRecord>,
+    write_queue: Vec<(CanRecord, Option<String>)>,
     /// Reads awaiting resolution by their flush's `getCAN` (see [`PendingRead`]).
     pending_reads: Vec<PendingRead>,
     ack_armed: bool,
@@ -49,9 +49,10 @@ pub(crate) struct Session {
     /// NACKs on the dirty-reset setCAN; bounded so an uncooperative CB cannot
     /// livelock the dump (mirrors aaservice's ≤3 CAN retries).
     reset_nacks: u8,
-    /// Set when `steady_tx` drained the write queue; consumed by the runner to
-    /// emit [`EngineEvent::WriteFlushed`] after the frame is transmitted.
-    write_flushed: bool,
+    /// Client `msg_id`s confirmed when `steady_tx` drained the write queue;
+    /// consumed by the runner to emit [`EngineEvent::WriteFlushed`] after the
+    /// frame is transmitted.
+    write_flushed: Vec<String>,
     /// Last complete non-Ping frame's CRC outcome (OEM `f4170w`): valid frames
     /// set 1, CRC-failed frames set 0; feeds the outbound `ackCAN 0|1` polarity.
     crc_ok: bool,
@@ -92,7 +93,7 @@ impl Session {
             dump_needs_resend: false,
             dirty_reset_sent: false,
             reset_nacks: 0,
-            write_flushed: false,
+            write_flushed: Vec::new(),
             crc_ok: true,
             can_in_use: false,
             last_set_can: None,
@@ -107,10 +108,10 @@ impl Session {
         self.shutdown
     }
 
-    /// Consume the write-flushed flag (set when `steady_tx` drained the write
-    /// queue); the runner emits [`EngineEvent::WriteFlushed`] after TX.
+    /// Consume the `msg_id`s of writes drained by the last `steady_tx`; the
+    /// runner emits [`EngineEvent::WriteFlushed`] after TX.
     #[must_use]
-    pub(crate) fn take_write_flushed(&mut self) -> bool {
+    pub(crate) fn take_write_flushed(&mut self) -> Vec<String> {
         std::mem::take(&mut self.write_flushed)
     }
 
@@ -148,14 +149,14 @@ impl Session {
                     reg: RegId::new(0x06),
                     data: [0; 7],
                 };
-                let already_queued = self.write_queue.iter().any(|queued| {
+                let already_queued = self.write_queue.iter().any(|(queued, _)| {
                     queued.unit_type == flush.unit_type
                         && queued.unit_id == flush.unit_id
                         && queued.reg == flush.reg
                         && queued.data == flush.data
                 });
                 if !already_queued {
-                    self.write_queue.push(flush);
+                    self.write_queue.push((flush, None));
                 }
                 self.pending_reads.push(PendingRead {
                     unit_type,
@@ -290,8 +291,9 @@ impl Session {
             });
         }
         if !self.write_queue.is_empty() {
-            let records = std::mem::take(&mut self.write_queue);
-            self.write_flushed = true;
+            let queued = std::mem::take(&mut self.write_queue);
+            self.write_flushed
+                .extend(queued.iter().filter_map(|(_, msg_id)| msg_id.clone()));
             // The queued flush (and any other writes) is now on the bus: only a
             // getCAN arriving after this TX may resolve the pending reads. The
             // ack branch above must never arm reads (a pure ack TX drains
@@ -299,6 +301,7 @@ impl Session {
             for pending in &mut self.pending_reads {
                 pending.flush_sent = true;
             }
+            let records: Vec<CanRecord> = queued.into_iter().map(|(record, _)| record).collect();
             let payload = build_set_can(&records);
             // Fresh generation = fresh resend entitlement: byte-exact copy is
             // the NACK resend target until the next write-queue drain.
@@ -349,7 +352,7 @@ impl Session {
                         // JZ18 handshake (aa_interop §7.3): every reg-06 announcement gets
                         // an all-zero reg-07 reply echoing unit type + id.
                         self.write_queue
-                            .push(build_jz18(record.unit_type, record.unit_id));
+                            .push((build_jz18(record.unit_type, record.unit_id), None));
                     }
                 }
                 // Early getCAN before dump TX (dirty-reset response): ack it and
@@ -429,7 +432,7 @@ impl Session {
                         // JZ18 handshake (aa_interop §7.3): every reg-06 announcement gets
                         // an all-zero reg-07 reply echoing unit type + id.
                         self.write_queue
-                            .push(build_jz18(record.unit_type, record.unit_id));
+                            .push((build_jz18(record.unit_type, record.unit_id), None));
                     }
                 }
                 self.ack_armed = true;
@@ -502,13 +505,16 @@ impl Session {
         {
             return;
         }
-        self.write_queue.push(CanRecord {
-            unit_type: UnitType::AIRCON,
-            dest: Dest::ControlBox,
-            unit_id: unit,
-            reg: RegId::new(0x06),
-            data: [0; 7],
-        });
+        self.write_queue.push((
+            CanRecord {
+                unit_type: UnitType::AIRCON,
+                dest: Dest::ControlBox,
+                unit_id: unit,
+                reg: RegId::new(0x06),
+                data: [0; 7],
+            },
+            None,
+        ));
     }
 }
 
@@ -855,7 +861,7 @@ mod tests {
 
         // Write TX: capture the exact payload the resend must match.
         let rec = control_box_write([0x42; 7]);
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec.clone()]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(rec.clone(), None)]));
         let tx = s.on_ping().unwrap();
         assert_eq!(tx, build_set_can(std::slice::from_ref(&rec)));
         assert!(!s.ack_armed);
@@ -936,7 +942,7 @@ mod tests {
 
         // Generation A: write → NACK → ack → resend A byte-identically.
         let a = control_box_write([0x11; 7]);
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![a.clone()]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(a.clone(), None)]));
         let tx_a = s.on_ping().unwrap();
         assert_eq!(tx_a, build_set_can(std::slice::from_ref(&a)));
         assert_eq!(s.nack_resend, NackResend::Idle, "fresh generation");
@@ -949,7 +955,7 @@ mod tests {
 
         // Generation B: a new write refreshes the buffer and the entitlement.
         let b = control_box_write([0x22; 7]);
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![b.clone()]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(b.clone(), None)]));
         let tx_b = s.on_ping().unwrap();
         assert_eq!(tx_b, build_set_can(std::slice::from_ref(&b)));
         assert_ne!(tx_b, tx_a, "distinct write, distinct payload");
@@ -982,7 +988,7 @@ mod tests {
 
         // Buffer a write so the resend target is byte-checkable.
         let rec = control_box_write([0x33; 7]);
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec.clone()]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(rec.clone(), None)]));
         let tx = s.on_ping().unwrap();
         assert_eq!(tx, build_set_can(std::slice::from_ref(&rec)));
 
@@ -1024,15 +1030,18 @@ mod tests {
         );
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
         assert!(
-            s.take_write_flushed(),
-            "JZ18 drain raised it; consume like the runner"
+            s.take_write_flushed().is_empty(),
+            "JZ18 drain carries no client ids; consume like the runner"
         );
 
         // Original write TX raises the flag; the runner consumes it.
         let rec = control_box_write([0x44; 7]);
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(rec, None)]));
         let tx = s.on_ping().unwrap();
-        assert!(s.take_write_flushed(), "write TX must raise write_flushed");
+        assert!(
+            s.take_write_flushed().is_empty(),
+            "None-id write TX carries no client ids; consume like the runner"
+        );
 
         // NACK → ack → resend: the resend is a buffer clone, not a queue drain.
         let _ = s.on_frame(b"getCAN 0");
@@ -1043,7 +1052,7 @@ mod tests {
             "resend must be the buffered write"
         );
         assert!(
-            !s.take_write_flushed(),
+            s.take_write_flushed().is_empty(),
             "resend TX must not re-raise write_flushed"
         );
     }
@@ -1114,12 +1123,12 @@ mod tests {
             reg: RegId::new(0x06),
             data: [0; 7],
         };
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec.clone()]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(rec.clone(), None)]));
         let tx = s.on_ping().unwrap();
         assert_eq!(tx, build_set_can(std::slice::from_ref(&rec)));
 
         let _ = s.on_frame(&get_can_payload(&[sample_record()]));
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(rec, None)]));
         assert_eq!(s.on_ping().unwrap(), ACK_CAN);
         let tx = s.on_ping().unwrap();
         assert!(tx.starts_with(b"setCAN "));
@@ -1135,7 +1144,7 @@ mod tests {
         let rec = sample_record();
         let mut write = rec.clone();
         write.dest = Dest::ControlBox;
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![write]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(write, None)]));
         let _ = s.on_ping(); // setCAN write
         let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
         assert!(matches!(
@@ -1181,7 +1190,7 @@ mod tests {
 
         // Write TX: capture the payload that must never ride the bus again.
         let rec = control_box_write([0x42; 7]);
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec.clone()]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(rec.clone(), None)]));
         let stale_tx = s.on_ping().unwrap();
         assert_eq!(stale_tx, build_set_can(std::slice::from_ref(&rec)));
 
@@ -1352,11 +1361,56 @@ mod tests {
             reg: RegId::new(0x06),
             data: [0; 7],
         };
-        s.apply_cmd(EngineCmd::WriteRegisters(vec![flush.clone()]));
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![(flush.clone(), None)]));
         let tx = s.on_ping().unwrap();
         assert_eq!(tx, build_set_can(std::slice::from_ref(&flush)));
         // No phantom JZ18 for the outbound write: next is empty poll.
         assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+    }
+
+    #[test]
+    fn steady_tx_collects_drained_msg_ids_in_order() {
+        // The msg_ids of the writes drained into a frame ride `take_write_flushed`
+        // in queue order; internal `None`-id writes contribute nothing.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert!(
+            s.take_write_flushed().is_empty(),
+            "internal writes (JZ18) must not produce msg_ids"
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+        assert!(s.take_write_flushed().is_empty());
+
+        let rec = CanRecord {
+            unit_type: UnitType::new(0x07),
+            dest: Dest::ControlBox,
+            unit_id: UnitId::try_new(0).unwrap(),
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![
+            (rec.clone(), Some("a".into())),
+            (rec.clone(), Some("b".into())),
+            (rec.clone(), None),
+        ]));
+        let tx = s.on_ping().unwrap();
+        assert_eq!(tx, build_set_can(&[rec.clone(), rec.clone(), rec]));
+        assert_eq!(
+            s.take_write_flushed(),
+            vec!["a".to_string(), "b".to_string()],
+            "msg_ids must be drained in queue order; None writes add nothing"
+        );
+        assert!(
+            s.take_write_flushed().is_empty(),
+            "take_write_flushed must consume the accumulated ids"
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+        assert!(s.take_write_flushed().is_empty());
     }
 
     /// Drain steady-state JZ18/empty polls until the write queue is empty.
@@ -1407,7 +1461,7 @@ mod tests {
         });
         let expected_flush = read_flush(target.unit_type, target.unit_id);
         assert_eq!(s.write_queue.len(), 1, "identical reads must share a flush");
-        let queued = s.write_queue[0].clone();
+        let queued = s.write_queue[0].0.clone();
         assert_eq!(queued.unit_type, expected_flush.unit_type);
         assert_eq!(queued.dest, Dest::ControlBox);
         assert_eq!(queued.unit_id, expected_flush.unit_id);
