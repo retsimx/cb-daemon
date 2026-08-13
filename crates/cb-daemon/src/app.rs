@@ -279,6 +279,27 @@ impl MockLinkCtrl {
         let _ = closed;
         self.notify.notify_one();
     }
+
+    /// Wait (up to 5s) until the mock link's written bytes contain `needle`
+    /// (usually a full encoded frame). Non-destructive: the feeder's steady
+    /// loop drains the capture between polls, so callers should wait for
+    /// frames the feeder holds briefly (ack batches) or that predate the
+    /// next drain.
+    pub async fn wait_written_contains(&self, needle: &[u8]) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let guard = self.mock.lock().await;
+                    if guard.written().windows(needle.len()).any(|w| w == needle) {
+                        return true;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
 }
 
 async fn spawn_mock_inner(bind: SocketAddr, with_feeder: bool) -> anyhow::Result<AppHandle> {

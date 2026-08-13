@@ -94,6 +94,41 @@ impl Frame {
     }
 }
 
+/// A frame rejected for a CRC mismatch between its trailer and payload.
+///
+/// Surfaced by [`FrameScanner::push`] as a [`ScanItem::CrcFailure`] at the
+/// frame's wire position so callers can mirror per-frame `ackCAN 0|1`
+/// polarity processing without silently dropping the failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrcFailure {
+    /// CRC value parsed from the frame trailer.
+    pub expected: u8,
+    /// CRC computed over the payload bytes.
+    pub actual: u8,
+    /// Payload of the rejected frame (lets the engine decide the
+    /// `ackCAN 0|1` polarity, USB parity).
+    pub payload: Vec<u8>,
+}
+
+/// One item produced by scanning a chunk: a complete frame or a CRC failure.
+///
+/// Items appear in the order the frames appeared on the wire, so interleaved
+/// good/bad bursts can be processed sequentially exactly like the OEM does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanItem {
+    /// A well-formed frame whose trailer CRC matched the payload.
+    Frame(Frame),
+    /// A frame whose trailer CRC did not match the payload.
+    CrcFailure(CrcFailure),
+}
+
+/// Ordered result of a [`FrameScanner::push`] call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanOutput {
+    /// Items in the order the frames appeared in the scanned chunk.
+    pub items: Vec<ScanItem>,
+}
+
 /// Incremental scanner that reassembles frames across partial `push` chunks.
 ///
 /// Incomplete trailing bytes are retained in an internal buffer with **no size
@@ -115,25 +150,32 @@ impl FrameScanner {
 
     /// Append `chunk` and extract every complete frame available.
     ///
+    /// Results are returned in wire order as [`ScanItem`]s: complete
+    /// well-formed frames become [`ScanItem::Frame`], and frames whose
+    /// trailer CRC does not match the payload become [`ScanItem::CrcFailure`]
+    /// at the same wire position (the engine needs both, in order, to mirror
+    /// the OEM's per-frame `ackCAN 0|1` polarity).
+    ///
     /// Incomplete trailing data stays buffered (unbounded — see type docs).
     /// Leading/trailing spaces between frames are accepted. Soft incompleteness
-    /// yields an empty (or partial) `Ok` list rather than [`FrameError::Incomplete`].
+    /// yields an empty (or partial) item list rather than [`FrameError::Incomplete`].
     ///
-    /// On [`FrameError::Malformed`] / [`FrameError::InvalidCrc`], the scanner
-    /// **resyncs** to the next `<U>` (or keeps a short partial-prefix tail) and
-    /// continues — it does not wedge on leading AOA/bus garbage. Those errors
-    /// are returned only when no frames were extracted **and** resync discarded
-    /// bytes with no subsequent `<U>` in this push (caller may log a warn).
+    /// On [`FrameError::Malformed`], the scanner **resyncs** to the next `<U>`
+    /// (or keeps a short partial-prefix tail) and continues — it does not
+    /// wedge on leading AOA/bus garbage. That error is returned only when no
+    /// frames and no CRC failures were extracted **and** resync discarded
+    /// bytes with no subsequent `<U>` in this push (pure-noise chunk; caller
+    /// may log a warn).
     ///
     /// # Errors
     ///
-    /// May return [`FrameError::InvalidCrc`] or [`FrameError::Malformed`] when
-    /// a push discarded noise and produced no frames (resync with no recovery
+    /// May return [`FrameError::Malformed`] when a push discarded noise and
+    /// produced neither frames nor CRC failures (resync with no recovery
     /// target yet). Incomplete data alone is never an error from `push`.
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Frame>, FrameError> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<ScanOutput, FrameError> {
         self.buf.extend_from_slice(chunk);
 
-        let mut frames = Vec::new();
+        let mut items = Vec::new();
         let mut last_resync_err: Option<FrameError> = None;
         loop {
             // Drop pure leading spaces so an idle trailing gap does not grow forever.
@@ -149,10 +191,34 @@ impl FrameScanner {
             match Frame::decode_one(&self.buf) {
                 Ok((frame, consumed)) => {
                     self.buf.drain(..consumed);
-                    frames.push(frame);
+                    items.push(ScanItem::Frame(frame));
                     last_resync_err = None;
                 }
                 Err(FrameError::Incomplete) => break,
+                Err(FrameError::InvalidCrc {
+                    expected,
+                    actual,
+                    payload,
+                }) => {
+                    // Surface the failure at its wire position, then resync
+                    // past the rejected frame and hunt for the next PREFIX.
+                    items.push(ScanItem::CrcFailure(CrcFailure {
+                        expected,
+                        actual,
+                        payload,
+                    }));
+                    if let Some(rel) = find_slice(&self.buf[1..], PREFIX) {
+                        self.buf.drain(..=rel);
+                        last_resync_err = None;
+                    } else {
+                        let keep = PREFIX.len().saturating_sub(1).min(self.buf.len());
+                        let drop = self.buf.len() - keep;
+                        if drop > 0 {
+                            self.buf.drain(..drop);
+                        }
+                        break;
+                    }
+                }
                 Err(e) => {
                     // Skip current byte / bad frame start and hunt for the next PREFIX.
                     // Keeping a short tail preserves a split `<U` across chunks.
@@ -171,12 +237,12 @@ impl FrameScanner {
                 }
             }
         }
-        if frames.is_empty()
+        if items.is_empty()
             && let Some(err) = last_resync_err
         {
             return Err(err);
         }
-        Ok(frames)
+        Ok(ScanOutput { items })
     }
 }
 
@@ -224,6 +290,17 @@ const fn hex_nibble(b: u8) -> Result<u8, FrameError> {
 mod tests {
     use super::*;
 
+    /// Payloads of every `Frame` item, in wire order (CRC failures skipped).
+    fn frame_payloads(out: &ScanOutput) -> Vec<Vec<u8>> {
+        out.items
+            .iter()
+            .filter_map(|item| match item {
+                ScanItem::Frame(frame) => Some(frame.payload.clone()),
+                ScanItem::CrcFailure(_) => None,
+            })
+            .collect()
+    }
+
     fn round_trip(payload: &[u8]) {
         let frame = Frame {
             payload: payload.to_vec(),
@@ -269,13 +346,13 @@ mod tests {
     fn scanner_splits_multiple_frames() {
         let mut scanner = FrameScanner::new();
         let burst = b"<U>Ping</U=db> <U>setCAN </U=b2> <U>ackCAN 1</U=aa>";
-        let frames = scanner.push(burst).unwrap();
+        let frames = frame_payloads(&scanner.push(burst).unwrap());
         assert_eq!(frames.len(), 3);
-        assert_eq!(frames[0].payload, b"Ping");
-        assert_eq!(frames[1].payload, b"setCAN ");
-        assert_eq!(frames[2].payload, b"ackCAN 1");
+        assert_eq!(frames[0], b"Ping");
+        assert_eq!(frames[1], b"setCAN ");
+        assert_eq!(frames[2], b"ackCAN 1");
         // Trailing gap consumed; further push of empty yields nothing.
-        assert!(scanner.push(&[]).unwrap().is_empty());
+        assert!(scanner.push(&[]).unwrap().items.is_empty());
     }
 
     #[test]
@@ -285,11 +362,12 @@ mod tests {
         let mid = full.len() / 2;
 
         let first = scanner.push(&full[..mid]).unwrap();
-        assert!(first.is_empty());
+        assert!(first.items.is_empty());
 
         let second = scanner.push(&full[mid..]).unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].payload, b"Ping");
+        let frames = frame_payloads(&second);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], b"Ping");
     }
 
     #[test]
@@ -304,7 +382,7 @@ mod tests {
     fn scanner_incomplete_returns_empty() {
         let mut scanner = FrameScanner::new();
         let out = scanner.push(b"<U>Pi").unwrap();
-        assert!(out.is_empty());
+        assert!(out.items.is_empty());
     }
 
     #[test]
@@ -344,9 +422,9 @@ mod tests {
         let ping = b"<U>Ping</U=db>";
         let mut burst = noise.to_vec();
         burst.extend_from_slice(ping);
-        let frames = scanner.push(&burst).expect("resync should yield ping");
+        let frames = frame_payloads(&scanner.push(&burst).expect("resync should yield ping"));
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].payload, b"Ping");
+        assert_eq!(frames[0], b"Ping");
     }
 
     #[test]
@@ -354,9 +432,17 @@ mod tests {
         // Regression: bad CRC must consume the bad frame and continue, not wedge.
         let mut scanner = FrameScanner::new();
         let burst = b"<U>Ping</U=00><U>Ping</U=db>";
-        let frames = scanner.push(burst).expect("bad crc should not wedge");
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].payload, b"Ping");
+        let out = scanner.push(burst).expect("bad crc should not wedge");
+        assert_eq!(out.items.len(), 2);
+        assert!(matches!(out.items[0], ScanItem::CrcFailure(_)));
+        match &out.items[1] {
+            ScanItem::Frame(frame) => assert_eq!(frame.payload, b"Ping"),
+            ScanItem::CrcFailure(failure) => {
+                panic!("expected good Frame after bad CRC, got CrcFailure {failure:?}")
+            }
+        }
+        // The scanner is not wedged: a following push is quiet.
+        assert!(scanner.push(&[]).unwrap().items.is_empty());
     }
 
     #[test]
@@ -382,13 +468,13 @@ mod tests {
         let mut got = Vec::new();
         for start in (0..encoded.len()).step_by(chunk) {
             let end = (start + chunk).min(encoded.len());
-            let frames = scanner
+            let out = scanner
                 .push(&encoded[start..end])
                 .expect("chunked large getCAN must not Malformed");
-            got.extend(frames);
+            got.extend(frame_payloads(&out));
         }
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].payload, records.as_bytes());
+        assert_eq!(got[0], records.as_bytes());
     }
 
     #[test]
@@ -399,6 +485,72 @@ mod tests {
             .expect_err("noise with no <U> should surface");
         assert_eq!(err, FrameError::Malformed);
         // Buffer kept a short prefix tail; further empty push is quiet.
-        assert!(scanner.push(&[]).unwrap().is_empty());
+        assert!(scanner.push(&[]).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn scanner_surfaces_crc_failure_after_good_frame_in_wire_order() {
+        // Mixed burst: good frame first, CRC-bad frame second. Both must be
+        // reported in wire order — the good frame as a Frame, the bad one as
+        // a CrcFailure at its exact position.
+        let mut scanner = FrameScanner::new();
+        let burst = b"<U>Ping</U=db> <U>Ping</U=00>";
+        let out = scanner.push(burst).unwrap();
+        assert_eq!(out.items.len(), 2);
+        match &out.items[0] {
+            ScanItem::Frame(frame) => assert_eq!(frame.payload, b"Ping"),
+            ScanItem::CrcFailure(failure) => {
+                panic!("expected Frame first, got CrcFailure {failure:?}")
+            }
+        }
+        match &out.items[1] {
+            ScanItem::CrcFailure(failure) => {
+                assert_eq!(failure.expected, 0x00);
+                assert_eq!(failure.actual, 0xdb);
+                assert_eq!(failure.payload, b"Ping");
+            }
+            ScanItem::Frame(frame) => {
+                panic!("expected CrcFailure second, got Frame {frame:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn scanner_pure_bad_crc_returns_ok_with_crc_failure() {
+        // A lone bad-CRC frame must be surfaced as Ok(CrcFailure), never
+        // Err(InvalidCrc) — the engine needs the failure to arm ackCAN 0.
+        let mut scanner = FrameScanner::new();
+        let out = scanner
+            .push(b"<U>Ping</U=00>")
+            .expect("bad-CRC-only chunk must not error");
+        assert_eq!(out.items.len(), 1);
+        match &out.items[0] {
+            ScanItem::CrcFailure(failure) => {
+                assert_eq!(failure.expected, 0x00);
+                assert_eq!(failure.actual, 0xdb);
+                assert_eq!(failure.payload, b"Ping");
+            }
+            ScanItem::Frame(frame) => {
+                panic!("expected CrcFailure, got Frame {frame:?}")
+            }
+        }
+        // The rejected frame is consumed; nothing is left to resync into an error.
+        assert!(scanner.push(&[]).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn scanner_preserves_order_across_good_bad_good() {
+        let mut scanner = FrameScanner::new();
+        let burst = b"<U>Ping</U=db> <U>Ping</U=00> <U>Ping</U=db>";
+        let out = scanner.push(burst).unwrap();
+        let kinds: Vec<&str> = out
+            .items
+            .iter()
+            .map(|item| match item {
+                ScanItem::Frame(_) => "frame",
+                ScanItem::CrcFailure(_) => "crc",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["frame", "crc", "frame"]);
     }
 }
