@@ -99,7 +99,7 @@ fn reg05_system_status_round_trip() {
             "fan": "high",
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         }),
         [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
@@ -283,7 +283,7 @@ fn raw_hex_reg05_acceptance_criterion() {
             "fan": "high",
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         })
     );
@@ -370,7 +370,7 @@ fn enum_mode_bytes() {
             "fan": "auto",
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         });
         let bytes = encode_payload(RegId::new(0x05), &payload).unwrap();
@@ -397,7 +397,7 @@ fn enum_fan_bytes() {
             "fan": wire,
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         });
         let bytes = encode_payload(RegId::new(0x05), &payload).unwrap();
@@ -417,7 +417,7 @@ fn enum_power_bytes() {
             "fan": "auto",
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         });
         let bytes = encode_payload(RegId::new(0x05), &payload).unwrap();
@@ -626,7 +626,7 @@ fn golden_write_omitted_addressing() {
             "fan": "high",
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         }),
     };
@@ -636,7 +636,7 @@ fn golden_write_omitted_addressing() {
     assert!(v.get("unit_id").is_none());
     assert!(v.get("zone").is_none());
     let expected: Value = serde_json::from_str(
-        r#"{"type":"write","msg_id":"req-1","register":"05","payload":{"power":"on","mode":"cool","fan":"high","target_temp_c":24.0,"myzone_id":0,"fresh_air":false,"rf_sys_id":0}}"#,
+        r#"{"type":"write","msg_id":"req-1","register":"05","payload":{"power":"on","mode":"cool","fan":"high","target_temp_c":24.0,"myzone_id":0,"fresh_air":"off","rf_sys_id":0}}"#,
     )
     .unwrap();
     assert_eq!(v, expected);
@@ -788,7 +788,7 @@ fn golden_event_message() {
             "fan": "high",
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         }),
     };
@@ -796,7 +796,7 @@ fn golden_event_message() {
     assert_eq!(v["type"], "event");
     assert!(v.get("zone").is_none());
     let expected: Value = serde_json::from_str(
-        r#"{"type":"event","unit_type":"07","unit_id":"11111","register":"05","payload":{"power":"on","mode":"cool","fan":"high","target_temp_c":24.0,"myzone_id":0,"fresh_air":false,"rf_sys_id":0}}"#,
+        r#"{"type":"event","unit_type":"07","unit_id":"11111","register":"05","payload":{"power":"on","mode":"cool","fan":"high","target_temp_c":24.0,"myzone_id":0,"fresh_air":"off","rf_sys_id":0}}"#,
     )
     .unwrap();
     assert_eq!(v, expected);
@@ -1041,7 +1041,7 @@ fn write_with_zone_deserializes_zone() {
 
 #[test]
 fn write_without_zone_deserializes_none() {
-    let raw = r#"{"type":"write","msg_id":"req-1","register":"05","payload":{"power":"on","mode":"cool","fan":"high","target_temp_c":24.0,"myzone_id":0,"fresh_air":false,"rf_sys_id":0}}"#;
+    let raw = r#"{"type":"write","msg_id":"req-1","register":"05","payload":{"power":"on","mode":"cool","fan":"high","target_temp_c":24.0,"myzone_id":0,"fresh_air":"off","rf_sys_id":0}}"#;
     let msg: ClientMessage = serde_json::from_str(raw).unwrap();
     let ClientMessage::Write { register, zone, .. } = &msg else {
         panic!("expected write");
@@ -1093,7 +1093,7 @@ fn snapshot_units_decodes_dtos_and_nested_zones() {
             "fan": "high",
             "target_temp_c": 24.0,
             "myzone_id": 0,
-            "fresh_air": false,
+            "fresh_air": "off",
             "rf_sys_id": 0,
         })
     );

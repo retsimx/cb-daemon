@@ -51,10 +51,11 @@
 //!   [`aa_registers::Action`] enum).
 //! - Reg `12` pairing: bit 6 (`0x40`) of byte 3 (the read shape's info byte);
 //!   any byte with bit 6 unset decodes to `pairing: false`.
-//! - Reg `05` `fresh_air`: DTO `true` → `FreshAir::On` (`0x02`), `false` →
-//!   `FreshAir::Off` (`0x01`). Decode maps `On` → `true` and `Off`/`None`
-//!   (`0x00`, "no fresh-air hardware") → `false` — `None` cannot be represented
-//!   in the bool DTO and is conflated with `Off` (matches the legacy mapper).
+//! - Reg `05` `fresh_air`: DTO `"none"` → `FreshAir::None` (`0x00`),
+//!   `"off"` → `FreshAir::Off` (`0x01`), `"on"` → `FreshAir::On` (`0x02`).
+//!   `None` (no fresh-air hardware) is preserved across the round trip — it
+//!   must not be conflated with `Off`, or a client write re-encodes `0x00` as
+//!   `0x01` and the `MyAir5` UI shows a switch for hardware that lacks it.
 //!
 //! # Reg `12` read vs write shape
 //!

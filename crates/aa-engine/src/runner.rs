@@ -3,7 +3,7 @@
 use aa_frame::{Frame, FrameScanner};
 use aa_link::Link;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::event::{EngineCmd, EngineEvent, SessionState};
 use crate::session::Session;
@@ -166,7 +166,7 @@ impl<L: Link> CbEngine<L> {
             if let Some(payload) = session.on_ping() {
                 let was_write = session.take_write_flushed();
                 let encoded = Frame { payload }.encode();
-                debug!(frame = %String::from_utf8_lossy(&encoded), "engine TX");
+                trace!(frame = %String::from_utf8_lossy(&encoded), "engine TX");
                 if let Err(err) = self.link.write_all(&encoded).await {
                     let _ = ev_tx
                         .send(EngineEvent::SessionState(SessionState::LinkDown))
@@ -184,7 +184,7 @@ impl<L: Link> CbEngine<L> {
             return false;
         }
 
-        debug!(frame = %String::from_utf8_lossy(&frame.payload), "engine RX");
+        trace!(frame = %String::from_utf8_lossy(&frame.payload), "engine RX");
 
         for event in session.on_frame(&frame.payload) {
             let is_snapshot = matches!(event, EngineEvent::Snapshot { .. });

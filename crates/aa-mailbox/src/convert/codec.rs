@@ -20,10 +20,10 @@ use super::{
     measured_to_c, slice_to_hex, temp_c_to_x2, temp_x2_to_c,
 };
 use crate::dto::{
-    ActionEnum, ActivationCodeDto, ActivationStatus, FanEnum, FirmwareDto, InfoByteDto, ModeEnum,
-    PowerEnum, RfDeviceCalibrationDto, RfDevicePairingDto, SensorPairingDto, SensorPairingWriteDto,
-    SensorTypeEnum, SystemErrorDto, SystemStatusDto, UnitActivationDto, UnitAnnouncementDto,
-    UnitTypeEnum, ZoneConfigDto, ZoneLimitsDto, ZoneStateDto,
+    ActionEnum, ActivationCodeDto, ActivationStatus, FanEnum, FirmwareDto, FreshAirEnum,
+    InfoByteDto, ModeEnum, PowerEnum, RfDeviceCalibrationDto, RfDevicePairingDto, SensorPairingDto,
+    SensorPairingWriteDto, SensorTypeEnum, SystemErrorDto, SystemStatusDto, UnitActivationDto,
+    UnitAnnouncementDto, UnitTypeEnum, ZoneConfigDto, ZoneLimitsDto, ZoneStateDto,
 };
 use crate::error::EncodeError;
 
@@ -223,6 +223,7 @@ pub(super) fn encode_system_status(payload: &Value) -> Result<[u8; 7], EncodeErr
     check_enum::<PowerEnum>("power", payload)?;
     check_enum::<ModeEnum>("mode", payload)?;
     check_enum::<FanEnum>("fan", payload)?;
+    check_enum::<FreshAirEnum>("fresh_air", payload)?;
     let dto: SystemStatusDto = deserialize_payload(payload)?;
     Ok(SystemStatus {
         power: power_to_aa(dto.power),
@@ -230,11 +231,7 @@ pub(super) fn encode_system_status(payload: &Value) -> Result<[u8; 7], EncodeErr
         fan: fan_to_aa(dto.fan),
         set_temp_x2: temp_c_to_x2(dto.target_temp_c),
         myzone_id: dto.myzone_id,
-        fresh_air: if dto.fresh_air {
-            FreshAir::On
-        } else {
-            FreshAir::Off
-        },
+        fresh_air: fresh_air_to_aa(dto.fresh_air),
         rf_sys_id: dto.rf_sys_id,
     }
     .into())
@@ -252,8 +249,9 @@ pub(super) fn decode_system_status(data: [u8; 7]) -> Result<Value, EncodeError> 
         return Ok(Value::String(bytes_to_hex(data)));
     };
     let fresh_air = match status.fresh_air {
-        FreshAir::On => true,
-        FreshAir::None | FreshAir::Off => false,
+        FreshAir::On => FreshAirEnum::On,
+        FreshAir::Off => FreshAirEnum::Off,
+        FreshAir::None => FreshAirEnum::None,
         FreshAir::Unknown(_) => return Ok(Value::String(bytes_to_hex(data))),
     };
     dto_to_value(&SystemStatusDto {
@@ -271,6 +269,14 @@ const fn power_to_aa(power: PowerEnum) -> Power {
     match power {
         PowerEnum::On => Power::On,
         PowerEnum::Off => Power::Off,
+    }
+}
+
+const fn fresh_air_to_aa(fresh_air: FreshAirEnum) -> FreshAir {
+    match fresh_air {
+        FreshAirEnum::None => FreshAir::None,
+        FreshAirEnum::Off => FreshAir::Off,
+        FreshAirEnum::On => FreshAir::On,
     }
 }
 
