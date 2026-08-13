@@ -1,6 +1,6 @@
 //! Async CB engine runner over a [`Link`].
 
-use aa_frame::{Frame, FrameScanner};
+use aa_frame::{Frame, FrameScanner, ScanItem};
 use aa_link::Link;
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
@@ -115,26 +115,37 @@ impl<L: Link> CbEngine<L> {
             }
         };
 
-        let frames = match scanner.push(&buf[..n]) {
-            Ok(frames) => frames,
+        let out = match scanner.push(&buf[..n]) {
             Err(err) => {
-                // CRC-failed getCAN frames must arm ackCAN 0 on the next ping
-                // (aaservice parity) so the CB retries the records.
-                if let aa_frame::FrameError::InvalidCrc { payload, .. } = &err
-                    && payload.starts_with(b"getCAN")
-                {
-                    session.set_crc_ok(false);
-                }
                 let _ = ev_tx
                     .send(EngineEvent::ProtocolWarn(format!("frame scan: {err:?}")))
                     .await;
                 return false;
             }
+            Ok(out) => out,
         };
 
-        for frame in frames {
-            if self.dispatch_frame(session, cmd_rx, ev_tx, frame).await {
-                return true;
+        for item in out.items {
+            match item {
+                ScanItem::Frame(frame) => {
+                    if self.dispatch_frame(session, cmd_rx, ev_tx, frame).await {
+                        return true;
+                    }
+                }
+                ScanItem::CrcFailure(failure) => {
+                    // Mirror aaservice per-frame polarity (f4170w/f4169v):
+                    // a CRC-failed getCAN arms ackCAN 0 on the next ping so the
+                    // CB retries the records.
+                    session.on_crc_failure(failure.payload.starts_with(b"getCAN"));
+                    let _ = ev_tx
+                        .send(EngineEvent::ProtocolWarn(format!(
+                            "frame CRC failed (expected {:#04x}, got {:#04x}): {}",
+                            failure.expected,
+                            failure.actual,
+                            String::from_utf8_lossy(&failure.payload)
+                        )))
+                        .await;
+                }
             }
         }
         false
@@ -216,7 +227,9 @@ mod tests {
 
     use super::CbEngine;
     use crate::event::{EngineCmd, EngineEvent, SessionState};
-    use crate::wire::{ACK_CAN, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA};
+    use crate::wire::{
+        ACK_CAN, ACK_CAN_ZERO, DIRTY_RESET_SET_CAN, DUMP_SET_CAN, EMPTY_SET_CAN, GET_SYSTEM_DATA,
+    };
 
     /// [`MockLink`] shared with tests; `read` waits when inbound is empty (not EOF).
     struct SharedMockLink {
@@ -462,6 +475,107 @@ mod tests {
         })
         .await;
 
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &encoded(ACK_CAN)).await;
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), join)
+            .await
+            .expect("engine join timeout")
+            .expect("engine task");
+    }
+
+    #[tokio::test]
+    async fn mocklink_mixed_burst_crc_failure_dispatches_good_frame_and_nacks() {
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+
+        let engine = CbEngine::new(link);
+        let join = tokio::spawn(async move {
+            engine.run(cmd_rx, ev_tx).await;
+        });
+
+        negotiate_through_can2(&mock, &notify).await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Negotiated { .. })).await;
+
+        dump_via_two_phase(&mock, &notify).await;
+
+        // Reach Steady: the first getCAN after the dump emits Snapshot. It
+        // carries the reg-05 sample so no unit flush is queued on top of the
+        // pending JZ18 (the flush would bundle both into one combined setCAN).
+        push_frame(
+            &mock,
+            &notify,
+            &get_can_body(std::slice::from_ref(&sample_record())),
+        )
+        .await;
+        let _ = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::Snapshot { .. })).await;
+
+        // Drain the ack + JZ18 pings so the wire is quiet before the burst.
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &encoded(ACK_CAN)).await;
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        let jz18 =
+            crate::wire::build_jz18(UnitType::new(0x07), UnitId::try_new(0x0_ABCDE).unwrap());
+        let expected_jz18 = encoded(&crate::wire::build_set_can(std::slice::from_ref(&jz18)));
+        wait_written_contains(&mock, &expected_jz18).await;
+
+        // One inbound chunk carrying [good getCAN, CRC-corrupted getCAN] so a
+        // single scanner push yields both items in wire order. The corrupted
+        // frame flips the last payload byte (the `getCAN` prefix stays intact
+        // so the arming check fires); decode yields InvalidCrc, never Malformed.
+        let good = get_can_body(std::slice::from_ref(&sample_record()));
+        let mut bad = encoded(&good);
+        let last_payload = bad.len() - 8;
+        bad[last_payload] ^= 0x01;
+        let mut burst = encoded(&good);
+        burst.extend_from_slice(&bad);
+        {
+            let mut g = mock.lock().await;
+            g.push_inbound(&burst);
+            drop(g);
+            notify.notify_one();
+        }
+
+        // The good frame still dispatches (Steady → RegistersChanged)...
+        let _ = recv_event(&mut ev_rx, |e| {
+            matches!(e, EngineEvent::RegistersChanged { .. })
+        })
+        .await;
+        // ...and the CRC failure is surfaced as a ProtocolWarn.
+        let warn = recv_event(&mut ev_rx, |e| matches!(e, EngineEvent::ProtocolWarn(_))).await;
+        match warn {
+            EngineEvent::ProtocolWarn(msg) => assert!(msg.contains("CRC"), "warn: {msg}"),
+            other => panic!("expected ProtocolWarn, got {other:?}"),
+        }
+
+        // Next ping carries ackCAN 0 (last frame's CRC was bad).
+        {
+            let mut g = mock.lock().await;
+            let _ = g.take_written();
+        }
+        push_frame(&mock, &notify, b"Ping").await;
+        wait_written_contains(&mock, &encoded(ACK_CAN_ZERO)).await;
+
+        // A retransmitted good getCAN is acked with ackCAN 1 (no polarity leak).
+        push_frame(&mock, &notify, &good).await;
+        let _ = recv_event(&mut ev_rx, |e| {
+            matches!(e, EngineEvent::RegistersChanged { .. })
+        })
+        .await;
         {
             let mut g = mock.lock().await;
             let _ = g.take_written();

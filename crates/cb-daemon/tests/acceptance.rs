@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use aa_engine::EngineCmd;
+use aa_frame::Frame;
 use aa_link::AOA_DEFAULT_PATH;
 use aa_registers::{UnitId, UnitType};
 use cb_daemon::{App, Backend, FeederSpec, SessionTimeouts, mock_backend_avoids_accessory};
@@ -1816,6 +1817,82 @@ async fn short_timeouts_normal_traffic_not_double_acked() {
     assert!(
         late.is_err(),
         "double-ack for an already-resolved msg_id on live bus: {late:?}"
+    );
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-16: a CRC-corrupted getCAN (the `corrupt_next_getcan` spec makes the
+/// first bare steady empty-poll reply carry it, with the good copy following
+/// as the retransmit) must not apply. No reg-05/reg-06 `event` may fire
+/// before the daemon's `ackCAN 0` NACK hits the wire — the engine emits
+/// events at frame-processing time, before the ack for the same poll cycle is
+/// TX'd — and the retransmitted good getCAN then applies the sample records
+/// (events) followed by `ackCAN 1` (polarity restored, no leak). The
+/// dump-phase JZ18 reg-07 echo may legitimately precede the corrupt reply, so
+/// only reg-05/reg-06 events are forbidden in the pre-NACK window.
+#[tokio::test]
+async fn mock_backend_crc_failed_getcan_nacks_then_acks() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, ctrl) = App::spawn_mock_ctrl_with_timeouts(
+        bind,
+        Some(FeederSpec::default().with_corrupt_next_getcan()),
+        Duration::from_mins(1),
+        Duration::from_mins(1),
+    )
+    .await
+    .expect("spawn mock with corrupt-getCAN spec");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    // Dump phase completes before the corruption fires (it only happens on a
+    // steady empty poll, after the snapshot).
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    // Phase 1: the corrupt getCAN must not apply. Wait for the daemon's
+    // ackCAN 0 on the wire while draining the WS stream; a reg-05/reg-06
+    // event before the NACK means the corrupt copy was applied.
+    let ack0 = Frame {
+        payload: b"ackCAN 0".to_vec(),
+    }
+    .encode();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            tokio::select! {
+                ok = ctrl.wait_written_contains(&ack0) => {
+                    assert!(ok, "ackCAN 0 never hit the wire");
+                    return;
+                }
+                msg = recv_json_or_close(&mut ws) => {
+                    let msg = msg.expect("closed before ackCAN 0 observed");
+                    let corrupt_leak = msg["type"] == "event"
+                        && (msg["register"] == "05" || msg["register"] == "06");
+                    assert!(
+                        !corrupt_leak,
+                        "corrupt getCAN must not produce reg-05/reg-06 events before the NACK: {msg}"
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("ackCAN 0 wire observation timeout");
+
+    // Phase 2: the retransmitted good getCAN applies the sample records — the
+    // events arrive strictly after the ackCAN 0 (the feeder only retransmits
+    // after the NACK poll cycle).
+    let ev05 = wait_for_event(&mut ws, "05", "abcde").await;
+    assert_eq!(ev05["unit_type"], "07", "retransmit reg-05 event: {ev05}");
+    let ev06 = wait_for_event(&mut ws, "06", "abcde").await;
+    assert_eq!(ev06["unit_type"], "08", "retransmit reg-06 event: {ev06}");
+
+    // Phase 3: polarity restored — the good getCAN gets ackCAN 1 on the wire.
+    let ack1 = Frame {
+        payload: b"ackCAN 1".to_vec(),
+    }
+    .encode();
+    assert!(
+        ctrl.wait_written_contains(&ack1).await,
+        "ackCAN 1 never hit the wire (polarity not restored)"
     );
 
     let _ = ws.close(None).await;

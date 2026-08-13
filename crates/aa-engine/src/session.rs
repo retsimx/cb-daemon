@@ -41,7 +41,8 @@ pub(crate) struct Session {
     /// Set when `steady_tx` drained the write queue; consumed by the runner to
     /// emit [`EngineEvent::WriteFlushed`] after the frame is transmitted.
     write_flushed: bool,
-    /// Last inbound frame CRC outcome; feeds the outbound `ackCAN 0|1` polarity.
+    /// Last complete non-Ping frame's CRC outcome (OEM `f4170w`): valid frames
+    /// set 1, CRC-failed frames set 0; feeds the outbound `ackCAN 0|1` polarity.
     crc_ok: bool,
     /// Mirrors stock `canInUse`: after `CAN2 in use`, skip empty `setCAN`.
     can_in_use: bool,
@@ -95,9 +96,14 @@ impl Session {
         std::mem::take(&mut self.write_flushed)
     }
 
-    /// Record the last inbound frame's CRC outcome (drives `ackCAN 0|1`).
-    pub(crate) const fn set_crc_ok(&mut self, ok: bool) {
-        self.crc_ok = ok;
+    /// Record a CRC-failed inbound frame (OEM `f4170w`): polarity drops to 0;
+    /// a getCAN failure additionally arms the ack latch (OEM `f4169v`) so the
+    /// next ping carries `ackCAN 0` even without a later good frame.
+    pub(crate) const fn on_crc_failure(&mut self, is_get_can: bool) {
+        self.crc_ok = false;
+        if is_get_can {
+            self.ack_armed = true;
+        }
     }
 
     /// Apply an inbound engine command.
@@ -218,6 +224,9 @@ impl Session {
 
     /// Handle a non-Ping frame payload; returns zero or more engine events.
     pub(crate) fn on_frame(&mut self, payload: &[u8]) -> Vec<EngineEvent> {
+        // Every well-formed non-Ping frame updates polarity (OEM `f4170w`):
+        // CRC-valid → 1, regardless of what the state machine does with it.
+        self.crc_ok = true;
         match self.state {
             State::Init | State::WaitPing => {
                 vec![EngineEvent::ProtocolWarn(
@@ -233,12 +242,14 @@ impl Session {
     fn steady_tx(&mut self) -> Vec<u8> {
         if self.ack_armed {
             self.ack_armed = false;
-            // ackCAN polarity mirrors the last inbound CRC outcome (USB parity:
-            // aaservice sends ackCAN 0 when the getCAN frame failed CRC).
+            // ackCAN polarity mirrors the last inbound frame's CRC outcome
+            // (USB parity: aaservice sends ackCAN 0 when the getCAN frame
+            // failed CRC). Never reset after sending: the next inbound frame
+            // overwrites polarity (OEM keeps `f4170w`; the latch gates
+            // emission, so a later ack reuses the current polarity).
             if self.crc_ok {
                 return ACK_CAN.to_vec();
             }
-            self.crc_ok = true;
             return ACK_CAN_ZERO.to_vec();
         }
         if !self.write_queue.is_empty() {
@@ -1283,5 +1294,118 @@ mod tests {
             "undelivered zone 3 must resolve None: {reads:?}"
         );
         assert!(s.pending_reads.is_empty());
+    }
+
+    /// Drain steady-state JZ18/empty polls until the ack latch and queue settle.
+    fn settle_steady(s: &mut Session) {
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&build_jz18(
+                UnitType::AIRCON,
+                live_unit_reg06().unit_id
+            )))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+    }
+
+    #[test]
+    fn lone_crc_failed_getcan_arms_ack_can_zero() {
+        // OEM f4169v is CRC-independent: a CRC-failed getCAN arms the latch, so
+        // the next ping carries ackCAN 0 with no good frame in between; the
+        // latch is cleared by emission and must not repeat on the next ping.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        settle_steady(&mut s);
+
+        s.on_crc_failure(true);
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN_ZERO);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            EMPTY_SET_CAN,
+            "latch cleared: no second ackCAN without a new frame"
+        );
+    }
+
+    #[test]
+    fn bad_then_good_getcan_no_polarity_leak() {
+        // [bad, good] getCAN → ackCAN 1: the good frame overwrites polarity.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        settle_steady(&mut s);
+
+        s.on_crc_failure(true);
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&sample_record())));
+        assert!(matches!(
+            ev.as_slice(),
+            [EngineEvent::RegistersChanged { .. }]
+        ));
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+    }
+
+    #[test]
+    fn good_then_bad_getcan_ack_zero() {
+        // [good, bad] getCAN → ackCAN 0: last complete frame's outcome wins.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        settle_steady(&mut s);
+
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&sample_record())));
+        assert!(matches!(
+            ev.as_slice(),
+            [EngineEvent::RegistersChanged { .. }]
+        ));
+        s.on_crc_failure(true);
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN_ZERO);
+    }
+
+    #[test]
+    fn bad_non_getcan_flips_armed_ack_to_zero() {
+        // Every complete non-Ping frame updates polarity: a CRC-failed
+        // non-getCAN drops an ack armed by an earlier good getCAN to 0, while
+        // the latch (armed by the getCAN) still gates emission.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        settle_steady(&mut s);
+
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&sample_record())));
+        assert!(matches!(
+            ev.as_slice(),
+            [EngineEvent::RegistersChanged { .. }]
+        ));
+        s.on_crc_failure(false);
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN_ZERO);
+    }
+
+    #[test]
+    fn bad_non_getcan_alone_does_not_arm() {
+        // Arming is getCAN-specific: a CRC-failed non-getCAN drops polarity to
+        // 0 but must not produce an ackCAN at all (no latch → normal empty poll).
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        settle_steady(&mut s);
+
+        s.on_crc_failure(false);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            EMPTY_SET_CAN,
+            "no latch: a CRC-failed non-getCAN must not emit ackCAN"
+        );
+    }
+
+    #[test]
+    fn good_non_getcan_after_bad_restores_polarity() {
+        // A well-formed non-getCAN frame (ProtocolWarn path) still overwrites
+        // polarity: an ack armed by a failed getCAN goes out as ackCAN 1.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        settle_steady(&mut s);
+
+        s.on_crc_failure(true);
+        let ev = s.on_frame(b"bogus steady frame");
+        assert!(
+            matches!(ev.as_slice(), [EngineEvent::ProtocolWarn(_)]),
+            "non-getCAN in steady must warn: {ev:?}"
+        );
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
     }
 }
