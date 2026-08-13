@@ -8,7 +8,7 @@ use std::time::Duration;
 use aa_engine::EngineCmd;
 use aa_link::AOA_DEFAULT_PATH;
 use aa_registers::{UnitId, UnitType};
-use cb_daemon::{App, Backend, FeederSpec, mock_backend_avoids_accessory};
+use cb_daemon::{App, Backend, FeederSpec, SessionTimeouts, mock_backend_avoids_accessory};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::time::timeout;
@@ -1519,5 +1519,186 @@ async fn idle_failsafe_powers_off_after_client_disconnect() {
     .await
     .expect("idle-failsafe power-off write not observed on spy");
 
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-12: on a silent bus (feeder stops after the dump; the engine never
+/// flushes), a write's ack must time out into an error ack — and the timeout
+/// ack is the *next* frame after the write: no status, event, or
+/// `read_result` traffic interleaves on the dead bus.
+#[tokio::test]
+async fn silent_bus_write_times_out() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, _ctrl) = App::spawn_mock_ctrl_with_session_timeouts(
+        bind,
+        Some(FeederSpec::default().stop_after_dump()),
+        Duration::from_mins(1),
+        Duration::from_mins(1),
+        SessionTimeouts {
+            write_ack: Duration::from_millis(400),
+            read: Duration::from_millis(300),
+        },
+    )
+    .await
+    .expect("spawn mock with short session timeouts");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg05_write("req-silent-w").to_string().into(),
+    ))
+    .await
+    .unwrap();
+
+    // The very next frame must be the timeout ack ("without any other
+    // traffic"); wait_for_ack guards against a close, `timeout` bounds the
+    // window, and the final asserts pin status/reason.
+    let ack = timeout(Duration::from_secs(2), async {
+        let msg = recv_json_or_close(&mut ws)
+            .await
+            .expect("closed before write timeout ack");
+        assert_eq!(
+            msg["type"], "ack",
+            "silent bus must not interleave {msg:?} before the timeout ack"
+        );
+        msg
+    })
+    .await
+    .expect("write timeout ack missing");
+    assert_eq!(ack["msg_id"], "req-silent-w", "write timeout ack: {ack}");
+    assert_eq!(ack["status"], "error", "write timeout ack: {ack}");
+    assert_eq!(ack["reason"], "write timeout", "write timeout ack: {ack}");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-12: on a silent bus, a read's deadline expires into an error ack too —
+/// the read never resolves (no flush `getCAN` reply) and must surface as
+/// "read timeout" carrying the read's `msg_id`.
+#[tokio::test]
+async fn silent_bus_read_times_out() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, _ctrl) = App::spawn_mock_ctrl_with_session_timeouts(
+        bind,
+        Some(FeederSpec::default().stop_after_dump()),
+        Duration::from_mins(1),
+        Duration::from_mins(1),
+        SessionTimeouts {
+            write_ack: Duration::from_millis(400),
+            read: Duration::from_millis(300),
+        },
+    )
+    .await
+    .expect("spawn mock with short session timeouts");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(
+        reg_read("req-silent-r", "05").to_string().into(),
+    ))
+    .await
+    .unwrap();
+
+    let ack = timeout(Duration::from_secs(2), async {
+        let msg = recv_json_or_close(&mut ws)
+            .await
+            .expect("closed before read timeout ack");
+        assert_eq!(
+            msg["type"], "ack",
+            "silent bus must not interleave {msg:?} before the read timeout ack"
+        );
+        msg
+    })
+    .await
+    .expect("read timeout ack missing");
+    assert_eq!(ack["msg_id"], "req-silent-r", "read timeout ack: {ack}");
+    assert_eq!(ack["status"], "error", "read timeout ack: {ack}");
+    assert_eq!(ack["reason"], "read timeout", "read timeout ack: {ack}");
+
+    let _ = ws.close(None).await;
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// D-12 positive control: short session timeouts must NOT fire on a live bus.
+/// A write acks success and a read resolves to a `read_result` well inside
+/// the (`400 ms` / `300 ms`) deadlines, and neither `msg_id` is ever
+/// double-acked with a timeout error afterwards.
+#[tokio::test]
+async fn short_timeouts_normal_traffic_not_double_acked() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (handle, _ctrl) = App::spawn_mock_ctrl_with_session_timeouts(
+        bind,
+        Some(FeederSpec::default()),
+        Duration::from_mins(1),
+        Duration::from_mins(1),
+        SessionTimeouts {
+            write_ack: Duration::from_millis(400),
+            read: Duration::from_millis(300),
+        },
+    )
+    .await
+    .expect("spawn mock with short session timeouts");
+    let mut ws = connect_ws(handle.local_addr()).await;
+    let _ = wait_for_type(&mut ws, "snapshot").await;
+
+    ws.send(Message::Text(reg05_write("req-fast-w").to_string().into()))
+        .await
+        .unwrap();
+    ws.send(Message::Text(
+        reg_read("req-fast-r", "05").to_string().into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut write_ok = false;
+    let mut read_ok = false;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed before live-bus results");
+            match (msg["type"].as_str(), msg["msg_id"].as_str()) {
+                (Some("ack"), Some("req-fast-w")) => {
+                    assert_eq!(msg["status"], "success", "fast write ack: {msg}");
+                    write_ok = true;
+                }
+                (Some("ack"), Some("req-fast-r")) => {
+                    panic!("read acked instead of resolving to read_result: {msg}");
+                }
+                (Some("read_result"), Some("req-fast-r")) => read_ok = true,
+                _ => {}
+            }
+            if write_ok && read_ok {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("fast write+read not both resolved within 2s");
+    assert!(write_ok, "write must ack success on live bus");
+    assert!(read_ok, "read must resolve to read_result on live bus");
+
+    // Negative check: neither msg_id may be acked again (timeout or otherwise)
+    // within a quiet window beyond its deadline.
+    let late = timeout(Duration::from_millis(500), async {
+        loop {
+            let msg = recv_json_or_close(&mut ws)
+                .await
+                .expect("closed during negative window");
+            if msg["type"] == "ack"
+                && let Some(id @ ("req-fast-w" | "req-fast-r")) = msg["msg_id"].as_str()
+            {
+                return Some(id.to_owned());
+            }
+        }
+    })
+    .await;
+    assert!(
+        late.is_err(),
+        "double-ack for an already-resolved msg_id on live bus: {late:?}"
+    );
+
+    let _ = ws.close(None).await;
     handle.shutdown().await.expect("shutdown");
 }
