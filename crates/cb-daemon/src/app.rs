@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::config::{Backend, Config};
+use crate::config::{Backend, Config, DEFAULT_WS_IDLE_RETRY_INTERVAL, DEFAULT_WS_IDLE_TIMEOUT};
 use crate::mock_feeder::{self, FeederSpec, SharedMockLink};
 use crate::ws::{self, WsEvent, WsState};
 
@@ -90,7 +90,13 @@ impl App {
         bind: SocketAddr,
         spec: FeederSpec,
     ) -> anyhow::Result<AppHandle> {
-        let (handle, _ctrl) = Self::spawn_mock_ctrl_inner(bind, Some(spec)).await?;
+        let (handle, _ctrl) = Self::spawn_mock_ctrl_inner(
+            bind,
+            Some(spec),
+            DEFAULT_WS_IDLE_TIMEOUT,
+            DEFAULT_WS_IDLE_RETRY_INTERVAL,
+        )
+        .await?;
         Ok(handle)
     }
 
@@ -118,7 +124,52 @@ impl App {
         with_feeder: bool,
     ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
         let feeder = with_feeder.then(FeederSpec::default);
-        Self::spawn_mock_ctrl_inner(bind, feeder).await
+        Self::spawn_mock_ctrl_inner(
+            bind,
+            feeder,
+            DEFAULT_WS_IDLE_TIMEOUT,
+            DEFAULT_WS_IDLE_RETRY_INTERVAL,
+        )
+        .await
+    }
+
+    /// Like [`Self::spawn_mock`] with custom idle-failsafe durations.
+    ///
+    /// Test hook for the watchdog: short `ws_idle_timeout` fires quickly and
+    /// a short `ws_idle_retry_interval` keeps re-fires cheap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates bind / spawn failures.
+    pub async fn spawn_mock_with_timeouts(
+        bind: SocketAddr,
+        ws_idle_timeout: Duration,
+        ws_idle_retry_interval: Duration,
+    ) -> anyhow::Result<AppHandle> {
+        let (handle, _ctrl) = Self::spawn_mock_ctrl_with_timeouts(
+            bind,
+            Some(FeederSpec::default()),
+            ws_idle_timeout,
+            ws_idle_retry_interval,
+        )
+        .await?;
+        Ok(handle)
+    }
+
+    /// Like [`Self::spawn_mock_ctrl`] with custom idle-failsafe durations and
+    /// a [`FeederSpec`] (e.g. [`FeederSpec::without_reg05`]) so tests can
+    /// control which registers the bank sees.
+    ///
+    /// # Errors
+    ///
+    /// Propagates bind / spawn failures.
+    pub async fn spawn_mock_ctrl_with_timeouts(
+        bind: SocketAddr,
+        feeder: Option<FeederSpec>,
+        ws_idle_timeout: Duration,
+        ws_idle_retry_interval: Duration,
+    ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
+        Self::spawn_mock_ctrl_inner(bind, feeder, ws_idle_timeout, ws_idle_retry_interval).await
     }
 }
 
@@ -126,6 +177,8 @@ impl App {
     async fn spawn_mock_ctrl_inner(
         bind: SocketAddr,
         feeder: Option<FeederSpec>,
+        ws_idle_timeout: Duration,
+        ws_idle_retry_interval: Duration,
     ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
         let listener = TcpListener::bind(bind)
             .await
@@ -140,7 +193,18 @@ impl App {
             notify: Arc::clone(&notify),
         };
         let join = tokio::spawn(async move {
-            run_mock_with_parts(listener, shutdown_rx, Some(spy), feeder, link, mock, notify).await
+            run_mock_with_parts(
+                listener,
+                shutdown_rx,
+                Some(spy),
+                feeder,
+                link,
+                mock,
+                notify,
+                ws_idle_timeout,
+                ws_idle_retry_interval,
+            )
+            .await
         });
         Ok((
             AppHandle {
@@ -216,17 +280,43 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
     });
     match config.backend {
         Backend::Mock => {
-            run_mock_with_listener(listener, shutdown_rx, None, Some(FeederSpec::default())).await
+            run_mock_with_listener(
+                listener,
+                shutdown_rx,
+                None,
+                Some(FeederSpec::default()),
+                config.ws_idle_timeout,
+                config.ws_idle_retry_interval,
+            )
+            .await
         }
         Backend::Aoa => {
             let hint = config.unit_id_hint;
             let link = open_aoa(&config).await?;
-            run_with_link(listener, link, shutdown_rx, None, hint).await
+            run_with_link(
+                listener,
+                link,
+                shutdown_rx,
+                None,
+                hint,
+                config.ws_idle_timeout,
+                config.ws_idle_retry_interval,
+            )
+            .await
         }
         Backend::Tty => {
             let hint = config.unit_id_hint;
             let link = open_tty(&config).await?;
-            run_with_link(listener, link, shutdown_rx, None, hint).await
+            run_with_link(
+                listener,
+                link,
+                shutdown_rx,
+                None,
+                hint,
+                config.ws_idle_timeout,
+                config.ws_idle_retry_interval,
+            )
+            .await
         }
     }
 }
@@ -266,13 +356,27 @@ async fn run_mock_with_listener(
     shutdown_rx: oneshot::Receiver<()>,
     cmd_spy: Option<Arc<Mutex<Vec<EngineCmd>>>>,
     feeder: Option<FeederSpec>,
+    ws_idle_timeout: Duration,
+    ws_idle_retry_interval: Duration,
 ) -> anyhow::Result<()> {
     let (link, mock, notify) = SharedMockLink::new();
-    run_mock_with_parts(listener, shutdown_rx, cmd_spy, feeder, link, mock, notify).await
+    run_mock_with_parts(
+        listener,
+        shutdown_rx,
+        cmd_spy,
+        feeder,
+        link,
+        mock,
+        notify,
+        ws_idle_timeout,
+        ws_idle_retry_interval,
+    )
+    .await
 }
 
 /// Mock path over pre-built [`SharedMockLink`] parts (tests may hold a
 /// [`MockLinkCtrl`] clone of `mock`/`notify` to force the link closed).
+#[allow(clippy::too_many_arguments)]
 async fn run_mock_with_parts(
     listener: TcpListener,
     shutdown_rx: oneshot::Receiver<()>,
@@ -281,9 +385,20 @@ async fn run_mock_with_parts(
     link: SharedMockLink,
     mock: Arc<Mutex<MockLink>>,
     notify: Arc<Notify>,
+    ws_idle_timeout: Duration,
+    ws_idle_retry_interval: Duration,
 ) -> anyhow::Result<()> {
     let feeder = feeder.map(|spec| tokio::spawn(mock_feeder::run_feeder(mock, notify, spec)));
-    let result = run_with_link(listener, link, shutdown_rx, cmd_spy, None).await;
+    let result = run_with_link(
+        listener,
+        link,
+        shutdown_rx,
+        cmd_spy,
+        None,
+        ws_idle_timeout,
+        ws_idle_retry_interval,
+    )
+    .await;
     if let Some(feeder) = feeder {
         feeder.abort();
         let _ = feeder.await;
@@ -297,12 +412,15 @@ async fn run_with_link<L: Link + 'static>(
     shutdown_rx: oneshot::Receiver<()>,
     cmd_spy: Option<Arc<Mutex<Vec<EngineCmd>>>>,
     unit_id_hint: Option<aa_registers::UnitId>,
+    ws_idle_timeout: Duration,
+    ws_idle_retry_interval: Duration,
 ) -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(CHANNEL_BOUND);
     let (ev_tx, ev_rx) = mpsc::channel::<EngineEvent>(CHANNEL_BOUND);
     let (snapshot_tx, snapshot_rx) = watch::channel::<Option<ws::HeldSnapshot>>(None);
     let (status_tx, status_rx) = watch::channel::<StatusState>(StatusState::Negotiating);
     let (broadcast_tx, _) = broadcast::channel::<WsEvent>(CHANNEL_BOUND);
+    let (clients_tx, _) = watch::channel::<usize>(0);
 
     let engine = CbEngine::new(link);
     let engine_join = tokio::spawn(async move {
@@ -321,8 +439,12 @@ async fn run_with_link<L: Link + 'static>(
         status: status_rx,
         cmd_spy,
         unit_id_hint,
+        clients: clients_tx,
     };
-    let router = ws::router(state);
+    let router = ws::router(state.clone());
+    // Detached: the watchdog holds its own state clones and never blocks
+    // shutdown — the process ending kills the task.
+    let _watchdog = ws::spawn_idle_watchdog(state, ws_idle_timeout, ws_idle_retry_interval);
 
     let serve = axum::serve(listener, router).with_graceful_shutdown(async {
         let _ = shutdown_rx.await;

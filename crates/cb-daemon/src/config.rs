@@ -5,6 +5,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use aa_link::{
     AOA_DEFAULT_PATH, AOA_INTER_CHUNK_DELAY_MS, AOA_MAX_CHUNK, TTY_BAUD, TTY_DEFAULT_PATH,
@@ -29,6 +30,18 @@ pub(crate) const DEFAULT_TTY_BAUD: u32 = TTY_BAUD;
 
 /// Default tracing level when `RUST_LOG` is unset.
 pub(crate) const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Default idle failsafe timeout: power off AIRCON units after this long with
+/// zero connected WebSocket clients (`0` disables the failsafe).
+pub(crate) const DEFAULT_WS_IDLE_TIMEOUT: Duration = Duration::from_mins(15);
+
+/// Default interval between repeated idle-failsafe power-off writes.
+pub(crate) const DEFAULT_WS_IDLE_RETRY_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Upper bound on the idle failsafe timeout (1 year): beyond this the
+/// deadline arithmetic could overflow `Instant` inside the watchdog task,
+/// panicking it and silently disabling the failsafe.
+pub(crate) const MAX_WS_IDLE_TIMEOUT: Duration = Duration::from_hours(8760);
 
 const ETC_CONFIG: &str = "/etc/cb-daemon/config.toml";
 const CWD_CONFIG: &str = "./config.toml";
@@ -90,6 +103,11 @@ pub struct Config {
     pub aoa_chunk_delay_ms: u64,
     /// TTY baud rate (> 0).
     pub tty_baud: u32,
+    /// Idle failsafe: power off AIRCON units after this long with zero
+    /// connected WebSocket clients (`0` = failsafe disabled).
+    pub ws_idle_timeout: Duration,
+    /// Idle failsafe retry interval between repeated power-off writes (≥ 1 s).
+    pub ws_idle_retry_interval: Duration,
 }
 
 impl Default for Config {
@@ -103,6 +121,8 @@ impl Default for Config {
             aoa_chunk_size: DEFAULT_AOA_CHUNK_SIZE,
             aoa_chunk_delay_ms: DEFAULT_AOA_CHUNK_DELAY_MS,
             tty_baud: DEFAULT_TTY_BAUD,
+            ws_idle_timeout: DEFAULT_WS_IDLE_TIMEOUT,
+            ws_idle_retry_interval: DEFAULT_WS_IDLE_RETRY_INTERVAL,
         }
     }
 }
@@ -133,6 +153,10 @@ pub struct FileConfig {
     pub aoa_chunk_delay_ms: Option<u64>,
     /// TTY baud.
     pub tty_baud: Option<u32>,
+    /// Idle failsafe timeout in minutes (`0` disables).
+    pub ws_idle_timeout_minutes: Option<u64>,
+    /// Idle failsafe retry interval in seconds.
+    pub ws_idle_retry_seconds: Option<u64>,
 }
 
 /// CLI flags (only applied when present).
@@ -174,6 +198,14 @@ pub struct CliArgs {
     /// TTY baud rate.
     #[arg(long)]
     pub tty_baud: Option<u32>,
+
+    /// Idle failsafe timeout in minutes (0 disables the failsafe).
+    #[arg(long)]
+    pub ws_idle_timeout_minutes: Option<u64>,
+
+    /// Idle failsafe retry interval in seconds.
+    #[arg(long)]
+    pub ws_idle_retry_seconds: Option<u64>,
 }
 
 /// Environment overlay (manual; clear precedence over clap env feature).
@@ -197,6 +229,10 @@ pub struct EnvOverrides {
     pub aoa_chunk_delay_ms: Option<String>,
     /// `CB_DAEMON_TTY_BAUD`
     pub tty_baud: Option<String>,
+    /// `CB_DAEMON_WS_IDLE_TIMEOUT_MINUTES`
+    pub ws_idle_timeout_minutes: Option<String>,
+    /// `CB_DAEMON_WS_IDLE_RETRY_SECONDS`
+    pub ws_idle_retry_seconds: Option<String>,
 }
 
 impl EnvOverrides {
@@ -213,6 +249,8 @@ impl EnvOverrides {
             aoa_chunk_size: env::var("CB_DAEMON_AOA_CHUNK_SIZE").ok(),
             aoa_chunk_delay_ms: env::var("CB_DAEMON_AOA_CHUNK_DELAY_MS").ok(),
             tty_baud: env::var("CB_DAEMON_TTY_BAUD").ok(),
+            ws_idle_timeout_minutes: env::var("CB_DAEMON_WS_IDLE_TIMEOUT_MINUTES").ok(),
+            ws_idle_retry_seconds: env::var("CB_DAEMON_WS_IDLE_RETRY_SECONDS").ok(),
         }
     }
 }
@@ -326,6 +364,12 @@ fn apply_file(cfg: &mut Config, file: &FileConfig) -> Result<()> {
     if let Some(baud) = file.tty_baud {
         cfg.tty_baud = baud;
     }
+    if let Some(minutes) = file.ws_idle_timeout_minutes {
+        cfg.ws_idle_timeout = Duration::from_secs(minutes.saturating_mul(60));
+    }
+    if let Some(seconds) = file.ws_idle_retry_seconds {
+        cfg.ws_idle_retry_interval = Duration::from_secs(seconds);
+    }
     Ok(())
 }
 
@@ -363,6 +407,18 @@ fn apply_env(cfg: &mut Config, env: &EnvOverrides) -> Result<()> {
             .parse()
             .with_context(|| format!("CB_DAEMON_TTY_BAUD `{raw}`"))?;
     }
+    if let Some(ref raw) = env.ws_idle_timeout_minutes {
+        let minutes: u64 = raw
+            .parse()
+            .with_context(|| format!("CB_DAEMON_WS_IDLE_TIMEOUT_MINUTES `{raw}`"))?;
+        cfg.ws_idle_timeout = Duration::from_secs(minutes.saturating_mul(60));
+    }
+    if let Some(ref raw) = env.ws_idle_retry_seconds {
+        let seconds: u64 = raw
+            .parse()
+            .with_context(|| format!("CB_DAEMON_WS_IDLE_RETRY_SECONDS `{raw}`"))?;
+        cfg.ws_idle_retry_interval = Duration::from_secs(seconds);
+    }
     Ok(())
 }
 
@@ -390,6 +446,12 @@ fn apply_cli(cfg: &mut Config, cli: &CliArgs) -> Result<()> {
     }
     if let Some(baud) = cli.tty_baud {
         cfg.tty_baud = baud;
+    }
+    if let Some(minutes) = cli.ws_idle_timeout_minutes {
+        cfg.ws_idle_timeout = Duration::from_secs(minutes.saturating_mul(60));
+    }
+    if let Some(seconds) = cli.ws_idle_retry_seconds {
+        cfg.ws_idle_retry_interval = Duration::from_secs(seconds);
     }
     Ok(())
 }
@@ -432,6 +494,24 @@ fn validate(cfg: &Config) -> Result<()> {
     }
     if cfg.tty_baud == 0 {
         bail!("tty_baud must be > 0");
+    }
+    // ws_idle_timeout_minutes of 0 is valid (failsafe disabled); only the
+    // retry interval has a floor so a misconfigured retry cannot hot-loop
+    // the bus. The timeout has a ceiling: `Instant::now() + timeout` panics
+    // on overflow, which would kill the watchdog task mid-run (failsafe
+    // silently off) instead of failing startup with a clear message.
+    if cfg.ws_idle_timeout > MAX_WS_IDLE_TIMEOUT {
+        bail!(
+            "ws_idle_timeout_minutes must be <= {} minutes (1 year), got {} minutes",
+            MAX_WS_IDLE_TIMEOUT.as_secs() / 60,
+            cfg.ws_idle_timeout.as_secs() / 60
+        );
+    }
+    if cfg.ws_idle_retry_interval < Duration::from_secs(1) {
+        bail!(
+            "ws_idle_retry_seconds must be >= 1 second, got {}",
+            cfg.ws_idle_retry_interval.as_secs()
+        );
     }
     Ok(())
 }
@@ -519,9 +599,13 @@ mod tests {
         assert_eq!(cfg.aoa_chunk_size, DEFAULT_AOA_CHUNK_SIZE);
         assert_eq!(cfg.aoa_chunk_delay_ms, DEFAULT_AOA_CHUNK_DELAY_MS);
         assert_eq!(cfg.tty_baud, DEFAULT_TTY_BAUD);
+        assert_eq!(cfg.ws_idle_timeout, DEFAULT_WS_IDLE_TIMEOUT);
+        assert_eq!(cfg.ws_idle_retry_interval, DEFAULT_WS_IDLE_RETRY_INTERVAL);
         assert_eq!(DEFAULT_AOA_CHUNK_SIZE, AOA_MAX_CHUNK);
         assert_eq!(DEFAULT_AOA_CHUNK_DELAY_MS, AOA_INTER_CHUNK_DELAY_MS);
         assert_eq!(DEFAULT_TTY_BAUD, TTY_BAUD);
+        assert_eq!(DEFAULT_WS_IDLE_TIMEOUT, Duration::from_mins(15));
+        assert_eq!(DEFAULT_WS_IDLE_RETRY_INTERVAL, Duration::from_mins(1));
     }
 
     #[test]
@@ -542,6 +626,8 @@ aoa_chunk_size = 10
 aoa_chunk_delay_ms = 2
 tty_baud = 9600
 unit_id_hint = "abcde"
+ws_idle_timeout_minutes = 30
+ws_idle_retry_seconds = 120
 "#,
         );
         let file = load_file_config(&path).unwrap();
@@ -557,6 +643,8 @@ unit_id_hint = "abcde"
             aoa_chunk_size: Some("20".into()),
             aoa_chunk_delay_ms: Some("3".into()),
             tty_baud: Some("19200".into()),
+            ws_idle_timeout_minutes: Some("45".into()),
+            ws_idle_retry_seconds: Some("180".into()),
             config: None,
         };
         apply_env(&mut cfg, &env).unwrap();
@@ -570,6 +658,8 @@ unit_id_hint = "abcde"
             aoa_chunk_size: Some(30),
             aoa_chunk_delay_ms: Some(4),
             tty_baud: Some(38400),
+            ws_idle_timeout_minutes: Some(60),
+            ws_idle_retry_seconds: Some(240),
             config: None,
         };
         apply_cli(&mut cfg, &cli).unwrap();
@@ -583,6 +673,8 @@ unit_id_hint = "abcde"
         assert_eq!(cfg.aoa_chunk_size, 30);
         assert_eq!(cfg.aoa_chunk_delay_ms, 4);
         assert_eq!(cfg.tty_baud, 38400);
+        assert_eq!(cfg.ws_idle_timeout, Duration::from_hours(1));
+        assert_eq!(cfg.ws_idle_retry_interval, Duration::from_mins(4));
 
         let _ = fs::remove_file(path);
     }
@@ -734,5 +826,100 @@ log_level = "debug"
         validate(&cfg).unwrap();
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.backend, Backend::Aoa);
+    }
+
+    #[test]
+    fn ws_idle_timeout_zero_passes_validation() {
+        let cfg = Config {
+            ws_idle_timeout: Duration::ZERO,
+            ..Config::default()
+        };
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn ws_idle_retry_zero_rejected_by_validation() {
+        let cfg = Config {
+            ws_idle_retry_interval: Duration::ZERO,
+            ..Config::default()
+        };
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ws_idle_retry_seconds must be >= 1 second, got 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ws_idle_timeout_over_one_year_rejected_by_validation() {
+        let cfg = Config {
+            ws_idle_timeout: MAX_WS_IDLE_TIMEOUT + Duration::from_mins(1),
+            ..Config::default()
+        };
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ws_idle_timeout_minutes must be <= 525600 minutes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ws_idle_timeout_at_one_year_passes_validation() {
+        let cfg = Config {
+            ws_idle_timeout: MAX_WS_IDLE_TIMEOUT,
+            ..Config::default()
+        };
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn ws_idle_env_values_apply_and_bad_values_error() {
+        let env = EnvOverrides {
+            ws_idle_timeout_minutes: Some("7".into()),
+            ws_idle_retry_seconds: Some("15".into()),
+            ..EnvOverrides::default()
+        };
+        let mut cfg = Config::default();
+        apply_env(&mut cfg, &env).unwrap();
+        assert_eq!(cfg.ws_idle_timeout, Duration::from_mins(7));
+        assert_eq!(cfg.ws_idle_retry_interval, Duration::from_secs(15));
+
+        let env = EnvOverrides {
+            ws_idle_timeout_minutes: Some("abc".into()),
+            ..EnvOverrides::default()
+        };
+        let mut cfg = Config::default();
+        let err = apply_env(&mut cfg, &env).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(full.contains("CB_DAEMON_WS_IDLE_TIMEOUT_MINUTES"), "{full}");
+
+        let env = EnvOverrides {
+            ws_idle_retry_seconds: Some("nope".into()),
+            ..EnvOverrides::default()
+        };
+        let mut cfg = Config::default();
+        let err = apply_env(&mut cfg, &env).unwrap_err();
+        let full = format!("{err:#}");
+        assert!(full.contains("CB_DAEMON_WS_IDLE_RETRY_SECONDS"), "{full}");
+    }
+
+    #[test]
+    fn ws_idle_cli_absent_leaves_file_value() {
+        let mut cfg = Config::default();
+        apply_file(
+            &mut cfg,
+            &FileConfig {
+                ws_idle_timeout_minutes: Some(20),
+                ws_idle_retry_seconds: Some(90),
+                ..FileConfig::default()
+            },
+        )
+        .unwrap();
+        apply_cli(&mut cfg, &CliArgs::default()).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.ws_idle_timeout, Duration::from_mins(20));
+        assert_eq!(cfg.ws_idle_retry_interval, Duration::from_secs(90));
     }
 }
