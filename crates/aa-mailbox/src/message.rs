@@ -116,7 +116,7 @@ pub enum ClientMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         zone: Option<u8>,
     },
-    /// Non-register command (`resync` | `flush_unit`).
+    /// Non-register command (`resync`).
     Command {
         /// Client correlation id.
         msg_id: String,
