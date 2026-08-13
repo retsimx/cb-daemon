@@ -341,6 +341,81 @@ pub fn validate_write(reg: RegId, payload: &Value) -> Result<(), WriteError> {
     check_ranges(reg.get(), data)
 }
 
+/// Shallow typed-object merge of a client write over the bank's decoded DTO.
+///
+/// Starts from `bank`'s object and overlays `overlay`'s fields — the overlay
+/// (client) wins per-field; bank-only fields are preserved. Both inputs are
+/// [`serde_json::Value`]s. Defensive fallbacks (callers guarantee both are
+/// objects): a non-object `bank` returns `overlay` unchanged; a non-object
+/// `overlay` returns `bank`'s object unchanged (or `overlay` if `bank` is not
+/// an object either).
+#[must_use]
+pub fn merge_payload(bank: &Value, overlay: &Value) -> Value {
+    let Some(mut obj) = bank.as_object().cloned() else {
+        return overlay.clone();
+    };
+    let Some(overlay_obj) = overlay.as_object() else {
+        return Value::Object(obj);
+    };
+    for (key, value) in overlay_obj {
+        obj.insert(key.clone(), value.clone());
+    }
+    Value::Object(obj)
+}
+
+/// Validate a sparse-merge write against the D-4 write policy and the wire
+/// ranges.
+///
+/// Mirrors [`validate_write`] for the sparse-merge path: the mode check and
+/// the range check run on the merged payload, but the read-only field check
+/// applies to the **client-sent** keys only — the merged payload legitimately
+/// carries read-only fields from the bank (e.g. `rf_sys_id` on reg `05`) and
+/// must not fail on them.
+///
+/// Precedence: mode → field → range. Raw-hex client payloads bypass the field
+/// and range checks (client responsibility) but still fail the mode check. A
+/// merged payload that fails to encode skips the range check — the outer write
+/// path surfaces the real [`EncodeError`].
+///
+/// # Errors
+///
+/// Returns [`WriteError::ReadOnlyRegister`] / [`WriteError::InternalRegister`]
+/// / [`WriteError::UnverifiedRegister`] for non-writable registers,
+/// [`WriteError::ReadOnlyField`] for a client-sent payload carrying a
+/// read-only field, and [`WriteError::OutOfRange`] for a merged wire value
+/// above its bound.
+pub fn validate_write_merged(reg: RegId, client: &Value, merged: &Value) -> Result<(), WriteError> {
+    let policy = write_policy(reg);
+    match policy.mode {
+        PolicyMode::ReadOnly => return Err(WriteError::ReadOnlyRegister { reg: reg.get() }),
+        PolicyMode::Internal => return Err(WriteError::InternalRegister { reg: reg.get() }),
+        PolicyMode::Unverified => return Err(WriteError::UnverifiedRegister { reg: reg.get() }),
+        PolicyMode::WriteOnly | PolicyMode::ReadWrite => {}
+    }
+    if client.as_str().is_some() {
+        return Ok(());
+    }
+    if let Some(obj) = client.as_object() {
+        for key in obj.keys() {
+            if let Some(field) = policy
+                .read_only_fields
+                .iter()
+                .copied()
+                .find(|f| *f == key.as_str())
+            {
+                return Err(WriteError::ReadOnlyField {
+                    reg: reg.get(),
+                    field,
+                });
+            }
+        }
+    }
+    let Ok(data) = encode_payload(reg, merged) else {
+        return Ok(());
+    };
+    check_ranges(reg.get(), data)
+}
+
 /// Build the multi-unit snapshot body from a register bank.
 ///
 /// Keyed by `"{unit_type}:{unit_id}"` via the [`std::fmt::Display`] impls
@@ -538,7 +613,7 @@ fn measured_from_c(temp_c: f64) -> (u8, u8) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{check_ranges, validate_write};
+    use super::{check_ranges, merge_payload, validate_write, validate_write_merged};
     use crate::error::WriteError;
     use aa_registers::RegId;
     use serde_json::{Value, json};
@@ -778,5 +853,154 @@ mod tests {
     fn ranges_skipped_for_registers_without_table() {
         assert_eq!(check_ranges(0x09, [0xff; 7]), Ok(()));
         assert_eq!(check_ranges(0x1e, [0xff; 7]), Ok(()));
+    }
+
+    #[test]
+    fn merge_payload_overlays_client_fields_over_bank() {
+        let bank = json!({
+            "power": "on",
+            "mode": "cool",
+            "fan": "high",
+            "target_temp_c": 21.0,
+            "myzone_id": 3,
+            "fresh_air": false,
+            "rf_sys_id": 5,
+        });
+        let client = json!({ "power": "off", "target_temp_c": 24.0 });
+        let merged = merge_payload(&bank, &client);
+        assert_eq!(
+            merged,
+            json!({
+                "power": "off",
+                "mode": "cool",
+                "fan": "high",
+                "target_temp_c": 24.0,
+                "myzone_id": 3,
+                "fresh_air": false,
+                "rf_sys_id": 5,
+            }),
+            "client wins per-field; bank-only fields preserved"
+        );
+    }
+
+    #[test]
+    fn merge_payload_falls_back_to_overlay_when_bank_not_object() {
+        let bank = raw_hex("01010330000100");
+        let client = json!({ "power": "on" });
+        assert_eq!(
+            merge_payload(&bank, &client),
+            client,
+            "non-object bank returns overlay unchanged"
+        );
+        assert_eq!(
+            merge_payload(&bank, &bank),
+            bank,
+            "non-object bank and overlay return overlay"
+        );
+    }
+
+    #[test]
+    fn merge_payload_keeps_bank_object_when_overlay_not_object() {
+        let bank = json!({ "power": "on", "rf_sys_id": 5 });
+        let overlay = raw_hex("01010330000100");
+        assert_eq!(
+            merge_payload(&bank, &overlay),
+            bank,
+            "non-object overlay returns bank's object unchanged"
+        );
+    }
+
+    #[test]
+    fn validate_write_merged_rejects_client_sent_read_only_field() {
+        let bank = json!({
+            "power": "on",
+            "mode": "cool",
+            "fan": "high",
+            "target_temp_c": 21.0,
+            "myzone_id": 3,
+            "fresh_air": false,
+            "rf_sys_id": 5,
+        });
+        let client = json!({ "rf_sys_id": 1 });
+        let merged = merge_payload(&bank, &client);
+        let err = validate_write_merged(RegId::new(0x05), &client, &merged).unwrap_err();
+        assert_eq!(
+            err,
+            WriteError::ReadOnlyField {
+                reg: 0x05,
+                field: "rf_sys_id",
+            }
+        );
+    }
+
+    #[test]
+    fn validate_write_merged_accepts_bank_read_only_fields() {
+        let bank = json!({
+            "power": "on",
+            "mode": "cool",
+            "fan": "high",
+            "target_temp_c": 21.0,
+            "myzone_id": 3,
+            "fresh_air": false,
+            "rf_sys_id": 5,
+        });
+        let client = json!({ "power": "on" });
+        let merged = merge_payload(&bank, &client);
+        assert_eq!(
+            validate_write_merged(RegId::new(0x05), &client, &merged),
+            Ok(()),
+            "merged payload carrying bank read-only fields (rf_sys_id) accepted"
+        );
+    }
+
+    #[test]
+    fn validate_write_merged_enforces_mode_check() {
+        let bank = json!({ "error_code": 0 });
+        let client = json!({ "error_code": 1 });
+        let merged = merge_payload(&bank, &client);
+        let err = validate_write_merged(RegId::new(0x08), &client, &merged).unwrap_err();
+        assert_eq!(err, WriteError::ReadOnlyRegister { reg: 0x08 });
+    }
+
+    #[test]
+    fn validate_write_merged_enforces_range_check_on_merged_bytes() {
+        let bank = json!({
+            "header": 0x20,
+            "total_zones": 10,
+            "constant_zones": 1,
+            "constant_zone_ids": [1, 0, 0],
+            "filter_clean_required": false,
+        });
+        let client = json!({ "total_zones": 11 });
+        let merged = merge_payload(&bank, &client);
+        let err = validate_write_merged(RegId::new(0x01), &client, &merged).unwrap_err();
+        assert_eq!(
+            err,
+            WriteError::OutOfRange {
+                field: "numZones",
+                value: 11,
+                max: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_write_merged_accepts_raw_hex_client_payload() {
+        let bank = json!({
+            "power": "on",
+            "mode": "cool",
+            "fan": "high",
+            "target_temp_c": 21.0,
+            "myzone_id": 3,
+            "fresh_air": false,
+            "rf_sys_id": 5,
+        });
+        let client = raw_hex("01010330000100");
+        let merged = merge_payload(&bank, &client);
+        assert_eq!(
+            validate_write_merged(RegId::new(0x05), &client, &merged),
+            Ok(()),
+            "raw-hex client payload bypasses field and range checks"
+        );
     }
 }

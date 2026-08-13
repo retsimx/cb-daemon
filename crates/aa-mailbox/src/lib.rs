@@ -31,7 +31,10 @@ pub mod error;
 pub mod message;
 pub mod policy;
 
-pub use convert::{decode_payload, encode_payload, event_body, snapshot_units, validate_write};
+pub use convert::{
+    decode_payload, encode_payload, event_body, merge_payload, snapshot_units, validate_write,
+    validate_write_merged,
+};
 pub use dto::{
     AckStatus, ActionEnum, ActivationStatus, FanEnum, FirmwareDto, InfoByteDto, ModeEnum,
     PowerEnum, RfDeviceCalibrationDto, RfDevicePairingDto, SensorPairingDto, SensorPairingWriteDto,
