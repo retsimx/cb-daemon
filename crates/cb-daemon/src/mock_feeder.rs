@@ -28,11 +28,14 @@ pub(crate) const FEEDER_UNIT_ID: UnitId = match UnitId::try_new(0x0_ABCDE) {
 /// [`FeederSpec::default`] reproduces the legacy feeder exactly; acceptance
 /// tests override individual behaviors with the builder methods.
 #[derive(Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct FeederSpec {
     omit_reg05: bool,
     scripted_reg06: Option<CanRecord>,
+
     stop_after_dump: bool,
     corrupt_next_getcan: bool,
+    scripted_nack_after_write: bool,
 }
 
 impl FeederSpec {
@@ -88,6 +91,18 @@ impl FeederSpec {
         self
     }
 
+    /// NACK the next client write (D-15): the first `setCAN` carrying write
+    /// records (and no JZ18 reg-07 record) is answered with `getCAN 0`
+    /// instead of the write echo — the engine acks and resends the exact
+    /// setCAN on a later ping, which this mock then echoes normally.
+    /// Fire-once: subsequent setCANs echo normally.
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn scripted_nack_after_write(mut self) -> Self {
+        self.scripted_nack_after_write = true;
+        self
+    }
+
     /// Sample records carried by getCAN replies (dump and flush full-set).
     fn samples(&self) -> Vec<CanRecord> {
         let mut out = Vec::new();
@@ -99,10 +114,25 @@ impl FeederSpec {
     }
 }
 
+/// One wire-direction record of the shared mock link's history.
+///
+/// `Tx` is a frame the engine wrote to the link (the feeder drains it from
+/// `written()` on its next poll); `Rx` is bytes the engine read (frames the
+/// feeder pushed inbound). Kept for wire-level test assertions (D-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireEntry {
+    Tx(Vec<u8>),
+    Rx(Vec<u8>),
+}
+
 /// [`MockLink`] shared with the feeder; `read` waits when inbound is empty (not EOF).
 pub(crate) struct SharedMockLink {
     inner: Arc<Mutex<MockLink>>,
     notify: Arc<Notify>,
+    /// Never-drained wire record (engine Tx + engine Rx chunks) for tests:
+    /// the feeder drains `written()` every poll, so this is the only stable
+    /// wire history.
+    history: Arc<Mutex<Vec<WireEntry>>>,
 }
 
 impl SharedMockLink {
@@ -115,10 +145,17 @@ impl SharedMockLink {
             Self {
                 inner: Arc::clone(&inner),
                 notify: Arc::clone(&notify),
+                history: Arc::new(Mutex::new(Vec::new())),
             },
             inner,
             notify,
         )
+    }
+
+    /// Clone of the never-drained wire history (test support for the app).
+    #[must_use]
+    pub(crate) fn wire_history(&self) -> Arc<Mutex<Vec<WireEntry>>> {
+        Arc::clone(&self.history)
     }
 }
 
@@ -132,6 +169,10 @@ impl Link for SharedMockLink {
                 n
             };
             if n > 0 {
+                self.history
+                    .lock()
+                    .await
+                    .push(WireEntry::Rx(buf[..n].to_vec()));
                 return Ok(n);
             }
             self.notify.notified().await;
@@ -139,8 +180,14 @@ impl Link for SharedMockLink {
     }
 
     async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().await;
-        guard.write_all(data).await
+        let result = {
+            let mut guard = self.inner.lock().await;
+            guard.write_all(data).await
+        };
+        if result.is_ok() {
+            self.history.lock().await.push(WireEntry::Tx(data.to_vec()));
+        }
+        result
     }
 
     async fn close(&mut self) -> std::io::Result<()> {
@@ -360,6 +407,10 @@ struct CorruptGetcanState {
 /// `scripted` holds the next unsolicited reg-06 record to announce: the
 /// first bare-getCAN poll (empty poll with no pending echoes) carries it
 /// instead of an empty getCAN, firing it exactly once.
+///
+/// `nack_armed` holds the fire-once D-15 NACK flag: the first write-carrying
+/// setCAN (no JZ18 reg-07 records) is answered with `getCAN 0` instead of
+/// the write echo, then disarmed.
 #[allow(clippy::too_many_arguments)]
 async fn reply_to_poll(
     mock: &Arc<Mutex<MockLink>>,
@@ -368,7 +419,10 @@ async fn reply_to_poll(
     pending_echo: &mut Vec<CanRecord>,
     spec: &FeederSpec,
     scripted: &mut Option<CanRecord>,
+
     corrupt: &mut CorruptGetcanState,
+
+    nack_armed: &mut bool,
 ) {
     if written_has_frame(&written, DUMP_SET_CAN) {
         push_frame(mock, notify, &get_can_with_sample(spec)).await;
@@ -401,29 +455,41 @@ async fn reply_to_poll(
             pending_echo.clear();
         }
     } else if let Some(records) = parse_set_can_records(&written) {
-        // setCAN carrying write records → the CB applies the write and
-        // reports the updated registers back in its next getCAN
-        // (aaservice parity); queue the echo so RegistersChanged fan-out
-        // events reach WebSocket sessions after the write's ack.
-        //
-        // A reg-06 ControlBox flush flips the CB into full-set reply mode:
-        // the getCAN carries the whole sample register set plus every flush
-        // record from the batch (mirrors real CB flush behavior and lets
-        // read-verb pending reads resolve against reg 05). The full-set
-        // reply wins over write echoes for that batch; all flush records
-        // found are included, in batch order.
-        let flush_records: Vec<CanRecord> = records
-            .iter()
-            .filter(|record| is_reg06_flush(record))
-            .cloned()
-            .collect();
-        if flush_records.is_empty() {
-            pending_echo.extend(records);
+        // D-15: a fire-once scripted NACK — the CB answers the client write
+        // with `getCAN 0` instead of the write echo; the engine acks and
+        // resends the exact setCAN on a later ping, which this mock then
+        // echoes normally. JZ18 reg-07 replies are engine-internal (client
+        // reg-07 writes are rejected by the WS write policy), so batches
+        // carrying them never consume the fire-once flag — the NACK
+        // deterministically targets the client's write.
+        if *nack_armed && records.iter().all(|record| record.reg != RegId::new(0x07)) {
+            *nack_armed = false;
+            push_frame(mock, notify, b"getCAN 0").await;
         } else {
-            let mut reply = spec.samples();
-            reply.push(sample_record_16());
-            reply.extend(flush_records);
-            push_frame(mock, notify, &get_can_from_records(&reply)).await;
+            // setCAN carrying write records → the CB applies the write and
+            // reports the updated registers back in its next getCAN
+            // (aaservice parity); queue the echo so RegistersChanged fan-out
+            // events reach WebSocket sessions after the write's ack.
+            //
+            // A reg-06 ControlBox flush flips the CB into full-set reply mode:
+            // the getCAN carries the whole sample register set plus every flush
+            // record from the batch (mirrors real CB flush behavior and lets
+            // read-verb pending reads resolve against reg 05). The full-set
+            // reply wins over write echoes for that batch; all flush records
+            // found are included, in batch order.
+            let flush_records: Vec<CanRecord> = records
+                .iter()
+                .filter(|record| is_reg06_flush(record))
+                .cloned()
+                .collect();
+            if flush_records.is_empty() {
+                pending_echo.extend(records);
+            } else {
+                let mut reply = spec.samples();
+                reply.push(sample_record_16());
+                reply.extend(flush_records);
+                push_frame(mock, notify, &get_can_from_records(&reply)).await;
+            }
         }
     }
 }
@@ -435,7 +501,13 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spe
     let mut pending_echo: Vec<CanRecord> = Vec::new();
     let mut spec = spec;
     let mut scripted = spec.scripted_reg06.take();
+
     let mut corrupt = CorruptGetcanState::default();
+
+    // Fire-once D-15 NACK arm: read from the spec like `scripted_reg06`; the
+    // flag survives until the first client write is NACK'd.
+    let mut nack_armed = spec.scripted_nack_after_write;
+
     loop {
         // Detect closed link without reading inbound (would corrupt queued frames).
         {
@@ -485,6 +557,7 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spe
             &spec,
             &mut scripted,
             &mut corrupt,
+            &mut nack_armed,
         )
         .await;
         if is_ack {
@@ -586,6 +659,7 @@ mod tests {
             &FeederSpec::default(),
             &mut scripted,
             &mut corrupt,
+            &mut false,
         )
         .await;
 
@@ -632,6 +706,7 @@ mod tests {
             &FeederSpec::default(),
             &mut scripted,
             &mut corrupt,
+            &mut false,
         )
         .await;
 
@@ -703,6 +778,7 @@ mod tests {
             &FeederSpec::default(),
             &mut scripted_slot,
             &mut corrupt,
+            &mut false,
         )
         .await;
 
@@ -746,6 +822,7 @@ mod tests {
             &FeederSpec::default(),
             &mut scripted_slot,
             &mut corrupt,
+            &mut false,
         )
         .await;
 
@@ -781,6 +858,7 @@ mod tests {
             &FeederSpec::default().without_reg05(),
             &mut scripted,
             &mut corrupt,
+            &mut false,
         )
         .await;
 
@@ -892,6 +970,7 @@ mod tests {
             &spec,
             &mut scripted,
             &mut corrupt,
+            &mut false,
         )
         .await;
         let mut buf = vec![0u8; 4096];
@@ -921,6 +1000,7 @@ mod tests {
             &spec,
             &mut scripted,
             &mut corrupt,
+            &mut false,
         )
         .await;
         assert!(corrupt.retransmitted, "{corrupt:?}");
@@ -939,8 +1019,100 @@ mod tests {
             &spec,
             &mut scripted,
             &mut corrupt,
+            &mut false,
         )
         .await;
         assert_eq!(take_inbound_payload(&mock).await, b"getCAN 1");
+    }
+
+    #[tokio::test]
+    async fn scripted_nack_after_write_replies_get_can_zero_once() {
+        let (_, mock, notify) = SharedMockLink::new();
+        let write = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x2e, 0x00, 0x01, 0x00],
+        };
+        let jz18 = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::ControlBox,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x07),
+            data: [0; 7],
+        };
+        let mut pending_echo = Vec::new();
+        let mut scripted = None;
+        let mut nack_armed = true;
+        let mut corrupt = CorruptGetcanState::default();
+
+        // A JZ18 reg-07 reply is engine-internal and must not consume the
+        // fire-once flag (the acceptance test's write must be NACK'd, not
+        // the dump's JZ18 handshake).
+        reply_to_poll(
+            &mock,
+            &notify,
+            written_batch(std::slice::from_ref(&jz18)),
+            &mut pending_echo,
+            &FeederSpec::default(),
+            &mut scripted,
+            &mut corrupt,
+            &mut nack_armed,
+        )
+        .await;
+        assert_eq!(pending_echo, vec![jz18.clone()], "JZ18 must still echo");
+        assert!(nack_armed, "JZ18 reply must not consume the fire-once NACK");
+
+        // The client write's setCAN is NACK'd exactly once: `getCAN 0`
+        // pushed, no write echo queued.
+        reply_to_poll(
+            &mock,
+            &notify,
+            written_batch(std::slice::from_ref(&write)),
+            &mut pending_echo,
+            &FeederSpec::default(),
+            &mut scripted,
+            &mut corrupt,
+            &mut nack_armed,
+        )
+        .await;
+        assert_eq!(
+            take_inbound_payload(&mock).await,
+            b"getCAN 0",
+            "the NACK'd write must be answered with getCAN 0"
+        );
+        assert!(!nack_armed, "the NACK must fire exactly once");
+        assert_eq!(
+            pending_echo,
+            vec![jz18.clone()],
+            "the NACK'd batch must not queue a write echo"
+        );
+
+        // Subsequent write setCANs echo normally (flag consumed).
+        reply_to_poll(
+            &mock,
+            &notify,
+            written_batch(std::slice::from_ref(&write)),
+            &mut pending_echo,
+            &FeederSpec::default(),
+            &mut scripted,
+            &mut corrupt,
+            &mut nack_armed,
+        )
+        .await;
+        assert_eq!(
+            pending_echo,
+            vec![jz18, write],
+            "later setCANs must echo normally"
+        );
+        let mut buf = vec![0u8; 64];
+        let n = mock
+            .lock()
+            .await
+            .read(&mut buf)
+            .await
+            .expect("inbound read");
+        assert_eq!(n, 0, "echo batch must not push an immediate reply");
     }
 }
