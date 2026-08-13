@@ -95,6 +95,7 @@ impl App {
             Some(spec),
             DEFAULT_WS_IDLE_TIMEOUT,
             DEFAULT_WS_IDLE_RETRY_INTERVAL,
+            ws::SessionTimeouts::default(),
         )
         .await?;
         Ok(handle)
@@ -129,6 +130,7 @@ impl App {
             feeder,
             DEFAULT_WS_IDLE_TIMEOUT,
             DEFAULT_WS_IDLE_RETRY_INTERVAL,
+            ws::SessionTimeouts::default(),
         )
         .await
     }
@@ -169,7 +171,41 @@ impl App {
         ws_idle_timeout: Duration,
         ws_idle_retry_interval: Duration,
     ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
-        Self::spawn_mock_ctrl_inner(bind, feeder, ws_idle_timeout, ws_idle_retry_interval).await
+        Self::spawn_mock_ctrl_inner(
+            bind,
+            feeder,
+            ws_idle_timeout,
+            ws_idle_retry_interval,
+            ws::SessionTimeouts::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::spawn_mock_ctrl_with_timeouts`] with custom session
+    /// read/write timeouts threaded into each WebSocket session.
+    ///
+    /// Test hook: short `timeouts.read` fires quickly when a client stops
+    /// sending frames, exercising the silent-bus disconnect path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates bind / spawn failures.
+    #[allow(private_interfaces)]
+    pub async fn spawn_mock_ctrl_with_session_timeouts(
+        bind: SocketAddr,
+        feeder: Option<FeederSpec>,
+        ws_idle_timeout: Duration,
+        ws_idle_retry_interval: Duration,
+        timeouts: ws::SessionTimeouts,
+    ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
+        Self::spawn_mock_ctrl_inner(
+            bind,
+            feeder,
+            ws_idle_timeout,
+            ws_idle_retry_interval,
+            timeouts,
+        )
+        .await
     }
 }
 
@@ -179,6 +215,7 @@ impl App {
         feeder: Option<FeederSpec>,
         ws_idle_timeout: Duration,
         ws_idle_retry_interval: Duration,
+        timeouts: ws::SessionTimeouts,
     ) -> anyhow::Result<(AppHandle, MockLinkCtrl)> {
         let listener = TcpListener::bind(bind)
             .await
@@ -203,6 +240,7 @@ impl App {
                 notify,
                 ws_idle_timeout,
                 ws_idle_retry_interval,
+                timeouts,
             )
             .await
         });
@@ -301,6 +339,7 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
                 hint,
                 config.ws_idle_timeout,
                 config.ws_idle_retry_interval,
+                ws::SessionTimeouts::default(),
             )
             .await
         }
@@ -315,6 +354,7 @@ pub async fn run_with_listener(config: Config, listener: TcpListener) -> anyhow:
                 hint,
                 config.ws_idle_timeout,
                 config.ws_idle_retry_interval,
+                ws::SessionTimeouts::default(),
             )
             .await
         }
@@ -370,6 +410,7 @@ async fn run_mock_with_listener(
         notify,
         ws_idle_timeout,
         ws_idle_retry_interval,
+        ws::SessionTimeouts::default(),
     )
     .await
 }
@@ -387,6 +428,7 @@ async fn run_mock_with_parts(
     notify: Arc<Notify>,
     ws_idle_timeout: Duration,
     ws_idle_retry_interval: Duration,
+    timeouts: ws::SessionTimeouts,
 ) -> anyhow::Result<()> {
     let feeder = feeder.map(|spec| tokio::spawn(mock_feeder::run_feeder(mock, notify, spec)));
     let result = run_with_link(
@@ -397,6 +439,7 @@ async fn run_mock_with_parts(
         None,
         ws_idle_timeout,
         ws_idle_retry_interval,
+        timeouts,
     )
     .await;
     if let Some(feeder) = feeder {
@@ -406,6 +449,7 @@ async fn run_mock_with_parts(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_with_link<L: Link + 'static>(
     listener: TcpListener,
     link: L,
@@ -414,6 +458,7 @@ async fn run_with_link<L: Link + 'static>(
     unit_id_hint: Option<aa_registers::UnitId>,
     ws_idle_timeout: Duration,
     ws_idle_retry_interval: Duration,
+    timeouts: ws::SessionTimeouts,
 ) -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(CHANNEL_BOUND);
     let (ev_tx, ev_rx) = mpsc::channel::<EngineEvent>(CHANNEL_BOUND);
@@ -440,6 +485,7 @@ async fn run_with_link<L: Link + 'static>(
         cmd_spy,
         unit_id_hint,
         clients: clients_tx,
+        timeouts,
     };
     let router = ws::router(state.clone());
     // Detached: the watchdog holds its own state clones and never blocks
