@@ -19,6 +19,17 @@ pub(crate) enum State {
     Steady,
 }
 
+/// getCAN `0` NACK retry state for the current buffered setCAN generation:
+/// `Idle` (no NACK since the last write TX) → `Pending` (NACK seen, resend due
+/// on the next ping) → `Sent` (resend TX'd; further NACKs warn until the
+/// buffer refreshes on the next write-queue drain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NackResend {
+    Idle,
+    Pending,
+    Sent,
+}
+
 /// Pure sync session: Ping/frame handlers, register bank, write queue.
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)] // protocol flags are independent, not a bitfield
@@ -46,6 +57,11 @@ pub(crate) struct Session {
     crc_ok: bool,
     /// Mirrors stock `canInUse`: after `CAN2 in use`, skip empty `setCAN`.
     can_in_use: bool,
+    /// Byte-exact payload of the most recent non-empty steady `setCAN` TX;
+    /// the `getCAN 0` NACK resend target.
+    last_set_can: Option<Vec<u8>>,
+    /// getCAN-NACK retry state for the current buffered generation.
+    nack_resend: NackResend,
     shutdown: bool,
 }
 
@@ -79,6 +95,8 @@ impl Session {
             write_flushed: false,
             crc_ok: true,
             can_in_use: false,
+            last_set_can: None,
+            nack_resend: NackResend::Idle,
             shutdown: false,
         }
     }
@@ -154,6 +172,11 @@ impl Session {
                 self.dirty_reset_sent = false;
                 self.reset_nacks = 0;
                 self.ack_armed = false;
+                // The re-dump invalidates the buffered setCAN generation: a
+                // NACK pending at resync time must not resend a stale
+                // pre-resync write onto the re-dumped CB.
+                self.nack_resend = NackResend::Idle;
+                self.last_set_can = None;
             }
             EngineCmd::Shutdown => {
                 self.shutdown = true;
@@ -211,7 +234,10 @@ impl Session {
                 // Match aaservice UartDispatchEngine.onPing:
                 // ack → queued writes → else empty setCAN. Never send empty
                 // setCAN while can_in_use.
-                if self.ack_armed || !self.write_queue.is_empty() {
+                if self.ack_armed
+                    || self.nack_resend == NackResend::Pending
+                    || !self.write_queue.is_empty()
+                {
                     return Some(self.steady_tx());
                 }
                 if self.can_in_use {
@@ -252,6 +278,17 @@ impl Session {
             }
             return ACK_CAN_ZERO.to_vec();
         }
+        // getCAN 0 NACK: resend the last setCAN byte-for-byte, once per generation.
+        if self.nack_resend == NackResend::Pending {
+            self.nack_resend = NackResend::Sent;
+            // Invariant: `Pending` is only entered from the `on_steady_frame`
+            // NACK branch while the buffer exists, and `ResyncMailbox` clears
+            // both fields together; a silent empty-setCAN fallback would bus a
+            // wrong frame, so a missing buffer must fail loud instead.
+            return self.last_set_can.clone().unwrap_or_else(|| {
+                unreachable!("nack_resend == Pending implies last_set_can is Some")
+            });
+        }
         if !self.write_queue.is_empty() {
             let records = std::mem::take(&mut self.write_queue);
             self.write_flushed = true;
@@ -262,7 +299,12 @@ impl Session {
             for pending in &mut self.pending_reads {
                 pending.flush_sent = true;
             }
-            return build_set_can(&records);
+            let payload = build_set_can(&records);
+            // Fresh generation = fresh resend entitlement: byte-exact copy is
+            // the NACK resend target until the next write-queue drain.
+            self.last_set_can = Some(payload.clone());
+            self.nack_resend = NackResend::Idle;
+            return payload;
         }
         EMPTY_SET_CAN.to_vec()
     }
@@ -363,6 +405,22 @@ impl Session {
             ))];
         }
         self.can_in_use = false;
+        if is_get_can_nack(payload) {
+            // NACK frames pass CRC, so ackCAN polarity stays 1 (reference parity).
+            self.ack_armed = true;
+            return match self.nack_resend {
+                NackResend::Idle if self.last_set_can.is_some() => {
+                    self.nack_resend = NackResend::Pending;
+                    Vec::new()
+                }
+                NackResend::Idle => vec![EngineEvent::ProtocolWarn(
+                    "getCAN NACK with no outstanding write; nothing to resend".into(),
+                )],
+                _ => vec![EngineEvent::ProtocolWarn(
+                    "getCAN NACK repeated; setCAN already resent once".into(),
+                )],
+            };
+        }
         match parse_get_can(payload) {
             Ok(records) => {
                 for record in &records {
@@ -483,6 +541,17 @@ mod tests {
             unit_id: UnitId::try_new(0x0_11111).unwrap(),
             reg: RegId::new(0x06),
             data: [0; 7],
+        }
+    }
+
+    /// A ControlBox-bound write record for steady-state write TX tests.
+    fn control_box_write(data: [u8; 7]) -> CanRecord {
+        CanRecord {
+            unit_type: UnitType::new(0x07),
+            dest: Dest::ControlBox,
+            unit_id: UnitId::try_new(0).unwrap(),
+            reg: RegId::new(0x06),
+            data,
         }
     }
 
@@ -769,6 +838,217 @@ mod tests {
     }
 
     #[test]
+    fn steady_get_can_nack_acks_then_resends_once() {
+        // D-15: a steady `getCAN 0` NACK is acked and the last setCAN is
+        // resent byte-for-byte exactly once per buffered generation; further
+        // NACKs warn and never resend again.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        // The reset-response reg-06 announced a JZ18 reply; drain it so the
+        // buffer holds exactly the write below.
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+
+        // Write TX: capture the exact payload the resend must match.
+        let rec = control_box_write([0x42; 7]);
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec.clone()]));
+        let tx = s.on_ping().unwrap();
+        assert_eq!(tx, build_set_can(std::slice::from_ref(&rec)));
+        assert!(!s.ack_armed);
+        assert_eq!(s.nack_resend, NackResend::Idle);
+
+        // NACK: arm the ack and the resend; no events (buffer present).
+        let ev = s.on_frame(b"getCAN 0");
+        assert!(
+            ev.is_empty(),
+            "first NACK with a buffer must be silent: {ev:?}"
+        );
+        assert!(s.ack_armed);
+        assert_eq!(s.nack_resend, NackResend::Pending);
+
+        // Ack first, then the byte-identical resend, then a quiet poll.
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        let resend = s.on_ping().unwrap();
+        assert_eq!(resend, tx, "resend must be byte-identical to the write TX");
+        assert_eq!(s.nack_resend, NackResend::Sent);
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN, "no resend storm");
+
+        // A second NACK warns (already resent once) and never resends again.
+        let ev = s.on_frame(b"getCAN 0");
+        assert!(
+            matches!(ev.as_slice(), [EngineEvent::ProtocolWarn(_)]),
+            "second NACK must warn exactly once: {ev:?}"
+        );
+        assert!(s.ack_armed);
+        assert_eq!(s.nack_resend, NackResend::Sent);
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            EMPTY_SET_CAN,
+            "no second resend after a repeated NACK"
+        );
+    }
+
+    #[test]
+    fn steady_get_can_nack_with_nothing_buffered_warns() {
+        // D-15: a steady `getCAN 0` NACK with no outstanding setCAN has
+        // nothing to resend: warn, arm the ack, and never emit a resend.
+        // A fully advanced steady session always buffers something (the
+        // reset-response JZ18 drains as the first steady write TX), so the
+        // no-buffer case is exercised from a pristine steady session (same
+        // direct-state pattern as reg05_machinery_skipped_on_08_only_bank).
+        let mut s = Session::new();
+        s.state = State::Steady;
+        assert_eq!(s.last_set_can, None);
+        assert!(s.write_queue.is_empty());
+
+        let ev = s.on_frame(b"getCAN 0");
+        assert!(
+            matches!(ev.as_slice(), [EngineEvent::ProtocolWarn(_)]),
+            "NACK with nothing buffered must warn: {ev:?}"
+        );
+        assert!(s.ack_armed, "NACK must still arm the ack");
+        assert_eq!(s.nack_resend, NackResend::Idle, "nothing to mark Pending");
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            EMPTY_SET_CAN,
+            "never a resend with nothing buffered"
+        );
+    }
+
+    #[test]
+    fn steady_nack_new_write_refreshes_generation() {
+        // D-15: each write-queue drain is a fresh resend generation; a NACK
+        // resends the newest buffered setCAN, never a stale one.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+
+        // Generation A: write → NACK → ack → resend A byte-identically.
+        let a = control_box_write([0x11; 7]);
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![a.clone()]));
+        let tx_a = s.on_ping().unwrap();
+        assert_eq!(tx_a, build_set_can(std::slice::from_ref(&a)));
+        assert_eq!(s.nack_resend, NackResend::Idle, "fresh generation");
+        let ev = s.on_frame(b"getCAN 0");
+        assert!(ev.is_empty());
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        let resend_a = s.on_ping().unwrap();
+        assert_eq!(resend_a, tx_a);
+        assert_eq!(s.nack_resend, NackResend::Sent);
+
+        // Generation B: a new write refreshes the buffer and the entitlement.
+        let b = control_box_write([0x22; 7]);
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![b.clone()]));
+        let tx_b = s.on_ping().unwrap();
+        assert_eq!(tx_b, build_set_can(std::slice::from_ref(&b)));
+        assert_ne!(tx_b, tx_a, "distinct write, distinct payload");
+        assert_eq!(
+            s.nack_resend,
+            NackResend::Idle,
+            "new write drain resets the generation"
+        );
+        let ev = s.on_frame(b"getCAN 0");
+        assert!(ev.is_empty());
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        let resend_b = s.on_ping().unwrap();
+        assert_eq!(resend_b, tx_b, "resend must target the newest generation");
+        assert_ne!(resend_b, tx_a);
+    }
+
+    #[test]
+    fn steady_nack_does_not_clobber_armed_ack() {
+        // D-15: a NACK must not lose an ack already armed by a good getCAN —
+        // `ack_armed` is a single idempotent flag, so the next ping emits
+        // exactly one ack, then the NACK's resend rides the following ping.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+
+        // Buffer a write so the resend target is byte-checkable.
+        let rec = control_box_write([0x33; 7]);
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec.clone()]));
+        let tx = s.on_ping().unwrap();
+        assert_eq!(tx, build_set_can(std::slice::from_ref(&rec)));
+
+        // A good getCAN arms the ack...
+        let rec_in = sample_record();
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec_in)));
+        assert!(matches!(
+            ev.as_slice(),
+            [EngineEvent::RegistersChanged { .. }]
+        ));
+        assert!(s.ack_armed);
+        // ...then a NACK arms the resend too; the ack stays armed exactly once.
+        let ev = s.on_frame(b"getCAN 0");
+        assert!(ev.is_empty(), "buffer present, NACK stays silent: {ev:?}");
+        assert!(s.ack_armed, "NACK must not clobber the armed ack");
+        assert_eq!(s.nack_resend, NackResend::Pending);
+
+        assert_eq!(
+            s.on_ping().unwrap(),
+            ACK_CAN,
+            "exactly one ack for the good frame (and the NACK)"
+        );
+        assert!(!s.ack_armed, "ack consumed by the single ack TX");
+        let resend = s.on_ping().unwrap();
+        assert_eq!(resend, tx, "resend rides the ping after the ack");
+        assert_eq!(s.nack_resend, NackResend::Sent);
+    }
+
+    #[test]
+    fn steady_nack_resend_does_not_raise_write_flushed() {
+        // D-15: the resend TX bypasses the write-queue drain branch, so it
+        // must not re-raise `write_flushed` (no duplicate WriteFlushed event).
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+        assert!(
+            s.take_write_flushed(),
+            "JZ18 drain raised it; consume like the runner"
+        );
+
+        // Original write TX raises the flag; the runner consumes it.
+        let rec = control_box_write([0x44; 7]);
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec]));
+        let tx = s.on_ping().unwrap();
+        assert!(s.take_write_flushed(), "write TX must raise write_flushed");
+
+        // NACK → ack → resend: the resend is a buffer clone, not a queue drain.
+        let _ = s.on_frame(b"getCAN 0");
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            tx,
+            "resend must be the buffered write"
+        );
+        assert!(
+            !s.take_write_flushed(),
+            "resend TX must not re-raise write_flushed"
+        );
+    }
+
+    #[test]
     fn dump_with_reg05_skips_unit_scoped_flush() {
         let mut s = Session::new();
         advance_to_steady(&mut s, &[sample_record()]);
@@ -882,6 +1162,64 @@ mod tests {
         let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
         assert!(matches!(ev.as_slice(), [EngineEvent::Snapshot { .. }]));
         assert_eq!(s.state, State::Steady);
+    }
+
+    #[test]
+    fn resync_clears_steady_nack_state() {
+        // Regression (REFINE Step 11-MEDIUM): a getCAN NACK pending at resync
+        // time must not resend the stale pre-resync setCAN after the re-dump —
+        // `ResyncMailbox` clears the resend entitlement and the buffered
+        // generation alongside the dump flags.
+        let mut s = Session::new();
+        advance_to_steady(&mut s, &[sample_record()]);
+        let jz18 = build_jz18(UnitType::AIRCON, live_unit_reg06().unit_id);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            build_set_can(std::slice::from_ref(&jz18))
+        );
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+
+        // Write TX: capture the payload that must never ride the bus again.
+        let rec = control_box_write([0x42; 7]);
+        s.apply_cmd(EngineCmd::WriteRegisters(vec![rec.clone()]));
+        let stale_tx = s.on_ping().unwrap();
+        assert_eq!(stale_tx, build_set_can(std::slice::from_ref(&rec)));
+
+        // NACK arms the resend; then the resync invalidates it.
+        let ev = s.on_frame(b"getCAN 0");
+        assert!(ev.is_empty());
+        assert_eq!(s.nack_resend, NackResend::Pending);
+        s.apply_cmd(EngineCmd::ResyncMailbox);
+        assert_eq!(s.state, State::RequestDump);
+        assert_eq!(s.nack_resend, NackResend::Idle, "resync clears Pending");
+        assert!(s.last_set_can.is_none(), "resync drops the buffered setCAN");
+
+        // Two-phase dump again (mirror resync_reenters_dump_and_snapshot).
+        assert_eq!(s.on_ping().unwrap(), DIRTY_RESET_SET_CAN);
+        let _ = s.on_frame(&get_can_payload(std::slice::from_ref(&live_unit_reg06())));
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        assert_eq!(s.on_ping().unwrap(), DUMP_SET_CAN);
+        let rec = sample_record();
+        let ev = s.on_frame(&get_can_payload(std::slice::from_ref(&rec)));
+        assert!(matches!(ev.as_slice(), [EngineEvent::Snapshot { .. }]));
+        assert_eq!(s.state, State::Steady);
+
+        // Post-resync steady: dump ack first, then the fresh JZ18 drain, then
+        // a quiet empty poll — never the stale pre-resync write.
+        let fresh = build_set_can(std::slice::from_ref(&jz18));
+        assert_eq!(s.on_ping().unwrap(), ACK_CAN);
+        assert_eq!(
+            s.on_ping().unwrap(),
+            fresh,
+            "fresh generation, not a resend"
+        );
+        assert_ne!(fresh, stale_tx);
+        assert_eq!(s.on_ping().unwrap(), EMPTY_SET_CAN);
+        assert!(
+            s.on_ping().is_none_or(|tx| tx != stale_tx),
+            "no stale resend after resync"
+        );
+        assert_eq!(s.nack_resend, NackResend::Idle, "still Idle after drain");
     }
 
     #[test]
