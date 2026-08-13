@@ -6,7 +6,8 @@ use std::sync::Arc;
 use aa_engine::{EngineCmd, EngineEvent};
 use aa_mailbox::{
     AckStatus, ClientMessage, PolicyMode, ServerMessage, StatusState, decode_payload,
-    encode_payload, event_body, snapshot_units, validate_write, write_policy,
+    encode_payload, event_body, merge_payload, snapshot_units, validate_write,
+    validate_write_merged, write_policy,
 };
 use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
 use axum::Router;
@@ -775,16 +776,96 @@ async fn handle_read(
     Ok(())
 }
 
+/// Sparse-merge a typed client payload over the bank's decoded DTO for the
+/// addressed `(unit_type, unit_id, reg, zone?)`.
+///
+/// The client payload must be a JSON object; any other non-string value
+/// (number, array, bool, null) is rejected exactly as the pre-merge path did.
+/// The bank must hold a value for the address and it must decode to a typed
+/// object — otherwise the write errors rather than silently writing zeros or
+/// raw bytes. The merged payload is validated with [`validate_write_merged`]
+/// (mode check on the merged payload, read-only field check on the client-sent
+/// keys only, range check on the merged bytes).
+///
+/// # Errors
+///
+/// Returns a human-readable reason for a non-object payload, missing bank
+/// state, or an undecodable (raw-hex) bank value.
+fn sparse_merge_payload(
+    bank: Option<&RegisterBank>,
+    unit_type: UnitType,
+    unit_id: UnitId,
+    reg: RegId,
+    zone: Option<u8>,
+    payload: &Value,
+) -> Result<Value, String> {
+    if !payload.is_object() {
+        let reason = match encode_payload(reg, payload) {
+            Err(err) => err.to_string(),
+            Ok(_) => "bad register payload: expected an object".to_owned(),
+        };
+        return Err(reason);
+    }
+    let zone_suffix = if is_zone_bearing(reg) {
+        format!(" [zone {}]", zone.unwrap_or(0))
+    } else {
+        String::new()
+    };
+    let bank_data = if is_zone_bearing(reg) {
+        bank.and_then(|bank| bank.get_zone(unit_type, unit_id, reg, zone.unwrap_or(0)))
+    } else {
+        bank.and_then(|bank| bank.get(unit_type, unit_id, reg))
+    };
+    let Some(bank_data) = bank_data else {
+        return Err(format!(
+            "no bank state for register {:02x}{}; send a full payload or issue a read first",
+            reg.get(),
+            zone_suffix
+        ));
+    };
+    let bank_decoded = decode_payload(reg, bank_data).map_err(|err| err.to_string())?;
+    if bank_decoded.as_str().is_some() {
+        return Err(format!(
+            "cannot merge: bank state for register {:02x} is not typed; send a full payload or issue a read first",
+            reg.get()
+        ));
+    }
+    let mut merged = merge_payload(&bank_decoded, payload);
+    drop_reg12_read_only_fields(&mut merged, reg);
+    validate_write_merged(reg, payload, &merged).map_err(|e| e.to_string())?;
+    Ok(merged)
+}
+
+/// Drop the read-only fields from a merged reg-`12` payload so it encodes as
+/// the write shape.
+///
+/// Reg `12` (sensor pairing) is special: its write DTO (`sensor_uid`, `zone`)
+/// is a strict subset of its read DTO (`sensor_uid`, `pairing`,
+/// `sensor_rev`). The bank holds the read shape, so a merged payload that
+/// keeps `pairing`/`sensor_rev` makes the codec prefer the read shape and the
+/// addressed zone is lost. No-op for every other register.
+fn drop_reg12_read_only_fields(merged: &mut Value, reg: RegId) {
+    if reg.get() == 0x12
+        && let Some(obj) = merged.as_object_mut()
+    {
+        obj.remove("pairing");
+        obj.remove("sensor_rev");
+    }
+}
+
 /// Resolve and encode a `write` into a single-register [`CanRecord`].
 ///
 /// Unit addressing defers to [`resolve_unit`]; zone-bearing registers
-/// (`03`/`04`) stamp the client's zone into wire byte 0.
+/// (`03`/`04`) stamp the client's zone into wire byte 0. Raw-hex payloads are
+/// byte-exact passthrough (no bank lookup, no merge); typed payloads sparse
+/// merge over the bank's decoded DTO via [`sparse_merge_payload`].
 ///
 /// # Errors
 ///
 /// Returns a human-readable reason for invalid identifiers/register, an
-/// unencodable payload (mirrors the ack `reason` field), or no primary unit
-/// when neither a bank nor a hint is available.
+/// unencodable payload (mirrors the ack `reason` field), no primary unit when
+/// neither a bank nor a hint is available, or a sparse-merge failure (missing
+/// or undecodable bank state for the addressed register/zone).
 fn build_write_record(
     bank: Option<&RegisterBank>,
     hint: Option<UnitId>,
@@ -796,8 +877,29 @@ fn build_write_record(
 ) -> Result<CanRecord, String> {
     let (unit_type, unit_id) = resolve_unit(bank, hint, unit_type, unit_id)?;
     let reg = RegId::from_hex(register).map_err(|err| format!("invalid register: {err:?}"))?;
-    validate_write(reg, payload).map_err(|e| e.to_string())?;
-    let mut data = encode_payload(reg, payload).map_err(|err| err.to_string())?;
+    // Raw-hex payloads are byte-exact passthrough: verbatim, no bank lookup,
+    // no merge (unchanged behavior).
+    if payload.as_str().is_some() {
+        validate_write(reg, payload).map_err(|e| e.to_string())?;
+        let mut data = encode_payload(reg, payload).map_err(|err| err.to_string())?;
+        // The zone id is part of the CAN address, not the payload: the codec stamps
+        // wire byte 0 as 0x00, so a zone-bearing write (regs 03/04) addressed by
+        // the client must be stamped here to reach the addressed zone.
+        if is_zone_bearing(reg)
+            && let Some(zone) = zone
+        {
+            data[0] = zone;
+        }
+        return Ok(CanRecord {
+            unit_type,
+            dest: Dest::ControlBox,
+            unit_id,
+            reg,
+            data,
+        });
+    }
+    let merged = sparse_merge_payload(bank, unit_type, unit_id, reg, zone, payload)?;
+    let mut data = encode_payload(reg, &merged).map_err(|err| err.to_string())?;
     // The zone id is part of the CAN address, not the payload: the codec stamps
     // wire byte 0 as 0x00, so a zone-bearing write (regs 03/04) addressed by
     // the client must be stamped here to reach the addressed zone.
@@ -1273,10 +1375,20 @@ mod tests {
     #[test]
     fn build_write_record_rejects_read_only_register() {
         // D-6: a write to a read-only register is rejected with the exact
-        // WriteError reason before any encoding / bus traffic.
+        // WriteError reason before any encoding / bus traffic. The typed path
+        // needs bank state to reach the mode check, so seed a reg-08 slot.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x08),
+            data: [0; 7],
+        });
         let err = build_write_record(
-            None,
-            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            Some(&bank),
+            Some(id),
             None,
             None,
             "08",
@@ -1290,10 +1402,21 @@ mod tests {
     #[test]
     fn build_write_record_rejects_read_only_field() {
         // D-6: a typed write carrying a read-only field is rejected with the
-        // exact WriteError reason before any encoding / bus traffic.
+        // exact WriteError reason before any encoding / bus traffic. The typed
+        // path needs bank state to reach the field check, so seed a reg-05
+        // slot.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
         let err = build_write_record(
-            None,
-            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            Some(&bank),
+            Some(id),
             None,
             None,
             "05",
@@ -1307,27 +1430,50 @@ mod tests {
     #[test]
     fn build_write_record_rejects_unverified_register() {
         // D-6: a write to an unverified register is rejected with the exact
-        // WriteError reason before any encoding / bus traffic.
+        // WriteError reason before any encoding / bus traffic. The typed path
+        // needs bank state that decodes to a typed DTO to reach the mode
+        // check, so seed a reg-13 (info byte) slot — reg 0b has no codec and
+        // its bank decode falls back to raw hex ("cannot merge").
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x13),
+            data: [0; 7],
+        });
         let err = build_write_record(
+            Some(&bank),
+            Some(id),
             None,
-            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
             None,
-            None,
-            "0b",
+            "13",
             None,
             &serde_json::json!({}),
         )
         .expect_err("unverified register write must be rejected");
-        assert_eq!(err, "register 0b is unverified; writes not permitted");
+        assert_eq!(err, "register 13 is unverified; writes not permitted");
     }
 
     #[test]
     fn build_write_record_rejects_out_of_range_field_value() {
         // D-6: a wire value above its bound is rejected with the exact
-        // WriteError reason before any bus traffic (numZones max 10).
+        // WriteError reason before any bus traffic (numZones max 10). The
+        // typed path needs bank state to reach the range check, so seed a
+        // reg-01 slot.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x01),
+            data: [0x20, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00],
+        });
         let err = build_write_record(
-            None,
-            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            Some(&bank),
+            Some(id),
             None,
             None,
             "01",
@@ -1342,5 +1488,194 @@ mod tests {
         )
         .expect_err("out-of-range field write must be rejected");
         assert_eq!(err, "field 'numZones' 11 out of range (max 10)");
+    }
+
+    /// Seed a reg-05 slot (the default dump sample) into `bank`.
+    fn seed_reg05(bank: &mut RegisterBank, id: UnitId) {
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
+    }
+
+    #[test]
+    fn build_write_record_sparse_typed_merge_preserves_bank_fields() {
+        // D-11: a sparse typed reg-05 write merges over the bank's decoded
+        // DTO — the client's field wins, the bank's other fields are
+        // preserved in the encoded bytes.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        seed_reg05(&mut bank, id);
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "05",
+            None,
+            &serde_json::json!({"fan": "low"}),
+        )
+        .expect("sparse merge must succeed");
+        assert_eq!(rec.data, [0x01, 0x01, 0x01, 0x30, 0x00, 0x01, 0x00]);
+        assert_eq!(rec.data[1], 0x01, "mode (cool) preserved from the bank");
+        assert_eq!(rec.data[2], 0x01, "fan (low) from the client");
+        assert_eq!(rec.data[3], 0x30, "target_temp_c preserved from the bank");
+        assert_eq!(rec.data[5], 0x01, "fresh_air preserved from the bank");
+    }
+
+    #[test]
+    fn build_write_record_sparse_typed_merge_zone_bearing() {
+        // D-11: a sparse typed reg-03 write addressed to a zone merges over
+        // that zone's bank value and stamps the zone into wire byte 0.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x03),
+            data: [0x02, 0x64, 0x00, 0x30, 0x00, 0x00, 0x00],
+        });
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "03",
+            Some(2),
+            &serde_json::json!({"open": true}),
+        )
+        .expect("zone merge must succeed");
+        assert_eq!(rec.reg, RegId::new(0x03));
+        assert_eq!(rec.data[0], 2, "zone must be stamped into wire byte 0");
+        assert_eq!(rec.data[1], 0xE4, "open set by client, damper preserved");
+        assert_eq!(rec.data[3], 0x30, "target_temp_c preserved from the bank");
+    }
+
+    #[test]
+    fn build_write_record_sparse_typed_merge_no_bank_state() {
+        // D-11: a sparse typed write with no bank value for the addressed
+        // register errors ack with the exact documented reason.
+        let bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        let err = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "05",
+            None,
+            &serde_json::json!({"power": "on"}),
+        )
+        .expect_err("no bank state must be rejected");
+        assert_eq!(
+            err,
+            "no bank state for register 05; send a full payload or issue a read first"
+        );
+
+        // Zone-bearing register: the reason carries the addressed zone.
+        let err = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "03",
+            Some(2),
+            &serde_json::json!({"open": true}),
+        )
+        .expect_err("no zone bank state must be rejected");
+        assert_eq!(
+            err,
+            "no bank state for register 03 [zone 2]; send a full payload or issue a read first"
+        );
+    }
+
+    #[test]
+    fn build_write_record_sparse_typed_merge_undecodable_bank() {
+        // D-11: a bank value that cannot decode to a typed DTO (unknown enum
+        // byte → raw hex fallback) errors ack with the exact documented
+        // reason instead of silently writing.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x05),
+            data: [0x7f, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
+        let err = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "05",
+            None,
+            &serde_json::json!({"power": "on"}),
+        )
+        .expect_err("undecodable bank must be rejected");
+        assert_eq!(
+            err,
+            "cannot merge: bank state for register 05 is not typed; send a full payload or issue a read first"
+        );
+    }
+
+    #[test]
+    fn build_write_record_rejects_non_object_typed_payload() {
+        // D-11: a non-string, non-object payload (number/array/bool/null)
+        // must be rejected with the pre-merge BadPayload reason — never
+        // silently merged over the bank and written.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        seed_reg05(&mut bank, id);
+        let err = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "05",
+            None,
+            &serde_json::json!(123),
+        )
+        .expect_err("non-object typed payload must be rejected");
+        assert!(
+            err.starts_with("bad register payload: "),
+            "expected BadPayload reason, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_write_record_sparse_typed_merge_reg12_write_shape() {
+        // D-11: a sparse reg-12 write `{"zone":1}` merges `sensor_uid` from
+        // the bank and encodes as the write shape (the bank's read-only
+        // `pairing`/`sensor_rev` fields are dropped so the codec does not
+        // prefer the read shape and lose the zone).
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x12),
+            data: [0x01, 0x61, 0x3d, 0x00, 0x05, 0x00, 0x00],
+        });
+        let rec = build_write_record(
+            Some(&bank),
+            Some(id),
+            None,
+            None,
+            "12",
+            None,
+            &serde_json::json!({"zone": 1}),
+        )
+        .expect("reg-12 merge must succeed");
+        assert_eq!(
+            rec.data,
+            [0x01, 0x61, 0x3d, 0x01, 0x00, 0x00, 0x00],
+            "uid from bank, zone from client, write shape"
+        );
     }
 }
