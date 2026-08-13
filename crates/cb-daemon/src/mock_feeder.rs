@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aa_frame::{Frame, FrameScanner};
+use aa_frame::{Frame, FrameScanner, ScanItem};
 use aa_link::{Link, MockLink};
 use aa_registers::{CanRecord, Dest, RegId, UnitId, UnitType};
 use tokio::sync::{Mutex, Notify};
@@ -15,6 +15,7 @@ const DIRTY_RESET_SET_CAN: &[u8] = b"setCAN 0701000000600000000000000";
 const DUMP_SET_CAN: &[u8] = b"setCAN 0801000000600000000000000 0801000000236000000000000";
 const EMPTY_SET_CAN: &[u8] = b"setCAN ";
 const ACK_CAN: &[u8] = b"ackCAN 1";
+const ACK_CAN_ZERO: &[u8] = b"ackCAN 0";
 
 /// Unit id used by the scripted dump sample (`abcde`).
 pub(crate) const FEEDER_UNIT_ID: UnitId = match UnitId::try_new(0x0_ABCDE) {
@@ -31,6 +32,7 @@ pub struct FeederSpec {
     omit_reg05: bool,
     scripted_reg06: Option<CanRecord>,
     stop_after_dump: bool,
+    corrupt_next_getcan: bool,
 }
 
 impl FeederSpec {
@@ -71,6 +73,18 @@ impl FeederSpec {
     #[must_use]
     pub const fn stop_after_dump(mut self) -> Self {
         self.stop_after_dump = true;
+        self
+    }
+
+    /// Corrupt the first bare-getCAN empty-poll reply in the steady loop
+    /// (D-16): it is sent as a CRC-corrupted getCAN carrying `samples()`
+    /// (one payload hex byte flipped, `getCAN` prefix intact), and the next
+    /// bare-getCAN reply is the good retransmit carrying the same records.
+    /// Exercises the engine's `ackCAN 0` → retransmit cycle end-to-end.
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn with_corrupt_next_getcan(mut self) -> Self {
+        self.corrupt_next_getcan = true;
         self
     }
 
@@ -195,9 +209,11 @@ fn is_reg06_flush(record: &CanRecord) -> bool {
 
 /// Parse the records carried by the first `setCAN …` frame in `written`.
 fn parse_set_can_records(written: &[u8]) -> Option<Vec<CanRecord>> {
-    let frames = FrameScanner::new().push(written).ok()?;
-    for frame in frames {
-        if let Some(body) = frame.payload.strip_prefix(b"setCAN ") {
+    let out = FrameScanner::new().push(written).ok()?;
+    for item in out.items {
+        if let ScanItem::Frame(frame) = item
+            && let Some(body) = frame.payload.strip_prefix(b"setCAN ")
+        {
             return CanRecord::parse_many(std::str::from_utf8(body).ok()?).ok();
         }
     }
@@ -215,12 +231,31 @@ fn get_can_from_records(records: &[CanRecord]) -> Vec<u8> {
     body
 }
 
-async fn push_frame(mock: &Arc<Mutex<MockLink>>, notify: &Notify, payload: &[u8]) {
-    let bytes = encoded(payload);
+/// A CRC-corrupted copy of the sample getCAN: the encoded frame with one
+/// trailing record hex char inside the payload region flipped. Framing tokens
+/// stay valid, so the scanner reports `InvalidCrc` (`CrcFailure`), never
+/// `Malformed`; the `getCAN` prefix stays intact, so the engine arms the
+/// `ackCAN 0` latch for the failed frame.
+fn corrupt_getcan_frame(spec: &FeederSpec) -> Vec<u8> {
+    let payload = get_can_with_sample(spec);
+    let mut bytes = Frame {
+        payload: payload.clone(),
+    }
+    .encode();
+    let last_payload = b"<U>".len() + payload.len() - 1;
+    bytes[last_payload] ^= 1;
+    bytes
+}
+
+async fn push_raw(mock: &Arc<Mutex<MockLink>>, notify: &Notify, bytes: &[u8]) {
     let mut g = mock.lock().await;
-    g.push_inbound(&bytes);
+    g.push_inbound(bytes);
     drop(g);
     notify.notify_one();
+}
+
+async fn push_frame(mock: &Arc<Mutex<MockLink>>, notify: &Notify, payload: &[u8]) {
+    push_raw(mock, notify, &encoded(payload)).await;
 }
 
 async fn wait_written_contains(mock: &Arc<Mutex<MockLink>>, needle: &[u8]) -> bool {
@@ -308,6 +343,16 @@ async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify, spec: &Feeder
     true
 }
 
+/// One-shot CRC-corruption script for the first bare-getCAN empty-poll reply
+/// (D-16): the corrupted copy goes out first, the good retransmit second.
+#[derive(Debug, Default)]
+struct CorruptGetcanState {
+    /// The corrupted copy was sent (a good retransmit is still owed).
+    sent: bool,
+    /// The good retransmit was sent (back to normal bare-getCAN replies).
+    retransmitted: bool,
+}
+
 /// Reply to one polled `written` batch. Dispatch order matters: engine-internal
 /// setCAN payloads (dump/resync, empty poll) are matched before generic
 /// record parsing so they are never treated as write echoes.
@@ -323,18 +368,34 @@ async fn reply_to_poll(
     pending_echo: &mut Vec<CanRecord>,
     spec: &FeederSpec,
     scripted: &mut Option<CanRecord>,
+    corrupt: &mut CorruptGetcanState,
 ) {
     if written_has_frame(&written, DUMP_SET_CAN) {
         push_frame(mock, notify, &get_can_with_sample(spec)).await;
     } else if written_has_frame(&written, ACK_CAN) {
         // Ack consumed; wait for next Ping cycle.
+    } else if written_has_frame(&written, ACK_CAN_ZERO) {
+        // NACK consumed (D-16 CRC-failed getCAN); wait for next Ping cycle.
     } else if written_has_frame(&written, EMPTY_SET_CAN) {
         // Empty poll: report applied-but-unreported registers (write echo),
         // else a bare getCAN request (or the scripted reg-06 announcement).
         if let Some(record) = scripted.take() {
             push_frame(mock, notify, &get_can_from_records(&[record])).await;
         } else if pending_echo.is_empty() {
-            push_frame(mock, notify, b"getCAN 1").await;
+            // Bare getCAN request. With `corrupt_next_getcan`, the first bare
+            // poll carries a CRC-corrupted copy of the sample records (the
+            // engine must NACK it with ackCAN 0 and apply nothing), and the
+            // next bare poll carries the good retransmit (records applied,
+            // ackCAN 1).
+            if spec.corrupt_next_getcan && !corrupt.sent {
+                corrupt.sent = true;
+                push_raw(mock, notify, &corrupt_getcan_frame(spec)).await;
+            } else if spec.corrupt_next_getcan && !corrupt.retransmitted {
+                corrupt.retransmitted = true;
+                push_frame(mock, notify, &get_can_with_sample(spec)).await;
+            } else {
+                push_frame(mock, notify, b"getCAN 1").await;
+            }
         } else {
             push_frame(mock, notify, &get_can_from_records(pending_echo)).await;
             pending_echo.clear();
@@ -374,6 +435,7 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spe
     let mut pending_echo: Vec<CanRecord> = Vec::new();
     let mut spec = spec;
     let mut scripted = spec.scripted_reg06.take();
+    let mut corrupt = CorruptGetcanState::default();
     loop {
         // Detect closed link without reading inbound (would corrupt queued frames).
         {
@@ -393,6 +455,7 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spe
                     written_has_frame(&written, DUMP_SET_CAN)
                         || written_has_frame(&written, EMPTY_SET_CAN)
                         || written_has_frame(&written, ACK_CAN)
+                        || written_has_frame(&written, ACK_CAN_ZERO)
                         || written
                             .windows(b"<U>setCAN".len())
                             .any(|x| x == b"<U>setCAN")
@@ -411,15 +474,25 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spe
             continue;
         }
 
+        let written = mock.lock().await.written().to_vec();
+        let is_ack =
+            written_has_frame(&written, ACK_CAN) || written_has_frame(&written, ACK_CAN_ZERO);
         reply_to_poll(
             &mock,
             &notify,
-            take_written(&mock).await,
+            written,
             &mut pending_echo,
             &spec,
             &mut scripted,
+            &mut corrupt,
         )
         .await;
+        if is_ack {
+            // Hold the ack frame in the write capture briefly so acceptance
+            // wire spies can observe ackCAN 0/1 without racing the drain.
+            sleep(Duration::from_millis(20)).await;
+        }
+        let _ = take_written(&mock).await;
         sleep(Duration::from_millis(10)).await;
     }
 }
@@ -472,9 +545,12 @@ mod tests {
         FrameScanner::new()
             .push(&buf[..n])
             .expect("frame scan")
+            .items
             .into_iter()
-            .next()
-            .map(|frame| frame.payload)
+            .find_map(|item| match item {
+                ScanItem::Frame(frame) => Some(frame.payload),
+                ScanItem::CrcFailure(_) => None,
+            })
             .expect("reply frame")
     }
 
@@ -498,6 +574,7 @@ mod tests {
         };
         let mut pending_echo = Vec::new();
         let mut scripted = None;
+        let mut corrupt = CorruptGetcanState::default();
 
         // Batch with two flush records + a regular write: the full-set reply
         // wins, carrying the sample set and every flush record in batch order.
@@ -508,6 +585,7 @@ mod tests {
             &mut pending_echo,
             &FeederSpec::default(),
             &mut scripted,
+            &mut corrupt,
         )
         .await;
 
@@ -544,6 +622,7 @@ mod tests {
         };
         let mut pending_echo = Vec::new();
         let mut scripted = None;
+        let mut corrupt = CorruptGetcanState::default();
 
         reply_to_poll(
             &mock,
@@ -552,6 +631,7 @@ mod tests {
             &mut pending_echo,
             &FeederSpec::default(),
             &mut scripted,
+            &mut corrupt,
         )
         .await;
 
@@ -611,6 +691,7 @@ mod tests {
         };
         let mut pending_echo = Vec::new();
         let mut scripted_slot = Some(scripted.clone());
+        let mut corrupt = CorruptGetcanState::default();
 
         // Empty poll with no pending echoes: the bare getCAN slot carries the
         // scripted reg-06 announcement exactly once.
@@ -621,6 +702,7 @@ mod tests {
             &mut pending_echo,
             &FeederSpec::default(),
             &mut scripted_slot,
+            &mut corrupt,
         )
         .await;
 
@@ -654,6 +736,7 @@ mod tests {
         };
         let mut pending_echo = vec![write.clone()];
         let mut scripted_slot = Some(scripted.clone());
+        let mut corrupt = CorruptGetcanState::default();
 
         reply_to_poll(
             &mock,
@@ -662,6 +745,7 @@ mod tests {
             &mut pending_echo,
             &FeederSpec::default(),
             &mut scripted_slot,
+            &mut corrupt,
         )
         .await;
 
@@ -687,6 +771,7 @@ mod tests {
         let aircon_flush = flush_record(UnitType::AIRCON);
         let mut pending_echo = Vec::new();
         let mut scripted = None;
+        let mut corrupt = CorruptGetcanState::default();
 
         reply_to_poll(
             &mock,
@@ -695,6 +780,7 @@ mod tests {
             &mut pending_echo,
             &FeederSpec::default().without_reg05(),
             &mut scripted,
+            &mut corrupt,
         )
         .await;
 
@@ -752,5 +838,109 @@ mod tests {
         cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
         let _ = timeout(Duration::from_secs(2), engine).await;
         feeder.abort();
+    }
+
+    #[test]
+    fn corrupt_getcan_frame_is_lone_crc_failure_with_intact_prefix() {
+        let spec = FeederSpec::default();
+        let frame = corrupt_getcan_frame(&spec);
+        let out = FrameScanner::new().push(&frame).expect("scan");
+        let [ScanItem::CrcFailure(failure)] = out.items.as_slice() else {
+            panic!("corrupt copy must scan as a lone CrcFailure, got {out:?}");
+        };
+        assert!(
+            failure.payload.starts_with(b"getCAN 1 "),
+            "getCAN prefix must stay intact: {}",
+            String::from_utf8_lossy(&failure.payload)
+        );
+        let body = failure
+            .payload
+            .strip_prefix(b"getCAN 1 ")
+            .expect("getCAN prefix");
+        assert!(
+            CanRecord::parse_many(std::str::from_utf8(body).expect("utf8"))
+                .expect("records")
+                .len()
+                == spec.samples().len(),
+            "corrupt copy must keep the record format parseable"
+        );
+        let good = get_can_with_sample(&spec);
+        assert_eq!(failure.payload.len(), good.len(), "same record layout");
+        let flipped = failure
+            .payload
+            .iter()
+            .zip(&good)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(flipped, 1, "exactly one payload byte flipped");
+    }
+
+    #[tokio::test]
+    async fn corrupt_next_getcan_sends_corrupt_then_good_retransmit() {
+        let (_, mock, notify) = SharedMockLink::new();
+        let mut pending_echo = Vec::new();
+        let mut scripted = None;
+        let mut corrupt = CorruptGetcanState::default();
+        let spec = FeederSpec::default().with_corrupt_next_getcan();
+
+        // First bare poll: the corrupted copy, and only the corrupted copy.
+        reply_to_poll(
+            &mock,
+            &notify,
+            encoded(EMPTY_SET_CAN),
+            &mut pending_echo,
+            &spec,
+            &mut scripted,
+            &mut corrupt,
+        )
+        .await;
+        let mut buf = vec![0u8; 4096];
+        let n = mock
+            .lock()
+            .await
+            .read(&mut buf)
+            .await
+            .expect("inbound read");
+        assert_eq!(
+            FrameScanner::new()
+                .push(&buf[..n])
+                .expect("frame scan")
+                .items
+                .len(),
+            1,
+            "the corrupt poll must push exactly one frame"
+        );
+        assert!(corrupt.sent && !corrupt.retransmitted, "{corrupt:?}");
+
+        // Second bare poll: the good retransmit with the sample records.
+        reply_to_poll(
+            &mock,
+            &notify,
+            encoded(EMPTY_SET_CAN),
+            &mut pending_echo,
+            &spec,
+            &mut scripted,
+            &mut corrupt,
+        )
+        .await;
+        assert!(corrupt.retransmitted, "{corrupt:?}");
+        assert_eq!(
+            parse_reply_records(&mock).await,
+            spec.samples(),
+            "the retransmit must carry the same sample records"
+        );
+
+        // Third bare poll: back to the bare getCAN request.
+        reply_to_poll(
+            &mock,
+            &notify,
+            encoded(EMPTY_SET_CAN),
+            &mut pending_echo,
+            &spec,
+            &mut scripted,
+            &mut corrupt,
+        )
+        .await;
+        assert_eq!(take_inbound_payload(&mock).await, b"getCAN 1");
     }
 }
