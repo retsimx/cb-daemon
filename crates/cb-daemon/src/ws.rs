@@ -1286,4 +1286,61 @@ mod tests {
         .expect_err("read-only register write must be rejected");
         assert_eq!(err, "register 08 is read-only");
     }
+
+    #[test]
+    fn build_write_record_rejects_read_only_field() {
+        // D-6: a typed write carrying a read-only field is rejected with the
+        // exact WriteError reason before any encoding / bus traffic.
+        let err = build_write_record(
+            None,
+            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            None,
+            None,
+            "05",
+            None,
+            &serde_json::json!({ "rf_sys_id": 1 }),
+        )
+        .expect_err("read-only field write must be rejected");
+        assert_eq!(err, "field 'rf_sys_id' is read-only on register 05");
+    }
+
+    #[test]
+    fn build_write_record_rejects_unverified_register() {
+        // D-6: a write to an unverified register is rejected with the exact
+        // WriteError reason before any encoding / bus traffic.
+        let err = build_write_record(
+            None,
+            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            None,
+            None,
+            "0b",
+            None,
+            &serde_json::json!({}),
+        )
+        .expect_err("unverified register write must be rejected");
+        assert_eq!(err, "register 0b is unverified; writes not permitted");
+    }
+
+    #[test]
+    fn build_write_record_rejects_out_of_range_field_value() {
+        // D-6: a wire value above its bound is rejected with the exact
+        // WriteError reason before any bus traffic (numZones max 10).
+        let err = build_write_record(
+            None,
+            Some(UnitId::try_new(0x0_ABCDE).unwrap()),
+            None,
+            None,
+            "01",
+            None,
+            &serde_json::json!({
+                "header": 0x20,
+                "total_zones": 11,
+                "constant_zones": 1,
+                "constant_zone_ids": [1, 0, 0],
+                "filter_clean_required": false,
+            }),
+        )
+        .expect_err("out-of-range field write must be rejected");
+        assert_eq!(err, "field 'numZones' 11 out of range (max 10)");
+    }
 }

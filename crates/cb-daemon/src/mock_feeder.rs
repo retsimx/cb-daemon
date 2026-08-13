@@ -22,6 +22,58 @@ pub(crate) const FEEDER_UNIT_ID: UnitId = match UnitId::try_new(0x0_ABCDE) {
     Err(_) => UnitId::ZERO,
 };
 
+/// Scripted behavior for the mock feeder.
+///
+/// [`FeederSpec::default`] reproduces the legacy feeder exactly; acceptance
+/// tests override individual behaviors with the builder methods.
+#[derive(Clone, Default)]
+pub struct FeederSpec {
+    omit_reg05: bool,
+    scripted_reg06: Option<CanRecord>,
+}
+
+impl FeederSpec {
+    /// Omit the 07/reg-05 sample from every getCAN the feeder produces
+    /// (dirty-reset reply, dump reply, flush full-set reply); the 08/reg-06
+    /// sample is kept, so the engine's register bank never sees reg 05.
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn without_reg05(mut self) -> Self {
+        self.omit_reg05 = true;
+        self
+    }
+
+    /// Inject one unsolicited reg-06 getCAN record on the next steady poll,
+    /// triggering the JZ18 reg-07 handshake (engine queues `build_jz18`).
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn scripted_reg06(
+        mut self,
+        unit_type: UnitType,
+        unit_id: UnitId,
+        data: [u8; 7],
+    ) -> Self {
+        self.scripted_reg06 = Some(CanRecord {
+            unit_type,
+            dest: Dest::Tablet,
+            unit_id,
+            reg: RegId::new(0x06),
+            data,
+        });
+        self
+    }
+
+    /// Sample records carried by getCAN replies (dump and flush full-set).
+    fn samples(&self) -> Vec<CanRecord> {
+        let mut out = Vec::new();
+        if !self.omit_reg05 {
+            out.push(sample_record());
+        }
+        out.push(sample_record_08());
+        out
+    }
+}
+
 /// [`MockLink`] shared with the feeder; `read` waits when inbound is empty (not EOF).
 pub(crate) struct SharedMockLink {
     inner: Arc<Mutex<MockLink>>,
@@ -117,8 +169,8 @@ const fn sample_record_16() -> CanRecord {
     }
 }
 
-fn get_can_with_sample() -> Vec<u8> {
-    get_can_from_records(&[sample_record(), sample_record_08()])
+fn get_can_with_sample(spec: &FeederSpec) -> Vec<u8> {
+    get_can_from_records(&spec.samples())
 }
 
 /// A reg-06 `ControlBox` flush: `ControlBox`-destined record with register `0x06`
@@ -182,14 +234,22 @@ async fn take_written(mock: &Arc<Mutex<MockLink>>) -> Vec<u8> {
 }
 
 /// Play negotiate→dump once, then keep the mock CB alive for steady / resync.
-pub(crate) async fn run_negotiate_dump_feeder(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
+pub(crate) async fn run_feeder(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spec: FeederSpec) {
     if !feeder_negotiate(&mock, &notify).await {
         return;
     }
-    if !feeder_dump(&mock, &notify).await {
+    if !feeder_dump(&mock, &notify, &spec).await {
         return;
     }
-    feeder_steady_loop(mock, notify).await;
+    feeder_steady_loop(mock, notify, spec).await;
+}
+
+/// Play negotiate→dump once, then keep the mock CB alive for steady / resync.
+///
+/// Equivalent to [`run_feeder`] with [`FeederSpec::default`].
+#[allow(dead_code)]
+pub(crate) async fn run_negotiate_dump_feeder(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
+    run_feeder(mock, notify, FeederSpec::default()).await;
 }
 
 async fn feeder_negotiate(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
@@ -203,7 +263,7 @@ async fn feeder_negotiate(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool 
     true
 }
 
-async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
+async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify, spec: &FeederSpec) -> bool {
     // Two-phase dump: reg-06 dirty reset → reset getCAN → ack → 08-flush dump.
     push_frame(mock, notify, b"Ping").await;
     if !wait_written_contains(mock, &encoded(DIRTY_RESET_SET_CAN)).await {
@@ -211,7 +271,7 @@ async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
         return false;
     }
     let _ = take_written(mock).await;
-    push_frame(mock, notify, &get_can_with_sample()).await;
+    push_frame(mock, notify, &get_can_with_sample(spec)).await;
 
     push_frame(mock, notify, b"Ping").await;
     if !wait_written_contains(mock, &encoded(ACK_CAN)).await {
@@ -226,7 +286,7 @@ async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
         return false;
     }
     let _ = take_written(mock).await;
-    push_frame(mock, notify, &get_can_with_sample()).await;
+    push_frame(mock, notify, &get_can_with_sample(spec)).await;
     debug!("mock feeder: dump complete (Snapshot expected)");
     true
 }
@@ -234,20 +294,29 @@ async fn feeder_dump(mock: &Arc<Mutex<MockLink>>, notify: &Notify) -> bool {
 /// Reply to one polled `written` batch. Dispatch order matters: engine-internal
 /// setCAN payloads (dump/resync, empty poll) are matched before generic
 /// record parsing so they are never treated as write echoes.
+///
+/// `scripted` holds the next unsolicited reg-06 record to announce: the
+/// first bare-getCAN poll (empty poll with no pending echoes) carries it
+/// instead of an empty getCAN, firing it exactly once.
+#[allow(clippy::too_many_arguments)]
 async fn reply_to_poll(
     mock: &Arc<Mutex<MockLink>>,
     notify: &Notify,
     written: Vec<u8>,
     pending_echo: &mut Vec<CanRecord>,
+    spec: &FeederSpec,
+    scripted: &mut Option<CanRecord>,
 ) {
     if written_has_frame(&written, DUMP_SET_CAN) {
-        push_frame(mock, notify, &get_can_with_sample()).await;
+        push_frame(mock, notify, &get_can_with_sample(spec)).await;
     } else if written_has_frame(&written, ACK_CAN) {
         // Ack consumed; wait for next Ping cycle.
     } else if written_has_frame(&written, EMPTY_SET_CAN) {
         // Empty poll: report applied-but-unreported registers (write echo),
-        // else a bare getCAN request.
-        if pending_echo.is_empty() {
+        // else a bare getCAN request (or the scripted reg-06 announcement).
+        if let Some(record) = scripted.take() {
+            push_frame(mock, notify, &get_can_from_records(&[record])).await;
+        } else if pending_echo.is_empty() {
             push_frame(mock, notify, b"getCAN 1").await;
         } else {
             push_frame(mock, notify, &get_can_from_records(pending_echo)).await;
@@ -273,18 +342,21 @@ async fn reply_to_poll(
         if flush_records.is_empty() {
             pending_echo.extend(records);
         } else {
-            let mut reply = vec![sample_record(), sample_record_08(), sample_record_16()];
+            let mut reply = spec.samples();
+            reply.push(sample_record_16());
             reply.extend(flush_records);
             push_frame(mock, notify, &get_can_from_records(&reply)).await;
         }
     }
 }
 
-async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
+async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>, spec: FeederSpec) {
     // Register records the CB has applied but not yet reported (write echo,
     // deferred until the next empty poll so the WriteFlushed ack — sent on
     // TX — always precedes the RegistersChanged fan-out event).
     let mut pending_echo: Vec<CanRecord> = Vec::new();
+    let mut spec = spec;
+    let mut scripted = spec.scripted_reg06.take();
     loop {
         // Detect closed link without reading inbound (would corrupt queued frames).
         {
@@ -322,7 +394,15 @@ async fn feeder_steady_loop(mock: Arc<Mutex<MockLink>>, notify: Arc<Notify>) {
             continue;
         }
 
-        reply_to_poll(&mock, &notify, take_written(&mock).await, &mut pending_echo).await;
+        reply_to_poll(
+            &mock,
+            &notify,
+            take_written(&mock).await,
+            &mut pending_echo,
+            &spec,
+            &mut scripted,
+        )
+        .await;
         sleep(Duration::from_millis(10)).await;
     }
 }
@@ -400,6 +480,7 @@ mod tests {
             data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
         };
         let mut pending_echo = Vec::new();
+        let mut scripted = None;
 
         // Batch with two flush records + a regular write: the full-set reply
         // wins, carrying the sample set and every flush record in batch order.
@@ -408,6 +489,8 @@ mod tests {
             &notify,
             written_batch(&[aircon_flush.clone(), e08_flush.clone(), write]),
             &mut pending_echo,
+            &FeederSpec::default(),
+            &mut scripted,
         )
         .await;
 
@@ -443,12 +526,15 @@ mod tests {
             data: [0; 7],
         };
         let mut pending_echo = Vec::new();
+        let mut scripted = None;
 
         reply_to_poll(
             &mock,
             &notify,
             written_batch(&[write.clone(), jz18.clone()]),
             &mut pending_echo,
+            &FeederSpec::default(),
+            &mut scripted,
         )
         .await;
 
@@ -490,6 +576,161 @@ mod tests {
         .await
         .expect("snapshot timeout");
         assert!(matches!(snap, EngineEvent::Snapshot { .. }));
+
+        cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
+        let _ = timeout(Duration::from_secs(2), engine).await;
+        feeder.abort();
+    }
+
+    #[tokio::test]
+    async fn scripted_reg06_fires_on_next_empty_poll() {
+        let (_, mock, notify) = SharedMockLink::new();
+        let scripted = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        let mut pending_echo = Vec::new();
+        let mut scripted_slot = Some(scripted.clone());
+
+        // Empty poll with no pending echoes: the bare getCAN slot carries the
+        // scripted reg-06 announcement exactly once.
+        reply_to_poll(
+            &mock,
+            &notify,
+            encoded(EMPTY_SET_CAN),
+            &mut pending_echo,
+            &FeederSpec::default(),
+            &mut scripted_slot,
+        )
+        .await;
+
+        assert_eq!(
+            parse_reply_records(&mock).await,
+            vec![scripted],
+            "empty poll must announce the scripted reg-06 record"
+        );
+        assert!(
+            scripted_slot.is_none(),
+            "scripted reg-06 must fire exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_reg06_wins_over_pending_echoes_on_next_empty_poll() {
+        let (_, mock, notify) = SharedMockLink::new();
+        let write = CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        };
+        let scripted = CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: FEEDER_UNIT_ID,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        };
+        let mut pending_echo = vec![write.clone()];
+        let mut scripted_slot = Some(scripted.clone());
+
+        reply_to_poll(
+            &mock,
+            &notify,
+            encoded(EMPTY_SET_CAN),
+            &mut pending_echo,
+            &FeederSpec::default(),
+            &mut scripted_slot,
+        )
+        .await;
+
+        assert_eq!(
+            parse_reply_records(&mock).await,
+            vec![scripted],
+            "the scripted announcement must fire on the next empty poll"
+        );
+        assert!(
+            scripted_slot.is_none(),
+            "scripted reg-06 must fire exactly once"
+        );
+        assert_eq!(
+            pending_echo,
+            vec![write],
+            "pending write echoes must stay queued for a later poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_reg05_omits_sample_from_flush_full_set_reply() {
+        let (_, mock, notify) = SharedMockLink::new();
+        let aircon_flush = flush_record(UnitType::AIRCON);
+        let mut pending_echo = Vec::new();
+        let mut scripted = None;
+
+        reply_to_poll(
+            &mock,
+            &notify,
+            written_batch(std::slice::from_ref(&aircon_flush)),
+            &mut pending_echo,
+            &FeederSpec::default().without_reg05(),
+            &mut scripted,
+        )
+        .await;
+
+        let records = parse_reply_records(&mock).await;
+        assert!(
+            records.iter().all(|rec| rec.reg != RegId::new(0x05)),
+            "without_reg05 full-set reply must not carry reg 05: {records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|rec| rec.reg == RegId::new(0x06) && rec.unit_type == UnitType::new(0x08)),
+            "without_reg05 full-set reply must keep the 08/reg-06 sample: {records:?}"
+        );
+        assert!(records.contains(&aircon_flush));
+    }
+
+    #[tokio::test]
+    async fn without_reg05_snapshot_lacks_reg05_sample() {
+        let (link, mock, notify) = SharedMockLink::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (ev_tx, mut ev_rx) = mpsc::channel(32);
+
+        let engine = tokio::spawn(async move {
+            CbEngine::new(link).run(cmd_rx, ev_tx).await;
+        });
+        tokio::task::yield_now().await;
+        let spec = FeederSpec::default().without_reg05();
+        let feeder = tokio::spawn(run_feeder(mock, notify, spec));
+
+        let snap = timeout(Duration::from_secs(5), async {
+            loop {
+                let ev = ev_rx.recv().await.expect("event");
+                if matches!(ev, EngineEvent::Snapshot { .. }) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("snapshot timeout");
+        let EngineEvent::Snapshot { bank, .. } = snap else {
+            panic!("expected snapshot");
+        };
+        assert!(
+            bank.records_for_unit(UnitType::AIRCON, FEEDER_UNIT_ID)
+                .iter()
+                .all(|rec| rec.reg != RegId::new(0x05)),
+            "bank must never see reg 05 under without_reg05"
+        );
+        assert!(
+            bank.has_unit(UnitType::new(0x08), FEEDER_UNIT_ID),
+            "08/reg-06 sample must still be in the bank"
+        );
 
         cmd_tx.send(EngineCmd::Shutdown).await.unwrap();
         let _ = timeout(Duration::from_secs(2), engine).await;
