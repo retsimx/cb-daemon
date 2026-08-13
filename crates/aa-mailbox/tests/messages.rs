@@ -910,6 +910,41 @@ fn golden_ack_error_message() {
 }
 
 #[test]
+fn golden_write_policy_error_ack_reasons() {
+    for reason in [
+        "register 08 is read-only",
+        "field 'rf_sys_id' is read-only on register 05",
+        "register 09 is write-only",
+        "register 07 is handled internally",
+        "register 0b is unverified; writes not permitted",
+        "field 'damper' 101 out of range (max 100)",
+        "unknown register in catalog: 16",
+        "malformed raw-hex payload: 12g45678901234",
+        "bad register payload: missing field `power` at line 1 column 1",
+        "unsupported mode value: dry",
+    ] {
+        let msg = ServerMessage::Ack {
+            msg_id: "req-5".to_owned(),
+            status: AckStatus::Error,
+            reason: Some(reason.to_owned()),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "ack");
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["reason"], reason);
+        let expected: Value = serde_json::from_str(&format!(
+            r#"{{"type":"ack","msg_id":"req-5","status":"error","reason":"{reason}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(
+            serde_json::from_value::<ServerMessage>(expected).unwrap(),
+            msg
+        );
+    }
+}
+
+#[test]
 fn golden_status_synced_message() {
     let msg = ServerMessage::Status {
         state: StatusState::Synced,
