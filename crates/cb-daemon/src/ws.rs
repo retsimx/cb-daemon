@@ -9,7 +9,9 @@ use aa_mailbox::{
     encode_payload, event_body, merge_payload, snapshot_units, validate_write,
     validate_write_merged, write_policy,
 };
-use aa_registers::{CanRecord, Dest, RegId, RegisterBank, UnitId, UnitType, is_zone_bearing};
+use aa_registers::{
+    CanRecord, Dest, Power, RegId, RegisterBank, SystemStatus, UnitId, UnitType, is_zone_bearing,
+};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -53,6 +55,8 @@ pub(crate) struct WsState {
     pub cmd_spy: Option<Arc<tokio::sync::Mutex<Vec<EngineCmd>>>>,
     /// Config `unit_id_hint` (preferred when present in the bank).
     pub unit_id_hint: Option<UnitId>,
+    /// Connected-session counter (idle-failsafe arming signal).
+    pub clients: watch::Sender<usize>,
 }
 
 /// Map an engine session-state onto the wire `status` state (1:1, D-8).
@@ -121,8 +125,32 @@ async fn mailbox_stream_upgrade(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+/// Session-counter guard: increments [`WsState::clients`] on acquire and
+/// decrements on drop.
+///
+/// Bound at session entry so every exit path (disconnect, snapshot-wait
+/// abort, transport error) decrements exactly once — including panics, which
+/// unwind through `Drop`.
+struct ClientCountGuard {
+    clients: watch::Sender<usize>,
+}
+
+impl ClientCountGuard {
+    fn acquire(clients: watch::Sender<usize>) -> Self {
+        clients.send_modify(|count| *count += 1);
+        Self { clients }
+    }
+}
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.clients.send_modify(|count| *count -= 1);
+    }
+}
+
 /// Run one independent session per connection (no single-session gate).
 async fn handle_socket(socket: WebSocket, state: WsState) {
+    let _guard = ClientCountGuard::acquire(state.clients.clone());
     let result = run_session(socket, state).await;
     if let Err(err) = result {
         debug!(?err, "mailbox-stream session ended");
@@ -983,11 +1011,156 @@ async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> anyhow::Resul
     Ok(())
 }
 
+/// Build power-off [`CanRecord`]s for every AIRCON unit in `bank`.
+///
+/// Each unit's reg-05 [`SystemStatus`] is re-encoded with `power = Off`,
+/// preserving every other byte (mode, fan, set temp, myzone, fresh air, RF
+/// sys id). Units without a reg-05 slot are skipped — their mode/fan bytes
+/// are unknown, so a blind off is refused. No AIRCON units → empty vec (the
+/// caller sends no write).
+fn power_off_records(bank: &RegisterBank) -> Vec<CanRecord> {
+    let mut records = Vec::new();
+    for unit_id in bank.unit_ids(UnitType::AIRCON) {
+        let Some(data) = bank.get(UnitType::AIRCON, unit_id, RegId::new(0x05)) else {
+            continue;
+        };
+        let mut status = SystemStatus::from(data);
+        status.power = Power::Off;
+        records.push(CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::ControlBox,
+            unit_id,
+            reg: RegId::new(0x05),
+            data: status.into(),
+        });
+    }
+    records
+}
+
+/// Fire the idle failsafe: queue a power-off write for every AIRCON unit
+/// with a reg-05 status in the held snapshot.
+///
+/// `warn!` audit log carries the target unit ids on both success and failure.
+async fn fire_idle_power_off(state: &WsState) {
+    // Clone the held snapshot: `watch::Ref` is not `Send`, so the borrow
+    // guard must not span the awaits below.
+    let Some(held) = state.snapshot.borrow().as_ref().cloned() else {
+        return;
+    };
+    let records = power_off_records(&held.bank);
+    if records.is_empty() {
+        return;
+    }
+    let units = records
+        .iter()
+        .map(|record| record.unit_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let cmd = EngineCmd::WriteRegisters(records);
+    record_spy(state, &cmd).await;
+    if let Err(err) = state.cmd_tx.send(cmd).await {
+        warn!(?err, %units, "idle failsafe: failed to queue power-off write");
+    } else {
+        warn!(%units, "idle failsafe: zero WebSocket clients; powering off aircon unit(s)");
+    }
+}
+
+/// Spawn the idle-failsafe watchdog task.
+///
+/// With `timeout == 0` the task exits immediately (failsafe disabled). The
+/// handle is intentionally detached: the task runs until the process ends.
+pub(crate) fn spawn_idle_watchdog(
+    state: WsState,
+    timeout: std::time::Duration,
+    retry_interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if timeout.is_zero() {
+            return;
+        }
+        idle_watchdog_loop(state, timeout, retry_interval).await;
+    })
+}
+
+/// Saturating cap for watchdog deadline spans: 100 years, far beyond any
+/// configured timeout yet safely inside `Instant` arithmetic bounds.
+const MAX_DEADLINE_SPAN: std::time::Duration = std::time::Duration::from_hours(876_000);
+
+/// `now + duration` as a watchdog deadline, saturating instead of panicking.
+///
+/// `Instant` addition is a checked add: an overflowing duration (possible
+/// via the test hooks, which bypass config validation) would panic the
+/// detached watchdog task and silently disable the failsafe. An overflowing
+/// span clamps to the latest representable deadline instead.
+fn idle_deadline(duration: std::time::Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(duration).unwrap_or(now + MAX_DEADLINE_SPAN)
+}
+
+/// Idle-failsafe state machine: arms immediately when the daemon boots with
+/// zero clients (startup arming — a restart while the network is down must
+/// still fail safe), else on the first >0 → 0 client transition; fires at
+/// `disconnected_at + timeout`, re-fires every `retry_interval` while the
+/// count stays 0, disarms on any reconnect (count > 0).
+async fn idle_watchdog_loop(
+    state: WsState,
+    timeout: std::time::Duration,
+    retry_interval: std::time::Duration,
+) {
+    let mut clients = state.clients.subscribe();
+    // `None` = disarmed (a client is connected). Armed deadlines are
+    // absolute, so drift-free re-arming is just `now + interval`.
+    let mut deadline: Option<tokio::time::Instant> = if *clients.borrow_and_update() == 0 {
+        // Startup arming: no client ever connected — count is 0 at boot, so
+        // arm from task start. A later >0 → 0 transition re-arms from that
+        // disconnect.
+        Some(idle_deadline(timeout))
+    } else {
+        None
+    };
+    loop {
+        let sleep = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            changed = clients.changed() => {
+                if changed.is_err() {
+                    warn!("idle failsafe: client-count watch closed; watchdog exiting");
+                    return;
+                }
+                if *clients.borrow_and_update() > 0 {
+                    // Any connected client disarms the failsafe.
+                    deadline = None;
+                } else if deadline.is_none() {
+                    // First >0 → 0 transition: arm at disconnect + timeout.
+                    deadline = Some(idle_deadline(timeout));
+                }
+            }
+            () = sleep => {
+                // Re-read before firing: a reconnect racing the deadline
+                // (both select branches ready) must disarm, not fire.
+                if *clients.borrow_and_update() == 0 {
+                    fire_idle_power_off(&state).await;
+                    deadline = Some(idle_deadline(retry_interval));
+                } else {
+                    deadline = None;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use aa_registers::{CanRecord, Dest, RegId, UnitType};
+    use aa_engine::EngineCmd;
+    use aa_registers::{CanRecord, Dest, RegId, UnitId, UnitType};
+    use futures_util::SinkExt;
+    use std::net::SocketAddr;
 
     #[test]
     fn primary_unit_prefers_live_dump_over_hint_default() {
@@ -1490,7 +1663,6 @@ mod tests {
         assert_eq!(err, "field 'numZones' 11 out of range (max 10)");
     }
 
-    /// Seed a reg-05 slot (the default dump sample) into `bank`.
     fn seed_reg05(bank: &mut RegisterBank, id: UnitId) {
         bank.apply(&CanRecord {
             unit_type: UnitType::AIRCON,
@@ -1677,5 +1849,594 @@ mod tests {
             [0x01, 0x61, 0x3d, 0x01, 0x00, 0x00, 0x00],
             "uid from bank, zone from client, write shape"
         );
+    }
+    fn aircon_reg05(unit_id: UnitId, data: [u8; 7]) -> CanRecord {
+        CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id,
+            reg: RegId::new(0x05),
+            data,
+        }
+    }
+
+    #[test]
+    fn power_off_records_preserves_bytes_with_power_off() {
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        // mode 02 (heat), fan 03 (high), set 0x30, myzone 00, fresh 01, rf 00.
+        bank.apply(&aircon_reg05(
+            id,
+            [0x01, 0x02, 0x03, 0x30, 0x00, 0x01, 0x00],
+        ));
+
+        let records = power_off_records(&bank);
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.unit_type, UnitType::AIRCON);
+        assert_eq!(rec.dest, Dest::ControlBox);
+        assert_eq!(rec.unit_id, id);
+        assert_eq!(rec.reg, RegId::new(0x05));
+        assert_eq!(
+            rec.data,
+            [0x00, 0x02, 0x03, 0x30, 0x00, 0x01, 0x00],
+            "power byte flipped to Off, every other byte preserved"
+        );
+    }
+
+    #[test]
+    fn power_off_records_skips_units_without_reg05() {
+        let mut bank = RegisterBank::new();
+        let with_status = UnitId::try_new(0x0_00001).unwrap();
+        let without_status = UnitId::try_new(0x0_00002).unwrap();
+        bank.apply(&aircon_reg05(
+            with_status,
+            [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        ));
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: without_status,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+
+        let records = power_off_records(&bank);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].unit_id, with_status);
+
+        // Only reg-06 present → nothing to power off.
+        let mut bank = RegisterBank::new();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: without_status,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        assert!(power_off_records(&bank).is_empty());
+    }
+
+    #[test]
+    fn power_off_records_ignores_non_aircon_units() {
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
+        assert!(
+            power_off_records(&bank).is_empty(),
+            "a non-AIRCON unit's reg-05 status must never be powered off"
+        );
+    }
+
+    #[test]
+    fn power_off_records_empty_bank_yields_empty_vec() {
+        let bank = RegisterBank::new();
+        assert!(power_off_records(&bank).is_empty());
+    }
+
+    /// One AIRCON unit with the default feeder's reg-05 status
+    /// (`[0x01,0x01,0x03,0x30,0x00,0x01,0x00]` → on/cool/high/24.0/off).
+    fn single_aircon_bank() -> RegisterBank {
+        let mut bank = RegisterBank::new();
+        bank.apply(&aircon_reg05(
+            UnitId::try_new(0x0_ABCDE).unwrap(),
+            [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        ));
+        bank
+    }
+
+    /// Assert `rec` is the idle-failsafe power-off record for `expected_id`:
+    /// AIRCON, `ControlBox`, reg 05, power byte flipped to Off with every other
+    /// byte preserved.
+    fn assert_power_off(rec: &CanRecord, expected_id: UnitId, expected_data: [u8; 7]) {
+        assert_eq!(rec.unit_type, UnitType::AIRCON);
+        assert_eq!(rec.dest, Dest::ControlBox);
+        assert_eq!(rec.unit_id, expected_id);
+        assert_eq!(rec.reg, RegId::new(0x05));
+        assert_eq!(
+            rec.data, expected_data,
+            "power byte flipped to Off, every other byte preserved"
+        );
+    }
+
+    /// Test harness: a `WsState` wired to the watchdog with a held snapshot
+    /// bank, `cmd_spy`, and a live client-count watch the test drives directly
+    /// (no network / feeder / timing races on the snapshot).
+    struct WatchdogHarness {
+        clients: watch::Sender<usize>,
+        spy: Arc<tokio::sync::Mutex<Vec<EngineCmd>>>,
+        watchdog: tokio::task::JoinHandle<()>,
+        drain: tokio::task::JoinHandle<()>,
+    }
+
+    impl WatchdogHarness {
+        /// Spawn the watchdog over `bank`, returning the harness.
+        fn spawn(
+            bank: RegisterBank,
+            timeout: std::time::Duration,
+            retry_interval: std::time::Duration,
+        ) -> Self {
+            let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCmd>(crate::app::CHANNEL_BOUND);
+            let (snapshot_tx, snapshot_rx) = watch::channel::<Option<HeldSnapshot>>(None);
+            let (_status_tx, status_rx) = watch::channel::<StatusState>(StatusState::Negotiating);
+            let (events_tx, _events_rx) = broadcast::channel::<WsEvent>(crate::app::CHANNEL_BOUND);
+            let (clients_tx, _clients_rx) = watch::channel::<usize>(0);
+            let spy = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            snapshot_tx.send_modify(|held| *held = Some(HeldSnapshot { bank }));
+            // Drain the engine cmd channel so the watchdog's sends never fail.
+            let drain = tokio::spawn(async move { while cmd_rx.recv().await.is_some() {} });
+            let state = WsState {
+                cmd_tx,
+                snapshot: snapshot_rx,
+                events: events_tx,
+                status: status_rx,
+                cmd_spy: Some(spy.clone()),
+                unit_id_hint: None,
+                clients: clients_tx.clone(),
+            };
+            let watchdog = spawn_idle_watchdog(state, timeout, retry_interval);
+            Self {
+                clients: clients_tx,
+                spy,
+                watchdog,
+                drain,
+            }
+        }
+
+        /// Simulate one WebSocket client connecting (count > 0 disarms).
+        fn connect(&self) {
+            self.clients.send_modify(|count| *count += 1);
+        }
+
+        /// Simulate one WebSocket client disconnecting (count → 0 arms).
+        fn disconnect(&self) {
+            self.clients.send_modify(|count| *count -= 1);
+        }
+    }
+
+    impl Drop for WatchdogHarness {
+        fn drop(&mut self) {
+            self.watchdog.abort();
+            self.drain.abort();
+        }
+    }
+
+    /// Every `WriteRegisters` recorded on the spy so far.
+    async fn spy_writes(spy: &Arc<tokio::sync::Mutex<Vec<EngineCmd>>>) -> Vec<EngineCmd> {
+        spy.lock()
+            .await
+            .iter()
+            .filter(|cmd| matches!(cmd, EngineCmd::WriteRegisters(_)))
+            .cloned()
+            .collect()
+    }
+
+    /// Poll the spy until at least `min` power-off writes are recorded.
+    async fn wait_for_power_offs(harness: &WatchdogHarness, min: usize) -> Vec<EngineCmd> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let writes = spy_writes(&harness.spy).await;
+                if writes.len() >= min {
+                    return writes;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timeout waiting for idle-failsafe power-off write(s)")
+    }
+
+    #[tokio::test]
+    async fn watchdog_fires_after_disconnect_timeout() {
+        // Watchdog: fires a power-off write after the timeout once the last
+        // client disconnects (the >0 → 0 transition arms the failsafe).
+        let harness = WatchdogHarness::spawn(
+            single_aircon_bank(),
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(100),
+        );
+        harness.connect();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        harness.disconnect();
+
+        let writes = wait_for_power_offs(&harness, 1).await;
+        let EngineCmd::WriteRegisters(records) = &writes[0] else {
+            panic!("expected WriteRegisters");
+        };
+        assert_eq!(records.len(), 1);
+        assert_power_off(
+            &records[0],
+            UnitId::try_new(0x0_ABCDE).unwrap(),
+            [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_fires_on_all_aircon_units() {
+        // Watchdog: the failsafe fires on ALL AIRCON units present in the
+        // bank — two units with reg-05 status → one power-off record each,
+        // all in a single write (startup arming supplies the fire).
+        let mut bank = RegisterBank::new();
+        bank.apply(&aircon_reg05(
+            UnitId::try_new(0x0_ABCDE).unwrap(),
+            [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        ));
+        bank.apply(&aircon_reg05(
+            UnitId::try_new(0x0_00002).unwrap(),
+            [0x01, 0x02, 0x03, 0x2e, 0x00, 0x01, 0x00],
+        ));
+        let harness = WatchdogHarness::spawn(
+            bank,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        );
+
+        let writes = wait_for_power_offs(&harness, 1).await;
+        let EngineCmd::WriteRegisters(records) = &writes[0] else {
+            panic!("expected WriteRegisters");
+        };
+        assert_eq!(records.len(), 2, "both AIRCON units must be powered off");
+        let mut ids: Vec<u32> = records.iter().map(|rec| rec.unit_id.get()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0x00_0002, 0x0_ABCDE]);
+        for rec in records {
+            // Known fixture expectations: each unit's reg-05 status with the
+            // power byte flipped On → Off and every other byte preserved.
+            let (expected_id, expected_data) = match rec.unit_id.get() {
+                0x0_ABCDE => (
+                    UnitId::try_new(0x0_ABCDE).unwrap(),
+                    [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+                ),
+                0x0_00002 => (
+                    UnitId::try_new(0x0_00002).unwrap(),
+                    [0x00, 0x02, 0x03, 0x2e, 0x00, 0x01, 0x00],
+                ),
+                id => panic!("unexpected unit id {id:05x}"),
+            };
+            assert_power_off(rec, expected_id, expected_data);
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_skips_aircon_units_without_reg05() {
+        // Watchdog: AIRCON units without a reg-05 status in the bank are
+        // skipped — their mode/fan bytes are unknown, so no blind off. With
+        // no reg-05 in the bank at all, the fire sends nothing.
+        let mut bank = RegisterBank::new();
+        let with_status = UnitId::try_new(0x0_ABCDE).unwrap();
+        let without_status = UnitId::try_new(0x0_00002).unwrap();
+        bank.apply(&aircon_reg05(
+            with_status,
+            [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        ));
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: without_status,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        let harness = WatchdogHarness::spawn(
+            bank,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        );
+
+        let writes = wait_for_power_offs(&harness, 1).await;
+        let EngineCmd::WriteRegisters(records) = &writes[0] else {
+            panic!("expected WriteRegisters");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].unit_id, with_status,
+            "reg-05-less unit must be skipped"
+        );
+
+        // No reg-05 anywhere → the fire is a no-op: no write at all.
+        let mut bank = RegisterBank::new();
+        bank.apply(&CanRecord {
+            unit_type: UnitType::AIRCON,
+            dest: Dest::Tablet,
+            unit_id: without_status,
+            reg: RegId::new(0x06),
+            data: [0; 7],
+        });
+        let harness = WatchdogHarness::spawn(
+            bank,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let writes = spy_writes(&harness.spy).await;
+        assert!(
+            writes.is_empty(),
+            "no power-off write may fire without reg-05: {writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_never_powers_off_non_aircon_units() {
+        // Watchdog: non-AIRCON (0x08) units are never touched — their reg-05
+        // status stays in the bank even when the same unit id also exists as
+        // an AIRCON that IS powered off.
+        let mut bank = RegisterBank::new();
+        let id = UnitId::try_new(0x0_ABCDE).unwrap();
+        bank.apply(&aircon_reg05(
+            id,
+            [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        ));
+        bank.apply(&CanRecord {
+            unit_type: UnitType::new(0x08),
+            dest: Dest::Tablet,
+            unit_id: id,
+            reg: RegId::new(0x05),
+            data: [0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        });
+        let harness = WatchdogHarness::spawn(
+            bank.clone(),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        );
+
+        let writes = wait_for_power_offs(&harness, 1).await;
+        let EngineCmd::WriteRegisters(records) = &writes[0] else {
+            panic!("expected WriteRegisters");
+        };
+        assert_eq!(records.len(), 1, "only the AIRCON unit may be powered off");
+        assert_power_off(&records[0], id, [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00]);
+        assert_eq!(
+            bank.get(UnitType::new(0x08), id, RegId::new(0x05)),
+            Some([0x01, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00]),
+            "08-type reg-05 status must remain untouched in the bank"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_reconnect_before_deadline_disarms() {
+        // Watchdog: a reconnect before the deadline disarms the failsafe —
+        // no power-off write fires even after the original deadline passes.
+        let harness = WatchdogHarness::spawn(
+            single_aircon_bank(),
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(100),
+        );
+        harness.connect();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        harness.disconnect(); // t0: 300ms deadline starts here
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await; // well before the deadline
+        harness.connect(); // reconnect
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await; // t0+400 > t0+300 deadline
+
+        let writes = spy_writes(&harness.spy).await;
+        assert!(
+            writes.is_empty(),
+            "reconnect must disarm the failsafe: {writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_refires_periodically_while_disconnected() {
+        // Watchdog: while the count stays 0, the failsafe re-fires every
+        // retry interval — at least two power-off writes are observed across
+        // two intervals, each with the same preserved reg-05 payload.
+        let harness = WatchdogHarness::spawn(
+            single_aircon_bank(),
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(200),
+        );
+        harness.connect();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        harness.disconnect();
+
+        let writes = wait_for_power_offs(&harness, 2).await;
+        assert_eq!(writes.len(), 2, "expected at least two re-fires");
+        for write in &writes {
+            let EngineCmd::WriteRegisters(records) = write else {
+                panic!("expected WriteRegisters");
+            };
+            assert_eq!(records.len(), 1);
+            assert_power_off(
+                &records[0],
+                UnitId::try_new(0x0_ABCDE).unwrap(),
+                [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_connected_client_never_fires() {
+        // Watchdog: any connected client (even idle) keeps the failsafe
+        // disarmed — no power-off write while the count stays > 0, well past
+        // the timeout.
+        let harness = WatchdogHarness::spawn(
+            single_aircon_bank(),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(50),
+        );
+        harness.connect();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let writes = spy_writes(&harness.spy).await;
+        assert!(
+            writes.is_empty(),
+            "a connected client must keep the failsafe disarmed: {writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_arms_at_startup_when_no_client_connected() {
+        // Watchdog startup arming: booting with zero clients arms immediately
+        // — the failsafe fires on its own after the timeout, with no
+        // >0 → 0 transition ever observed.
+        let harness = WatchdogHarness::spawn(
+            single_aircon_bank(),
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(100),
+        );
+
+        let writes = wait_for_power_offs(&harness, 1).await;
+        let EngineCmd::WriteRegisters(records) = &writes[0] else {
+            panic!("expected WriteRegisters");
+        };
+        assert_eq!(records.len(), 1);
+        assert_power_off(
+            &records[0],
+            UnitId::try_new(0x0_ABCDE).unwrap(),
+            [0x00, 0x01, 0x03, 0x30, 0x00, 0x01, 0x00],
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_zero_timeout_is_disabled() {
+        // Watchdog: a zero timeout disables the failsafe entirely — the task
+        // exits immediately and never fires, even with zero clients at
+        // startup.
+        let harness = WatchdogHarness::spawn(
+            single_aircon_bank(),
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(50),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let writes = spy_writes(&harness.spy).await;
+        assert!(
+            writes.is_empty(),
+            "timeout 0 must disable the failsafe: {writes:?}"
+        );
+    }
+
+    #[test]
+    fn idle_deadline_saturates_on_overflowing_duration() {
+        // Regression (F2): an extreme timeout must not panic the watchdog
+        // task. `idle_deadline` clamps to a representable deadline instead of
+        // panicking on `Instant` checked-add overflow.
+        let saturated = idle_deadline(std::time::Duration::MAX);
+        let fine = idle_deadline(std::time::Duration::from_millis(100));
+        assert!(
+            saturated >= tokio::time::Instant::now(),
+            "saturated deadline must still be in the future"
+        );
+        let span = fine.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            span >= std::time::Duration::from_millis(80),
+            "non-overflowing deadline must land ~now + duration, got {span:?}"
+        );
+    }
+
+    /// Connect a real WebSocket client to the daemon at `addr` (retry loop).
+    async fn app_connect(
+        addr: SocketAddr,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let url = format!("ws://{addr}/v1/mailbox-stream");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match tokio_tungstenite::connect_async(&url).await {
+                    Ok((ws, _)) => return ws,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("connect timeout")
+    }
+
+    /// Wait for the snapshot frame on a real WebSocket session.
+    async fn app_wait_snapshot(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Value {
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            loop {
+                let msg = ws.next().await.expect("ws stream").expect("ws msg");
+                match msg {
+                    WsMsg::Text(text) => {
+                        let msg: Value = serde_json::from_str(&text).expect("json");
+                        if msg["type"] == "snapshot" {
+                            return msg;
+                        }
+                    }
+                    WsMsg::Ping(payload) => {
+                        let _ = ws.send(WsMsg::Pong(payload)).await;
+                    }
+                    WsMsg::Close(frame) => panic!("unexpected close: {frame:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("snapshot timeout")
+    }
+
+    #[tokio::test]
+    async fn watchdog_without_reg05_feeder_never_writes() {
+        // Watchdog (app wiring): with a `without_reg05` feeder spec the bank
+        // never sees an AIRCON reg-05 status, so even a fully armed failsafe
+        // sends no power-off write — while the daemon stays alive and serving
+        // (verified via a client snapshot of the 08 unit after the window).
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = crate::app::App::spawn_mock_ctrl_with_timeouts(
+            bind,
+            Some(crate::mock_feeder::FeederSpec::default().without_reg05()),
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect("spawn mock with without_reg05 spec")
+        .0;
+        // Window covers the startup-armed fire deadline (200ms) with margin.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let spy = handle.cmd_spy.lock().await;
+        assert!(
+            spy.iter()
+                .all(|cmd| !matches!(cmd, EngineCmd::WriteRegisters(_))),
+            "no power-off write may fire without reg-05 in the bank: {spy:?}"
+        );
+        drop(spy);
+
+        // The daemon is alive and its bank holds the 08 unit only.
+        let mut ws = app_connect(handle.local_addr()).await;
+        let snap = app_wait_snapshot(&mut ws).await;
+        assert!(
+            snap["units"]["08:abcde"].is_object(),
+            "08 unit missing from snapshot: {snap}"
+        );
+        for registers in snap["units"].as_object().unwrap().values() {
+            assert!(
+                !registers.as_object().unwrap().contains_key("05"),
+                "reg 05 must not be synthesized: {snap}"
+            );
+        }
+
+        let _ = ws.close(None).await;
+        handle.shutdown().await.expect("shutdown");
     }
 }

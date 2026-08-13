@@ -39,14 +39,20 @@ Canonical example: [`packaging/cb-daemon.example.toml`](packaging/cb-daemon.exam
 | `aoa_chunk_size` | `63` | ≥ 1 |
 | `aoa_chunk_delay_ms` | `1` | Milliseconds between AOA chunks |
 | `tty_baud` | `57600` | Must be a supported termios rate |
+| `ws_idle_timeout_minutes` | `15` | Minutes with zero connected WebSocket clients before the power-off failsafe fires; `0` disables it (max 1 year) |
+| `ws_idle_retry_seconds` | `60` | Seconds between power-off retries while still disconnected; ≥ 1 |
+
+The WebSocket idle failsafe is open-loop: the daemon transmits the power-off frame but cannot verify the unit obeyed. While no client is connected, the frame is re-sent every `ws_idle_retry_seconds`.
+
+> **Development note:** with the default mock backend, an unattended daemon run with no client connected will log a power-off `warn!` after the idle timeout — harmless in development (no real aircon), but set `ws_idle_timeout_minutes = 0` or connect a client to avoid it.
 
 ### Environment
 
-`CB_DAEMON_CONFIG`, `CB_DAEMON_BACKEND`, `CB_DAEMON_DEVICE`, `CB_DAEMON_BIND`, `CB_DAEMON_LOG_LEVEL`, `CB_DAEMON_UNIT_ID_HINT`, `CB_DAEMON_AOA_CHUNK_SIZE`, `CB_DAEMON_AOA_CHUNK_DELAY_MS`, `CB_DAEMON_TTY_BAUD`
+`CB_DAEMON_CONFIG`, `CB_DAEMON_BACKEND`, `CB_DAEMON_DEVICE`, `CB_DAEMON_BIND`, `CB_DAEMON_LOG_LEVEL`, `CB_DAEMON_UNIT_ID_HINT`, `CB_DAEMON_AOA_CHUNK_SIZE`, `CB_DAEMON_AOA_CHUNK_DELAY_MS`, `CB_DAEMON_TTY_BAUD`, `CB_DAEMON_WS_IDLE_TIMEOUT_MINUTES`, `CB_DAEMON_WS_IDLE_RETRY_SECONDS`
 
 ### CLI
 
-`--config`, `--backend`, `--device`, `--bind`, `--log-level`, `--unit-id-hint`, `--aoa-chunk-size`, `--aoa-chunk-delay-ms`, `--tty-baud`
+`--config`, `--backend`, `--device`, `--bind`, `--log-level`, `--unit-id-hint`, `--aoa-chunk-size`, `--aoa-chunk-delay-ms`, `--tty-baud`, `--ws-idle-timeout-minutes`, `--ws-idle-retry-seconds`
 
 ### Logging
 
