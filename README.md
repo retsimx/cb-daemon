@@ -1,6 +1,8 @@
 # cb-daemon
 
-Foundation for a Control Box (CB) mailbox sync daemon that talks to Advantage Air air-conditioning systems. This repository holds the pure protocol crates (CRC, framing, registers, link backends, session engine) and engineering scaffold; the mailbox layer and full packaging come later.
+Rust Control Box (CB) mailbox sync daemon for Advantage Air air-conditioning systems. It acts as the RS-485 "tablet" endpoint on the CB bus: it runs the CB↔tablet session (negotiate / dump / steady poll), maintains an in-memory register bank, and serves a typed JSON mailbox API over WebSocket.
+
+In production since **2026-08-12** as the sole talker on the CB bus — a Raspberry Pi Zero W (Alpine/OpenRC) with a USB-RS485 dongle (see [Deployment](#deployment)).
 
 ## Workspace
 
@@ -8,11 +10,45 @@ Current Cargo workspace members:
 
 - **`aa-crc`** — CRC-8 used on CB frames
 - **`aa-frame`** — `<U>…</U=xx>` frame encode/decode and burst scanning
-- **`aa-registers`** — register IDs, CAN2 wire codec, and register bank (scaffold)
+- **`aa-registers`** — register IDs, CAN2 wire codec, register bank, and typed decode/encode for all known registers (write-policy metadata included)
 - **`aa-link`** — async byte I/O seam (`Link`), `MockLink` for hardware-free tests, `AoaLink` for raw `/dev/usb_accessory` (config on open, chunked writes; aaservice must not hold the accessory while open), and `TtyLink` for Linux USB-serial / USB-RS485 (57600 8N1 raw, full-frame writes; default `/dev/ttyUSB0`)
-- **`aa-engine`** — CB session state machine (negotiate / dump / steady poll) over a `Link`
-- **`aa-mailbox`** — northbound mailbox JSON message types and `RegisterBank` ↔ JSON converters (no WS bind)
-- **`cb-daemon`** — runnable daemon: TOML/env/CLI config, engine wiring, and multi-consumer axum WebSocket at `GET /v1/mailbox-stream`
+- **`aa-engine`** — CB session state machine (negotiate / dump / steady poll, getCAN NACK retry, dirty-reset resync) over a `Link`
+- **`aa-mailbox`** — mailbox JSON message types and `RegisterBank` ↔ JSON converters (write policy, raw-hex passthrough; no WS bind)
+- **`cb-daemon`** — runnable daemon: TOML/env/CLI config, engine wiring, and the axum WebSocket at `GET /v1/mailbox-stream`
+
+## WebSocket protocol (mailbox API)
+
+`ws://<host>:2026/v1/mailbox-stream` — JSON frames tagged by `type` (snake_case). Registers are addressed as 2-hex register ids (`"05"`); zone-bearing registers (`03`/`04`) take an optional `zone`. Units are keyed `"{unit_type}:{unit_id}"` (e.g. `"07:11111"`); client `write`/`read` default to the primary unit when `unit_type`/`unit_id` are omitted.
+
+### Server → client
+
+| `type` | Fields | Meaning |
+|--------|--------|---------|
+| `snapshot` | `units` (unit-keyed map → register id → typed payload) | Full register snapshot of all known units (on connect and after resync) |
+| `event` | `unit_type`, `unit_id`, `register`, `zone?`, `payload` | Incremental register change pushed by the CB |
+| `read_result` | `msg_id`, `unit_type`, `unit_id`, `register`, `zone?`, `payload` | Reply to a client `read` |
+| `ack` | `msg_id`, `status` (`success` \| `error`), `reason?` | Reply to `write` / `command` |
+| `status` | `state`, `detail?` | Link-state changes (`syncing`, `synced`, `link_down`, …) |
+| `error` | `message`, `reason?` | Protocol / transport error not tied to a `msg_id` |
+
+### Client → server
+
+| `type` | Fields | Meaning |
+|--------|--------|---------|
+| `write` | `msg_id`, `unit_type?`, `unit_id?`, `register`, `zone?`, `payload` | Write a register (typed payload, or raw 14-char hex for unknown registers); policy-checked against read-only fields |
+| `read` | `msg_id`, `unit_type?`, `unit_id?`, `register`, `zone?` | Read a register; answered with `read_result` |
+| `command` | `msg_id`, `action` | Non-register command; `resync` triggers a CB register flush + fresh `snapshot` |
+
+Example client write:
+
+```json
+{
+  "type": "write",
+  "msg_id": "req-101",
+  "register": "05",
+  "payload": { "power": "on", "mode": "cool", "target_temp_c": 23.0 }
+}
+```
 
 ## Configuration (`cb-daemon`)
 
@@ -102,6 +138,38 @@ Override binary path for packing with `CB_DAEMON_BIN=/path/to/cb-daemon`.
 - **OpenRC** (`packaging/openrc/cb-daemon`): init script for the Pi Zero W on Alpine (the systemd placeholder is retired). Install and enable steps in the template header. `/var/log` is RAM-backed (tmpfs, fstab) to spare SD card IOPS; daemon output goes to `/var/log/cb-daemon.log`, rotated with a size cap via `packaging/logrotate/cb-daemon` (copytruncate keeps the live fd; rotation runs from the 1-minute periodic — see the config header — because a slower cadence lets a debug frame flood outgrow the tmpfs and deadlock rotation; logs are intentionally volatile across reboot).
 - Canonical host config example: [`packaging/cb-daemon.example.toml`](packaging/cb-daemon.example.toml).
 
+## Deployment
+
+Live deployment: a Raspberry Pi Zero W (Alpine Linux, 32-bit ARMv6, OpenRC) acting as the tablet-side talker on the Advantage Air Control Box (CB) RS-485 link since 2026-08-12. The wall tablet is a pure WebSocket client to the daemon.
+
+### Hardware & wiring
+
+- **Compute:** Raspberry Pi Zero W, powered from the CB's ~14 V feed through a 1 A slow-blow fuse and a buck converter into the PWR micro-USB.
+- **Link:** CH340-based USB-to-RS485 dongle on the OTG port → `/dev/ttyUSB0`, **57600 8N1** half-duplex.
+- **CB RJ45 pinout** (T568A): pin 1 green/white = RS-485 B(+), pin 2 green = RS-485 A(−), pin 4 blue = GND, pin 5 blue/white = ~14 V, pin 6 orange = GND. Identify by pin number, not colour.
+- **Single tablet-side talker rule:** never run the wall tablet and the Zero W on the same RS-485 segment simultaneously.
+
+### Link & service
+
+- **Build:** `./scripts/build-pi-zero.sh` → static musl `cb-daemon` binary.
+- **Install:** binary at `/usr/local/bin/cb-daemon`, config at `/etc/cb-daemon/config.toml` (`backend = "tty"`, `device = "/dev/ttyUSB0"`, `bind = "0.0.0.0:2026"`, optional `unit_id_hint`).
+- **Service:** OpenRC init script `packaging/openrc/cb-daemon` → `/etc/init.d/cb-daemon`, `rc-update add cb-daemon default`. `supervise-daemon` respawns the child on failure (unlimited); the script waits for `/dev/ttyUSB0` at boot.
+- **Northbound:** `ws://<host>:2026/v1/mailbox-stream`, single active client (second connection gets WS close `4009`).
+
+### Logging (RAM-backed)
+
+- `/var/log` is a **128 MB tmpfs** (fstab entry, mounted by `localmount`) to spare SD card IOPS; logs are intentionally volatile across reboot.
+- `supervise-daemon` redirects child stdout/stderr to `/var/log/cb-daemon.log` (`output_log`/`error_log`); `NO_COLOR=1` strips ANSI escapes.
+- Rotation is size-capped to bound RAM usage: cb-daemon 5 MB × 19 (~100 MB), messages 2 MB × 4 (~10 MB), `copytruncate` so the live fd survives. logrotate runs from the 1-minute periodic so caps are enforced promptly even during debug bursts.
+
+### GPU memory
+
+Headless node: `gpu_mem=32` in `/boot/config.txt` (the practical minimum with Alpine's initramfs on the legacy firmware). Note this file is regenerated on kernel upgrades, so the setting must be re-applied after `apk upgrade`.
+
+### Rollback
+
+Disconnect the Zero W RS-485 tap from the CB; reconnect the tablet cable path; tablet resumes USB driving (reinstall the tablet Magisk module if removed — see `packaging/magisk/README.md`). Never run both talkers on the bus.
+
 ## Tracking
 
-Epic / design work for this scaffold: [GitHub issue #2](https://github.com/retsimx/cb-daemon/issues/2).
+Epic / design work for this project: [GitHub issue #2](https://github.com/retsimx/cb-daemon/issues/2).
