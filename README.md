@@ -169,7 +169,3 @@ Headless node: `gpu_mem=32` in `/boot/config.txt` (the practical minimum with Al
 ### Rollback
 
 Disconnect the Zero W RS-485 tap from the CB; reconnect the tablet cable path; tablet resumes USB driving (reinstall the tablet Magisk module if removed — see `packaging/magisk/README.md`). Never run both talkers on the bus.
-
-## Tracking
-
-Epic / design work for this project: [GitHub issue #2](https://github.com/retsimx/cb-daemon/issues/2).
